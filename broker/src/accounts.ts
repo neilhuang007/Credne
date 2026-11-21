@@ -1,10 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { type Api, type AuthCredential, AuthStorage, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
-import { parse as parseYaml } from "yaml";
+import { loadBrokerConfig } from "./config.ts";
 import { array, object, stringArray, text, type WireObject } from "./wire.ts";
 
 export class HttpError extends Error {
@@ -27,6 +27,7 @@ export interface AccountRecord {
 	createdAt: string;
 	source?: string;
 	baseUrl?: string;
+	headers?: Record<string, string>;
 	plan?: string;
 }
 export interface Account {
@@ -149,6 +150,7 @@ export class Accounts {
 	async load(): Promise<void> {
 		await mkdir(join(this.options.home, "credentials"), { recursive: true, mode: 0o700 });
 		await chmod(join(this.options.home, "credentials"), 0o700);
+		const config = await loadBrokerConfig(this.options.home);
 		const metadata = await readJson(this.metadataPath);
 		const migrating = metadata === undefined;
 		const saved = object(migrating ? await readJson(join(this.options.home, "api-accounts.json")) : metadata);
@@ -168,54 +170,12 @@ export class Accounts {
 			// An empty snapshot is authoritative too: later deletes must not revive legacy accounts.
 			await this.save();
 		}
-		let config: WireObject = {};
-		try {
-			config = object(parseYaml(await readFile(join(this.options.home, "config.yaml"), "utf8")));
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error("Cannot read broker config.yaml.");
-		}
-		const routing = object(config.routing);
-		if (routing["session-affinity"] === false) this.routing.affinity = false;
-		if (routing.strategy === "fill-first") this.routing.strategy = "fill-first";
-		const retries = object(routing.retry)["request-retry"];
-		if (typeof retries === "number" && Number.isInteger(retries) && retries >= 0 && retries <= 10)
-			this.routing.retries = retries;
-		for (const [family, groups] of Object.entries(object(config["api-keys"]))) {
-			for (const rawGroup of array(groups)) {
-				const group = object(rawGroup);
-				for (const rawEntry of array(group.keys)) {
-					const entry = object(rawEntry);
-					const key = entry["api-key"];
-					if (typeof key !== "string" || !key) continue;
-					const provider =
-						family === "claude" || family === "anthropic"
-							? "claude-api"
-							: family === "codex"
-								? "codex"
-								: "openai-api";
-					const baseUrl = text(group["base-url"]);
-					const id = `config-${family}-${createHash("sha256")
-						.update(`${key}\0${baseUrl ?? ""}`)
-						.digest("hex")
-						.slice(0, 24)}`;
-					await this.register(
-						{
-							id,
-							provider,
-							name: text(group.name) ?? id,
-							kind: "api-key",
-							source: "config",
-							baseUrl,
-							models: array(group.models).flatMap((model) => {
-								const id = text(model) ?? text(object(model).name);
-								return id ? [id] : [];
-							}),
-							createdAt: new Date().toISOString(),
-						},
-						{ type: "api_key", key, source: "login" },
-					);
-				}
-			}
+		Object.assign(this.routing, config.routing);
+		for (const { key, ...record } of config.accounts) {
+			await this.register(
+				{ ...record, kind: "api-key", source: "config", createdAt: new Date().toISOString() },
+				{ type: "api_key", key, source: "login" },
+			);
 		}
 	}
 	private async importLegacy(): Promise<void> {
@@ -300,11 +260,14 @@ export class Accounts {
 					});
 			model.provider = provider;
 			model.preferWebsockets = false;
-			if (record.baseUrl || provider === "anthropic" || provider === "openai") {
-				const baseUrl =
-					record.baseUrl ??
-					(provider === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl);
-				model.baseUrl = `${baseUrl.replace(/\/$/, "")}${baseUrl.endsWith("/v1") ? "" : "/v1"}`;
+			if (record.baseUrl && record.provider === "codex" && record.source === "config") {
+				// Legacy Codex API keys append /responses to the configured base, not /v1/responses.
+				model.baseUrl = record.baseUrl;
+			} else if (record.baseUrl || provider === "anthropic" || provider === "openai") {
+				const baseUrl = (
+					record.baseUrl ?? (provider === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl)
+				).replace(/\/+$/, "");
+				model.baseUrl = `${baseUrl}${baseUrl.endsWith("/v1") ? "" : "/v1"}`;
 			}
 			return model;
 		});

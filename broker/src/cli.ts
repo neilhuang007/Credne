@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { BrokerConfigError } from "./config.ts";
 import { type BrokerOptions, startBroker } from "./service.ts";
 
 function duration(value: string): number {
@@ -84,9 +85,11 @@ async function main(): Promise<void> {
 if (import.meta.main) {
 	try {
 		await main();
-	} catch {
+	} catch (error) {
 		console.error(
-			"credne-broker: startup failed. Check home permissions, configuration, and whether a legacy broker must be stopped.",
+			error instanceof BrokerConfigError
+				? `credne-broker: ${error.message}`
+				: "credne-broker: startup failed. Check home permissions, configuration, and whether a legacy broker must be stopped.",
 		);
 		process.exitCode = 1;
 	}

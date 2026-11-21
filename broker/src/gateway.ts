@@ -201,6 +201,14 @@ export class Gateway {
 				const headers = new Headers(request.headers);
 				for (const name of ["cookie", "cookie2", "proxy-authorization", "x-api-key", "authorization"])
 					headers.delete(name);
+				for (const [name, value] of Object.entries(account.record.headers ?? {})) headers.set(name, value);
+				// Legacy Claude accounts treated an explicit base as the path before /v1/messages.
+				const url =
+					account.record.source === "config" &&
+					account.record.id.startsWith("claude:apikey:") &&
+					account.record.baseUrl
+						? `${account.record.baseUrl}/v1/messages?beta=true`
+						: request.url;
 				let credential = await this.accounts.credential(account, attempt.signal);
 				const body = await providerBody(request, attempt);
 				if (typeof body === "string") {
@@ -215,7 +223,7 @@ export class Gateway {
 					else headers.set("authorization", `Bearer ${credential.token}`);
 					if (account.provider === "openai-codex" && credential.accountId)
 						headers.set("chatgpt-account-id", credential.accountId);
-					response = await send(request.url, {
+					response = await send(url, {
 						...init,
 						method: request.method,
 						headers,

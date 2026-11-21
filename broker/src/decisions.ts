@@ -110,6 +110,7 @@ async function forward(request: Request, account: Account, body: ArrayBuffer, de
 	const url = `${base}${base.endsWith("/v1") ? "" : "/v1"}/decisions`;
 	const headers = new Headers({ authorization: `Bearer ${credential.key}`, "content-type": "application/json" });
 	copyHeaders(request.headers, headers, ["accept", "openai-beta", "x-client-request-id"]);
+	for (const [name, value] of Object.entries(account.record.headers ?? {})) headers.set(name, value);
 	let upstream: Response;
 	try {
 		upstream = await fetch(url, { method: "POST", headers, body, redirect: "manual", signal: request.signal });

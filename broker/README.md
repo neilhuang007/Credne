@@ -90,7 +90,9 @@ api-keys:
         - api-key: YOUR_KEY
 ```
 
-`openai` and legacy `codex` groups use the same structure. Only routing and API-account fields are read. Configuration cannot expose a listener or management route.
+`openai` and legacy `codex` groups use the same structure. A `codex` key requires its original `base-url`; requests go to `<base-url>/responses`. Claude and Codex configurations in this subset retain their legacy account IDs, including distinct IDs for keys that differ only by routing headers. A key's `headers` or `models` replaces the corresponding group setting.
+
+The broker accepts literal model names and custom headers that do not override credentials or transport controls. Unsupported options such as a proxy, model alias, provider prefix, or weighted routing stop startup with a diagnostic instead of silently changing which account or upstream serves a request. Back up `config.yaml` before adapting it; the broker does not edit it.
 
 ## IPC v1
 
