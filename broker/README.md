@@ -189,8 +189,22 @@ The base URL and token come from `<home>/broker.json`, written atomically with o
 | `POST /credne/v1/route/{target}/v1/messages` | Anthropic Messages, native |
 | `POST /credne/v1/route/{target}/responses` | OpenAI Responses, native |
 | `POST /credne/v1/route/{target}/chat/completions` | Chat Completions, translated by CLIProxyAPI for providers without a native Pi adapter |
+| `POST /credne/v1/route/{target}/decisions` | OpenAI Decisions API (`POST /v1/decisions`), forwarded unchanged. Only OpenAI API-key accounts and `p.openai` serve it; see "Decisions API" |
 
 `{target}` is `a.<key>` for a pinned account or `p.<name>` for a pool. Responses are SSE in the request's protocol. Errors use the protocol's own envelope (Anthropic `{"type":"error","error":{...}}`, OpenAI `{"error":{...}}`). They carry the upstream status and `Retry-After`, and they name the account, for example `account a@example.com (claude): rate limited`.
+
+## Decisions API
+
+OpenAI's Decisions API (`POST /v1/decisions`, model `gpt-6-luna`) classifies a state with structured questions. It accepts only an OpenAI API key; OpenAI rejects Sign in with ChatGPT tokens on this route. CLIProxyAPI v8.0.70 has no support for it (and none for TypeSafe or System One), and it is not a chat protocol, so `decisions.go` does not go through CLIProxyAPI's request execution. It reads the request body, picks an account, and sends the body to `<openai base URL>/v1/decisions` with `AuthManager.HttpRequest`, which lets the registered `openai-api` executor set the account's `Authorization` header. The upstream status and body come back unchanged, including errors; only `Content-Type`, `Retry-After` and `X-Request-Id` are passed on, plus `X-Credne-Account` with the serving account.
+
+| Target | Result |
+| --- | --- |
+| `a.<key>` of an OpenAI API-key account | Served by that account and never rerouted. A missing account is 404, a disabled one 403. |
+| `a.<key>` of any other account, such as a ChatGPT subscription | 400, nothing is sent upstream. |
+| `p.openai` | `AuthManager.SelectAuth` picks an enabled OpenAI API-key account whose model list has the requested model, as for chat. None is 503. |
+| any other pool | 400. |
+
+A Decisions failure is not recorded in the account's cooldown and quota state, so it never cools the account for chat. A pinned route ignores that state; `p.openai` skips accounts that are cooling. A pinned account's concurrency limit applies. Covered by `TestDecisionsRoute`.
 
 ## Live subscription usage
 

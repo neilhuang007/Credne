@@ -4,8 +4,10 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Value } from "typebox/value";
 import { CONFIG_DIR_NAME, getAgentDir, getBundledAgentsDir } from "../../config.ts";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
+import { type ModelTier, modelTierSchema } from "./model-tiers.ts";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -14,6 +16,8 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	/** Default capability tier; dispatch maps it to a model and reasoning effort. */
+	tier?: ModelTier;
 	systemPrompt: string;
 	source: "builtin" | "user" | "project";
 	filePath: string;
@@ -37,6 +41,7 @@ type AgentFrontmatter = {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	tier?: unknown;
 };
 
 /**
@@ -97,6 +102,8 @@ function loadAgentsFromDir(dir: string, source: AgentConfig["source"]): AgentCon
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			// Frontmatter is file input: an unknown tier is ignored rather than dropping the agent.
+			tier: Value.Check(modelTierSchema, frontmatter.tier) ? frontmatter.tier : undefined,
 			systemPrompt: body,
 			source,
 			filePath,

@@ -1,9 +1,9 @@
 ---
 name: explorer
 description: >-
-  Use a cheap, fast model at medium or high thinking effort to search and return information, not to reason about designs or solutions. Read-only search agent for broad fan-out searches — when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: "medium" for moderate exploration, "very thorough" for multiple locations and naming conventions.
+  Its purpose is to search and return information, not to reason about designs or solutions. Read-only search agent for broad fan-out searches — when answering means sweeping many files, directories, or naming conventions and you only need the conclusion, not the file dumps. It reads excerpts rather than whole files, so it locates code; it doesn't review or audit it. Specify search breadth: "medium" for moderate exploration, "very thorough" for multiple locations and naming conventions.
 tools: read, grep, find, ls, bash, web_search
-models: gpt-6-luna, claude-haiku-5-5
+tier: light
 ---
 
 # Subagent guidelines

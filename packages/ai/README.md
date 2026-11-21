@@ -935,6 +935,8 @@ const result = await models.classify(model, {
 console.log(result.answers);
 ```
 
+A `score` question lists its levels in `criteria`, lowest first, and its answer is `{ type: "score", score, confidence, probabilities? }`: `score` is the expected level index averaged over the levels, and `probabilities` holds the probability of each level in the same order, so `probabilities[2]` is the probability of the third level. `openai-decisions` and `llama-cpp-classify` always report `probabilities`. System One services report it when their response carries it, as TypeSafe's Jev does; the field is absent otherwise.
+
 The public contract uses `bool` questions and `{ type: "bool", probability }` answers. The TypeSafe adapter translates those to and from its `noul` wire representation. Like image generation, `classify()` resolves to a result with `stopReason: "error"` instead of rejecting for provider, authentication, or response errors.
 
 When the service reports token counts, `result.usage` carries them with their cost at the model's catalog price, the same `Usage` shape as chat messages. All System One services report token counts; a request that was answered with malformed answers keeps its usage. Local classifiers such as `llama-cpp-classify` report no usage.
@@ -957,7 +959,7 @@ Vercel AI Gateway and OpenCode list their Jev models with text input only.
 
 ### OpenAI Decisions
 
-The `openai-decisions` API calls OpenAI's [Decisions API](https://developers.openai.com/api/docs/guides/decisions) (`POST /v1/decisions`). GPT-6 Luna is its only model. The state is sent as JSON text; with images, the input is one user message with the state followed by the images as data URLs (at most 128). `choice` and `score` questions map to the Decisions types of the same name. `bool` questions become `predicate` questions; predicates have no criteria field, so the meanings of true and false are appended to the instructions. If OpenAI refuses to answer a question, the whole result is an error. Usage reports input tokens only, priced at the catalog input rate with OpenAI's long-context multiplier.
+The `openai-decisions` API calls OpenAI's [Decisions API](https://developers.openai.com/api/docs/guides/decisions) (`POST /v1/decisions`). GPT-6 Luna is its only model. The state is sent as JSON text; with images, the input is one user message with the state followed by the images as data URLs (at most 128). `choice` and `score` questions map to the Decisions types of the same name. A score answer's per-level probabilities are placed by each entry's `value`, the level index; an answer that lacks a level or repeats one is an error, like a malformed choice answer. `bool` questions become `predicate` questions; predicates have no criteria field, so the meanings of true and false are appended to the instructions. If OpenAI refuses to answer a question, the whole result is an error. Usage reports input tokens only, priced at the catalog input rate with OpenAI's long-context multiplier.
 
 The endpoint needs an OpenAI API key; Sign in with ChatGPT credentials are rejected, so the `openai` provider hides `gpt-6-luna` from `getAvailableOfType('classifier')` while it uses OAuth. The API rejects inputs above 922K tokens, but requests that run longer than about five seconds, currently above roughly 600K input tokens, fail with a gateway timeout (504).
 

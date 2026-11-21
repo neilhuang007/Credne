@@ -4,8 +4,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AssistantMessage, createModels, type Model } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type ClassifierContext, createModels, type Model } from "@earendil-works/pi-ai";
 import { REASONING_SUMMARY_LABEL } from "@earendil-works/pi-ai/api/transform-messages";
+import { getBuiltinClassifierModel } from "@earendil-works/pi-ai/providers/all";
 import { TuiMainScreen } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
@@ -76,6 +77,12 @@ const claudeModel: BrokerModel = {
 	thinking: true,
 };
 const codexModel: BrokerModel = { id: "gpt-test", thinking: true, inputModalities: ["text", "image"] };
+const openaiKey = account({ id: "openai-api-key-luna", provider: "openai-api", kind: "api-key", label: "luna" });
+const lunaModel: BrokerModel = { id: "gpt-6-luna", thinking: false, inputModalities: ["text", "image"] };
+/** Pi's built-in Decisions classifier, which accounts take their cost and limits from. */
+const builtinLuna = getBuiltinClassifierModel("openai", "gpt-6-luna");
+const lookupClassifier = (provider: string, id: string) =>
+	provider === "openai" && id === builtinLuna.id ? builtinLuna : undefined;
 
 function spec(id: string): BrokerProviderSpec {
 	const found = providerSpecs(testCatalog()).find((entry) => entry.id === id);
@@ -373,6 +380,96 @@ describe("account catalog", () => {
 		expect(readCatalog(path)).toEqual(testCatalog());
 		writeFileSync(path, "{ not json");
 		expect(readCatalog(path).accounts).toEqual([]);
+	});
+
+	describe("Decisions classifier", () => {
+		const modelsOf = (...entries: [BrokerAccount, BrokerModel[]][]) =>
+			new Map(entries.map(([entry, models]) => [entry.key, models]));
+		const catalogFor = (entries: BrokerAccount[], models: Map<string, BrokerModel[]>) =>
+			buildCatalog(entries, models, () => undefined, lookupClassifier);
+
+		it("goes to OpenAI API keys that list gpt-6-luna and to pool:openai, with Pi's cost and limits", () => {
+			const catalog = catalogFor([openaiKey], modelsOf([openaiKey, [lunaModel]]));
+			expect(builtinLuna.api).toBe("openai-decisions");
+			expect(catalog.accounts[0]!.classifiers).toEqual([
+				{ ...builtinLuna, provider: "acct:openai-api-key-luna", baseUrl: BROKER_PLACEHOLDER_URL },
+			]);
+			expect(catalog.pools).toEqual([
+				expect.objectContaining({
+					name: "openai",
+					classifiers: [{ ...builtinLuna, provider: "pool:openai", baseUrl: BROKER_PLACEHOLDER_URL }],
+				}),
+			]);
+			expect(catalog.accounts[0]!.classifiers![0]).toMatchObject({
+				cost: builtinLuna.cost,
+				contextWindow: builtinLuna.contextWindow,
+			});
+		});
+
+		it("is not offered for ChatGPT subscriptions, which the Decisions API rejects", () => {
+			const subscription = account({
+				id: "codex-dddd-d@example.com.json",
+				provider: "codex",
+				email: "d@example.com",
+			});
+			const catalog = catalogFor(
+				[subscription, openaiKey],
+				modelsOf([subscription, [lunaModel]], [openaiKey, [lunaModel]]),
+			);
+			expect(catalog.accounts.map((entry) => [entry.id, entry.classifiers?.length])).toEqual([
+				[subscription.id, undefined],
+				[openaiKey.id, 1],
+			]);
+			expect(catalog.pools.map((pool) => [pool.name, pool.classifiers?.length])).toEqual([
+				["codex", undefined],
+				["openai", 1],
+			]);
+			expect(providerSpecs(catalog).map((entry) => [entry.id, entry.classifiers?.length])).toEqual([
+				["pool:codex", undefined],
+				["pool:openai", 1],
+				[`acct:${subscription.id.replace(/\.json$/, "")}`, undefined],
+				[`acct:${openaiKey.id}`, 1],
+			]);
+		});
+
+		it("is not offered when the key does not list the model, or Pi has no matching classifier", () => {
+			const imageOnly = modelsOf([openaiKey, [{ id: "gpt-image-1", thinking: false }]]);
+			expect(catalogFor([openaiKey], imageOnly).accounts[0]!.classifiers).toBeUndefined();
+			expect(catalogFor([openaiKey], imageOnly).pools[0]!.classifiers).toBeUndefined();
+			const listed = modelsOf([openaiKey, [lunaModel]]);
+			expect(buildCatalog([openaiKey], listed, () => undefined).accounts[0]!.classifiers).toBeUndefined();
+			const otherApi = () => ({ ...builtinLuna, api: "typesafe-system-one" });
+			expect(buildCatalog([openaiKey], listed, () => undefined, otherApi).accounts[0]!.classifiers).toBeUndefined();
+		});
+
+		it("is kept in the catalog file, and entries this version cannot serve are dropped", () => {
+			const catalog = catalogFor([openaiKey], modelsOf([openaiKey, [lunaModel]]));
+			const path = join(tempDir(), "catalog.json");
+			writeCatalog(path, catalog);
+			expect(readCatalog(path)).toEqual(catalog);
+
+			const [pinned] = catalog.accounts;
+			const [pool] = catalog.pools;
+			writeFileSync(
+				path,
+				JSON.stringify({
+					version: 2,
+					accounts: [{ ...pinned, classifiers: "gpt-6-luna" }],
+					pools: [
+						{
+							...pool,
+							classifiers: [
+								{ type: "classifier", api: "typesafe-system-one", id: "jev-latest" },
+								...pool!.classifiers!,
+							],
+						},
+					],
+				}),
+			);
+			const read = readCatalog(path);
+			expect(read.accounts[0]!.classifiers).toBeUndefined();
+			expect(read.pools[0]!.classifiers).toEqual(pool!.classifiers);
+		});
 	});
 });
 
@@ -719,6 +816,92 @@ describe("account providers", () => {
 		expect(otherAccount).toContainEqual(
 			expect.objectContaining({ type: "text", text: "Earlier answer from account A." }),
 		);
+	});
+
+	describe("Decisions classifier", () => {
+		const catalog = buildCatalog(
+			[openaiKey, codexC],
+			new Map([
+				[openaiKey.key, [lunaModel]],
+				[codexC.key, [lunaModel]],
+			]),
+			() => undefined,
+			lookupClassifier,
+		);
+		const specOf = (id: string): BrokerProviderSpec => providerSpecs(catalog).find((entry) => entry.id === id)!;
+		const pinned = specOf(`acct:${openaiKey.id}`);
+		const pool = specOf("pool:openai");
+		const context: ClassifierContext = {
+			state: { task: "rename a variable" },
+			questions: {
+				difficulty: { type: "score", instructions: "How hard is the task?", criteria: ["easy", "hard"] },
+			},
+		};
+		const decisionsAnswer = {
+			model: "gpt-6-luna",
+			answers: [
+				{
+					type: "score",
+					name: "difficulty",
+					score: 1.5,
+					probabilities: [
+						{ value: 0, label: "easy", probability: 0.4 },
+						{ value: 1, label: "hard", probability: 0.6 },
+					],
+					confidence: 0.8,
+				},
+			],
+			usage: { input_tokens: 100, output_tokens: 0 },
+		};
+
+		it("posts to the decisions route of a pinned account or of pool:openai with the broker token", async () => {
+			const broker = await startFakeBroker({
+				respond: (request) =>
+					request.path.endsWith("/decisions") ? { status: 200, body: decisionsAnswer } : undefined,
+			});
+			const models = createModels();
+			models.setProvider(createAccountProvider(pinned, clientFor(broker.home)));
+			models.setProvider(createAccountProvider(pool, clientFor(broker.home)));
+
+			const results = [];
+			for (const spec of [pinned, pool]) {
+				results.push(await models.classify(spec.classifiers![0]!, context));
+			}
+
+			for (const result of results) {
+				expect(result).toMatchObject({
+					stopReason: "stop",
+					answers: { difficulty: { type: "score", score: 1.5, confidence: 0.8 } },
+				});
+				// Priced from the built-in entry: 100 input tokens at its input rate.
+				expect(result.usage?.cost.total).toBeCloseTo((100 * builtinLuna.cost.input) / 1_000_000, 12);
+			}
+			const sent = broker.requests.filter((request) => request.path.includes("/route/"));
+			expect(sent.map((request) => request.path)).toEqual([
+				`/credne/v1/route/a.${openaiKey.key}/decisions`,
+				"/credne/v1/route/p.openai/decisions",
+			]);
+			for (const request of sent) {
+				expect(request.method).toBe("POST");
+				expect(request.headers.authorization).toBe(`Bearer ${TOKEN}`);
+				expect(JSON.parse(request.body)).toMatchObject({ model: "gpt-6-luna" });
+			}
+		});
+
+		it("is available for an enabled API-key account and pool, never for a subscription or a disabled account", async () => {
+			const broker = await startFakeBroker();
+			const availableFor = async (spec: BrokerProviderSpec) => {
+				const models = createModels();
+				models.setProvider(createAccountProvider(spec, clientFor(broker.home)));
+				return (await models.getAvailableOfType("classifier")).map((model) => `${model.provider}/${model.id}`);
+			};
+			expect(await availableFor(pinned)).toEqual([`acct:${openaiKey.id}/gpt-6-luna`]);
+			expect(await availableFor(pool)).toEqual(["pool:openai/gpt-6-luna"]);
+			expect(await availableFor(specOf("pool:codex"))).toEqual([]);
+			expect(await availableFor(specOf(ACCT_C))).toEqual([]);
+			expect(await availableFor({ ...pinned, disabled: true })).toEqual([]);
+			expect(broker.requests).toEqual([]);
+		});
 	});
 });
 

@@ -135,6 +135,7 @@ describe("llama.cpp classifier", () => {
 			type: "score",
 			score: levels[1]! + 2 * levels[2]!,
 			confidence: peakConfidence(levels),
+			probabilities: levels,
 		});
 
 		const root = classifierModel.baseUrl.replace(/\/v1$/u, "");
@@ -394,7 +395,12 @@ describe("llama.cpp classifier", () => {
 				["0", "1", "2"],
 				[0.2, 0.3, 0.5],
 			),
-		).toEqual({ type: "score", score: 1.3, confidence: peakConfidence([0.2, 0.3, 0.5]) });
+		).toEqual({
+			type: "score",
+			score: 1.3,
+			confidence: peakConfidence([0.2, 0.3, 0.5]),
+			probabilities: [0.2, 0.3, 0.5],
+		});
 	});
 });
 

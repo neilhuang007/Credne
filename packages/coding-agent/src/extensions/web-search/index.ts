@@ -12,6 +12,7 @@ import {
 import type { BrokerClient } from "../accounts/client.ts";
 import { createAccountBrokerClient } from "../accounts/index.ts";
 import { latestServingProvider } from "../accounts/served.ts";
+import { resolveModelTier } from "../subagent/model-tiers.ts";
 import {
 	type DomainFilter,
 	type SearchEntry,
@@ -26,7 +27,8 @@ const domainList = (description: string) =>
 
 /**
  * Registers `web_search`, modeled on Claude Code's WebSearch tool. Claude searches run on a local Claude
- * subscription through the model registry; Codex searches run on a broker subscription.
+ * subscription through the model registry; Codex searches run on a broker subscription. Either way the search
+ * model is the light-tier model of the subscription that serves the search, whatever model the session uses.
  */
 export default function webSearchExtension(pi: ExtensionAPI): void {
 	const client = createAccountBrokerClient();
@@ -87,8 +89,8 @@ type LocalSearch =
 
 /**
  * Search on a local Claude subscription: the account the session is pinned to, or, under a Claude pool or any other
- * Claude selection, the accounts that offer the session's model, the one that answered last first. An account at
- * its usage limit passes the search to the next one.
+ * Claude selection, the accounts that offer the session's model, the one that answered last first. Each searches on
+ * its light-tier model. An account at its usage limit passes the search to the next one.
  */
 async function searchLocalClaude(
 	ctx: ExtensionContext,
@@ -112,19 +114,31 @@ async function searchLocalClaude(
 	return limited ? { type: "limited", error: limited } : { type: "none" };
 }
 
-/** The models of the session's model on local Claude subscriptions that can serve now, in the order to try them. */
+/**
+ * The models to search with, in the order to try them, one per local Claude subscription that offers the session's
+ * model. Which subscriptions count follows the session; the model is the subscription's light-tier model, or the
+ * session's model when the subscription serves no light-tier model.
+ */
 function localClaudeModels(ctx: ExtensionContext): Model<Api>[] {
 	const active = ctx.model;
 	if (!active || active.provider.startsWith(ACCOUNT_PROVIDER_PREFIX)) return [];
 	if (!isLocalClaudeProvider(active.provider) && active.api !== "anthropic-messages" && !isVirtualModel(active))
 		return [];
-	const offering = ctx.modelRegistry
-		.getAvailable()
-		.filter((model) => isLocalClaudeProvider(model.provider) && model.id === active.id);
+	const available = ctx.modelRegistry.getAvailable().filter((model) => isLocalClaudeProvider(model.provider));
+	const offering = available.filter((model) => model.id === active.id);
+	const pinned = isLocalClaudeProvider(active.provider);
+	const served = pinned ? undefined : latestServingProvider(ctx.sessionManager.getBranch());
 	// A session pinned to one subscription never searches on another.
-	if (isLocalClaudeProvider(active.provider)) return offering.filter((model) => model.provider === active.provider);
-	const served = latestServingProvider(ctx.sessionManager.getBranch());
-	return offering.sort((left, right) => Number(right.provider === served) - Number(left.provider === served));
+	const eligible = pinned
+		? offering.filter((model) => model.provider === active.provider)
+		: offering.sort((left, right) => Number(right.provider === served) - Number(left.provider === served));
+	return eligible.map((model) => lightTierOr(model, available));
+}
+
+/** The light-tier model of the subscription that serves `offered`, or `offered` itself when it serves none. */
+function lightTierOr(offered: Model<Api>, available: readonly Model<Api>[]): Model<Api> {
+	const subscriptionModels = available.filter((model) => model.provider === offered.provider);
+	return resolveModelTier("light", subscriptionModels)?.model ?? offered;
 }
 
 // Claude Code's full WebSearch description with its Sources requirement. Not US-only: Codex search has no such limit.
@@ -169,6 +183,11 @@ function formatResults(query: string, entries: readonly SearchEntry[]): string {
 	return text.trim();
 }
 
+/**
+ * The broker subscription to search on and its model. Which accounts count follows the session: an account must
+ * offer the session's model, or, with no pinned account or pool, any model. The search model is the account's
+ * light-tier model, or, when it serves none, the session's model (the account's first model if it lacks that one).
+ */
 async function selectSubscription(client: BrokerClient, active: Model<Api> | undefined, signal: AbortSignal) {
 	const provider = active?.provider ?? "";
 	const pinned = provider.startsWith(ACCOUNT_PROVIDER_PREFIX);
@@ -190,8 +209,10 @@ async function selectSubscription(client: BrokerClient, active: Model<Api> | und
 		if (family !== "codex" && family !== "claude") continue;
 		const models = await client.accountModels(account.key, signal);
 		const current = models.find((model) => model.id === active?.id);
-		const model = current ?? (pinned || pool ? undefined : models[0]);
-		if (model) return { key: account.key, family, model: model.id } as const;
+		const offered = current ?? (pinned || pool ? undefined : models[0]);
+		if (!offered) continue;
+		const model = resolveModelTier("light", models)?.model ?? offered;
+		return { key: account.key, family, model: model.id } as const;
 	}
 	throw new Error(
 		"No available Claude or ChatGPT subscription for this search. Use /accounts add claude-subscription or /accounts add codex, then select an available subscription model with /model.",

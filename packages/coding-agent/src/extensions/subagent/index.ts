@@ -27,6 +27,7 @@ import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { captureSubagentContext, turnSchema } from "./context.ts";
 import { createSubagentDispatch, reasoningEffortSchema } from "./dispatch.ts";
 import { registerModelSearch } from "./model-search.ts";
+import { type ModelTier, modelTierSchema } from "./model-tiers.ts";
 import {
 	aggregateUsage,
 	cacheHitRate,
@@ -40,6 +41,7 @@ import {
 } from "./runner.ts";
 import { type SessionPanelResult, SubagentSessionPanel } from "./session-panel.ts";
 import { DELEGATION_TOOLS, getWorkerTeam, registerTeamTools, revealTools } from "./team.ts";
+import { classifyTiers, type TierOverride, type TierRequest, withRating } from "./tier-classifier.ts";
 import { registerWorkerCache } from "./worker-cache.ts";
 import { connectWorkerChannel } from "./worker-channel.ts";
 import { registerWorkerPrompt, WORKER_FLAG } from "./worker-prompt.ts";
@@ -249,9 +251,10 @@ const dispatchProperties = {
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Model ID or unique name on the current account, such as luna. Use search_models to discover models. An explicit provider/model ID opts into that route. Overrides the agent profile model.",
+				"Model ID, unique name, or family alias such as sol, opus or flash (newest of that family) on the current account. Use search_models to discover models. An explicit provider/model ID opts into that route. Overrides the agent profile model.",
 		}),
 	),
+	tier: Type.Optional(modelTierSchema),
 	reasoningEffort: Type.Optional(reasoningEffortSchema),
 	turn: Type.Optional(turnSchema),
 };
@@ -382,11 +385,11 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Bundled agents: explorer (read-only codebase search), worker (multi-step tasks), critic (review of finished changes), crazy (extremely hard problems and deep research). User and project definitions can override these names.",
-			"Explorer: choose a cheap, fast model at medium or high thinking effort to search and return information, not to reason about solutions. Worker: choose a capable middle-tier model, such as Sol or Opus 5.5, at xhigh effort to reason during implementation. Crazy: choose an expensive, highly capable model at xhigh or max effort and supply focused context and references so it can concentrate on the hard problem.",
+			"The harness picks each agent's model and reasoning effort from its tier, so a call needs only agent and task. Set tier, model or reasoningEffort only to override that: tier when a task is clearly easier or harder than its agent assumes, model or reasoningEffort when the user asks for one. search_models lists what the account serves when a named model does not resolve.",
 			"Use background: true for independent work while you continue, then receive each result automatically. Use foreground execution when your next step needs the result immediately.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"Relevant subagent tools will be declared after your first call. Use search_models once when selecting a model; it defaults to five compact cost-ranked results. Reuse a result while the route is valid, and refresh after model/account changes or dispatch failure. Prefer economical models for bounded tasks, but price does not guarantee capability. Use the bare modelId portion of a result ID to stay on the current account; include its provider only when intentionally changing routes.",
-			"Choose model, reasoningEffort, and turn at the top level or per task or chain step. Explicit model overrides the agent profile. turn: 0 starts fresh with only the task, -1 also gives the subagent a copy of the conversation so far with tool outputs shortened, and a positive turn number gives that copy up to a checkpoint from get_subagent_context, including task completions or reviewed milestones. The copy is captured at submission. Use list_agents, send_agent_message, interrupt_agent, continue_agent, steer_agent, and change_agent_model to coordinate workers by ID. change_agent_model changes an idle or interrupted worker's model without losing its conversation; interrupt active workers first.",
+			"Relevant subagent tools will be declared after your first call.",
+			"Overrides and turn apply at the top level or per task or chain step. turn: 0 starts fresh with only the task, -1 also gives the subagent a copy of the conversation so far with tool outputs shortened, and a positive turn number gives that copy up to a checkpoint from get_subagent_context, including task completions or reviewed milestones. The copy is captured at submission. Use list_agents, send_agent_message, interrupt_agent, continue_agent, steer_agent, and change_agent_model to coordinate workers by ID. change_agent_model changes an idle or interrupted worker's model without losing its conversation; interrupt active workers first.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -487,24 +490,41 @@ export default function (pi: ExtensionAPI) {
 			);
 			const resolvedSingle = params.agent ? resolveAgent(ctx.cwd, agentScope, params.agent, params.cwd) : undefined;
 			const captureDefaults = (
-				selection: { model?: string; reasoningEffort?: typeof params.reasoningEffort; turn?: number },
+				selection: {
+					model?: string;
+					tier?: typeof params.tier;
+					reasoningEffort?: typeof params.reasoningEffort;
+					turn?: number;
+				},
 				resolved: ResolvedAgent<AgentConfig>,
+				rating: TierOverride | undefined,
 			): DispatchDefaults => ({
 				...dispatch.resolve(
 					{
 						model: selection.model ?? params.model,
+						tier: selection.tier ?? params.tier,
 						reasoningEffort: selection.reasoningEffort ?? params.reasoningEffort,
 					},
 					ctx,
-					resolved.agent?.model,
+					// The rated tier replaces the profile's tier, and the rated effort the effort of its tier row;
+					// neither is a choice of the caller, so an explicit model, tier or reasoningEffort still wins.
+					withRating(resolved.agent, rating),
 				),
 				context: captureSubagentContext(selection.turn ?? params.turn, ctx),
 				extraArgs: ["--subagent-worker", "--planning-worker"],
 			});
-			// Resolve every control before any job is submitted or any chain step starts.
-			const chainDefaults = (params.chain ?? []).map((step, index) => captureDefaults(step, resolvedChain[index]));
-			const taskDefaults = (params.tasks ?? []).map((task, index) => captureDefaults(task, resolvedTasks[index]));
-			const singleDefaults = resolvedSingle ? captureDefaults(params, resolvedSingle) : undefined;
+			const tierRequest = (
+				item: { task?: string; model?: string; tier?: ModelTier },
+				resolved: ResolvedAgent<AgentConfig> | undefined,
+			): TierRequest | undefined =>
+				resolved?.agent && item.task !== undefined
+					? {
+							agent: resolved.agent,
+							work: { kind: "task", task: item.task },
+							model: item.model ?? params.model,
+							tier: item.tier ?? params.tier,
+						}
+					: undefined;
 
 			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
 				let selectedAgents: ResolvedAgent<AgentConfig>[] = [];
@@ -540,6 +560,33 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
+
+			// The classifier sees the tasks only once the call is approved, and rates all of them at once.
+			const [chainTiers, taskTiers, singleTiers] = await Promise.all([
+				classifyTiers(
+					pi,
+					dispatch,
+					(params.chain ?? []).map((step, index) => tierRequest(step, resolvedChain[index])),
+					ctx,
+					signal,
+				),
+				classifyTiers(
+					pi,
+					dispatch,
+					(params.tasks ?? []).map((task, index) => tierRequest(task, resolvedTasks[index])),
+					ctx,
+					signal,
+				),
+				classifyTiers(pi, dispatch, [tierRequest(params, resolvedSingle)], ctx, signal),
+			]);
+			// Resolve every control before any job is submitted or any chain step starts.
+			const chainDefaults = (params.chain ?? []).map((step, index) =>
+				captureDefaults(step, resolvedChain[index], chainTiers[index]),
+			);
+			const taskDefaults = (params.tasks ?? []).map((task, index) =>
+				captureDefaults(task, resolvedTasks[index], taskTiers[index]),
+			);
+			const singleDefaults = resolvedSingle ? captureDefaults(params, resolvedSingle, singleTiers[0]) : undefined;
 
 			if (params.background) {
 				if (hasChain)

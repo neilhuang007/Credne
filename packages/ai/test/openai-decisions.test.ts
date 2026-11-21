@@ -122,7 +122,7 @@ describe("OpenAI Decisions", () => {
 				probabilities: { success: 0.9, failure: 0.1 },
 				confidence: 0.8,
 			},
-			satisfaction: { type: "score", score: 1.8, confidence: 0.7 },
+			satisfaction: { type: "score", score: 1.8, confidence: 0.7, probabilities: [0.05, 0.1, 0.85] },
 			approved: { type: "bool", probability: 0.95 },
 		});
 		expect(result.usage).toMatchObject({ input: 164, output: 0, cacheRead: 0, totalTokens: 164 });
@@ -213,6 +213,38 @@ describe("OpenAI Decisions", () => {
 		expect(missing.errorMessage).toContain("did not return an answer for approved");
 		expect(mistyped.stopReason).toBe("error");
 		expect(mistyped.errorMessage).toContain("did not return a predicate answer for approved");
+	});
+
+	it("places score level probabilities by level index and rejects incomplete ones", async () => {
+		const answerWith = (probabilities: unknown) =>
+			classify(model, context, {
+				apiKey: "secret",
+				fetch: async () =>
+					Response.json({
+						answers: [wireAnswers[0], { ...wireAnswers[1], probabilities }, wireAnswers[2]],
+					}),
+			});
+		const level = (value: number, probability: number) => ({ value, label: `level ${value}`, probability });
+
+		const shuffled = await answerWith([level(2, 0.85), level(0, 0.05), level(1, 0.1)]);
+		expect(shuffled.stopReason).toBe("stop");
+		expect(shuffled.answers.satisfaction).toMatchObject({ type: "score", probabilities: [0.05, 0.1, 0.85] });
+
+		const invalid: Record<string, unknown> = {
+			missing: undefined,
+			short: [level(0, 0.5), level(1, 0.5)],
+			duplicate: [level(0, 0.5), level(1, 0.25), level(1, 0.25)],
+			outOfRange: [level(0, 0.5), level(1, 0.25), level(3, 0.25)],
+			unnumbered: [level(0, 0.5), level(1, 0.25), { label: "high", probability: 0.25 }],
+			badProbability: [level(0, 0.5), level(1, 0.25), { value: 2, label: "high", probability: "high" }],
+		};
+		for (const [name, probabilities] of Object.entries(invalid)) {
+			const result = await answerWith(probabilities);
+			expect(result.stopReason, name).toBe("error");
+			expect(result.answers, name).toEqual({});
+			expect(result.errorMessage, name).toContain("OpenAI Decisions returned");
+			expect(result.errorMessage, name).toContain("satisfaction");
+		}
 	});
 
 	it("preserves prototype-sensitive question IDs in answers", async () => {

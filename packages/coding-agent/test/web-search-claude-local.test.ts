@@ -178,6 +178,83 @@ describe("web search on a local Claude subscription", () => {
 		expect(broker.listAccounts).not.toHaveBeenCalled();
 	});
 
+	describe("search model", () => {
+		const light = "claude-haiku-5-5";
+		const subAHaiku = model("claude-sub:a", light);
+		const subBHaiku = model("claude-sub:b", light);
+
+		it("is the light-tier model of the subscription, not the session's model", async () => {
+			const { ctx, attempts } = createContext(subA, [subA, subAHaiku, subB, subBHaiku]);
+
+			const result = await runSearch(ctx);
+
+			// A session pinned to one subscription searches on that subscription only.
+			expect(attempts.map((attempt) => [attempt.model.provider, attempt.model.id])).toEqual([
+				["claude-sub:a", light],
+			]);
+			expect(attempts[0]!.payload).toMatchObject({ model: light });
+			expect(attempts[0]!.payload).not.toHaveProperty("thinking");
+			expect(result.details).toMatchObject({ family: "claude", model: light });
+		});
+
+		it("falls back to the session's model on a subscription that serves no light-tier model", async () => {
+			const { ctx, attempts } = createContext(subA, [subA, subB, subBHaiku]);
+
+			const result = await runSearch(ctx);
+
+			expect(attempts.map((attempt) => [attempt.model.provider, attempt.model.id])).toEqual([
+				["claude-sub:a", opus],
+			]);
+			expect(result.details).toMatchObject({ model: opus });
+		});
+
+		it("is chosen per subscription under a pool, the one that answered last first", async () => {
+			const pool = createVirtualModel({ provider: "pool:claude", id: opus, name: opus });
+			const available = [subA, subAHaiku, subB];
+
+			const lastOnB = createContext(pool, available, { branch: [answer("claude-sub:a"), answer("claude-sub:b")] });
+			await runSearch(lastOnB.ctx);
+			expect(lastOnB.attempts.map((attempt) => [attempt.model.provider, attempt.model.id])).toEqual([
+				["claude-sub:b", opus],
+			]);
+
+			const lastOnA = createContext(pool, available, { branch: [answer("claude-sub:b"), answer("claude-sub:a")] });
+			await runSearch(lastOnA.ctx);
+			expect(lastOnA.attempts.map((attempt) => [attempt.model.provider, attempt.model.id])).toEqual([
+				["claude-sub:a", light],
+			]);
+		});
+
+		it("keeps the usage-limit fallthrough, each subscription on its own search model", async () => {
+			const pool = createVirtualModel({ provider: "pool:all", id: opus, name: opus });
+			const { ctx, attempts } = createContext(pool, [subA, subAHaiku, subB], {
+				fail: (target) => (target.provider === "claude-sub:a" ? limitFailure(target.provider) : undefined),
+			});
+
+			const result = await runSearch(ctx);
+
+			expect(attempts.map((attempt) => [attempt.model.provider, attempt.model.id])).toEqual([
+				["claude-sub:a", light],
+				["claude-sub:b", opus],
+			]);
+			expect(result.details).toMatchObject({ model: opus, searchCount: 1 });
+		});
+
+		it("does not use a subscription that serves the light-tier model but not the session's model", async () => {
+			const pool = createVirtualModel({ provider: "pool:claude", id: opus, name: opus });
+			const { ctx, attempts } = createContext(pool, [subA, subAHaiku, subBHaiku], {
+				branch: [answer("claude-sub:b")],
+				fail: (target) => limitFailure(target.provider),
+			});
+
+			await expect(runSearch(ctx)).rejects.toThrow("Claude hosted web search failed");
+
+			expect(attempts.map((attempt) => [attempt.model.provider, attempt.model.id])).toEqual([
+				["claude-sub:a", light],
+			]);
+		});
+	});
+
 	it("searches under a pool on the accounts that offer the model, the one that answered last first", async () => {
 		const pool = createVirtualModel({ provider: "pool:claude", id: opus, name: opus });
 		const haiku = model("claude-sub:a", "claude-haiku-4-5");

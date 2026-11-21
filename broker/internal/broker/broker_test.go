@@ -81,6 +81,10 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	key := f.key(r)
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+		if strings.HasPrefix(key, "sk-openai-") {
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-6-luna"},{"id":"gpt-image-1"}]}`))
+			return
+		}
 		if !strings.HasPrefix(key, "sk-ant-api") && !strings.HasPrefix(key, "sk-ant-oat01-fake-") {
 			http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`, http.StatusUnauthorized)
 			return
@@ -108,6 +112,13 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "7")
 		w.WriteHeader(status)
 		_, _ = fmt.Fprintf(w, `{"type":"error","error":{"type":"rate_limit_error","message":"key %s is rate limited"}}`, key)
+		return
+	}
+	if r.URL.Path == "/v1/decisions" {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "req_fake")
+		w.Header().Set("Set-Cookie", "__cf_bm=upstream-cookie")
+		_, _ = fmt.Fprintf(w, `{"model":"gpt-6-luna","answers":[],"path":%q,"key":%q}`, r.URL.Path, key)
 		return
 	}
 	if strings.Contains(string(body), "HANG") {
@@ -208,6 +219,7 @@ api-keys:
 			Home:             home,
 			Version:          "test",
 			AnthropicBaseURL: upstream.server.URL,
+			OpenAIBaseURL:    upstream.server.URL,
 			OnReady:          func(s State) { ready <- s },
 		})
 	}()
@@ -414,6 +426,21 @@ func (tb *testBroker) addAPIKey(t *testing.T, name, key string) (int, string) {
 	}
 	_ = json.Unmarshal([]byte(text), &out)
 	return resp.StatusCode, out.Error
+}
+
+// addOpenAIKey adds an OpenAI API key through /api-keys and fails the test unless it is accepted.
+func (tb *testBroker) addOpenAIKey(t *testing.T, name, key string) accountView {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"provider": "openai", "name": name, "key": key})
+	resp := tb.request(t, http.MethodPost, APIPrefix+"api-keys", string(body), nil)
+	text := readAll(t, resp)
+	var added struct {
+		Account accountView `json:"account"`
+	}
+	if err := json.Unmarshal([]byte(text), &added); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("add OpenAI key %s: status %d body %s", name, resp.StatusCode, text)
+	}
+	return added.Account
 }
 
 // accountIDs lists every account id in the broker's listing order.

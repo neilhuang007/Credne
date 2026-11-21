@@ -210,6 +210,9 @@ func (s *server) configure(engine *gin.Engine, handler *handlers.BaseAPIHandler,
 	api.POST("/route/:target/v1/messages", s.execute(protocolClaude))
 	api.POST("/route/:target/responses", s.execute(protocolOpenAIResponses))
 	api.POST("/route/:target/chat/completions", s.execute(protocolOpenAIChat))
+	// Decisions is not a chat protocol: the body goes to OpenAI's /v1/decisions as sent, so only
+	// OpenAI API-key accounts and pool openai serve it.
+	api.POST("/route/:target/decisions", s.decisions)
 }
 
 // registerAPIExecutors binds broker-managed accounts to their official API handlers.

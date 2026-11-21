@@ -1,0 +1,14 @@
+[
+	{ "provider": "anthropic", "tier": "light", "alias": "haiku", "effort": "medium" },
+	{ "provider": "anthropic", "tier": "medium", "alias": "opus", "effort": "xhigh" },
+	{ "provider": "anthropic", "tier": "heavy", "alias": "fable", "effort": "xhigh" },
+	{ "provider": "openai", "tier": "light", "alias": "luna", "effort": "medium" },
+	{ "provider": "openai", "tier": "medium", "alias": "sol", "effort": "xhigh" },
+	{ "provider": "openai", "tier": "heavy", "alias": "astra", "effort": "xhigh" },
+	{ "provider": "xai", "tier": "light", "alias": "grok", "effort": "low" },
+	{ "provider": "xai", "tier": "medium", "alias": "grok", "effort": "high" },
+	{ "provider": "xai", "tier": "heavy", "alias": "grok", "effort": "xhigh" },
+	{ "provider": "meta", "tier": "light", "alias": "ember", "effort": "medium" },
+	{ "provider": "meta", "tier": "medium", "alias": "spark", "effort": "xhigh" },
+	{ "provider": "meta", "tier": "heavy", "alias": "wonder", "effort": "xhigh" }
+]

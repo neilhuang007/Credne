@@ -2,6 +2,8 @@ import {
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
+	type ClassifierApi,
+	type ClassifierModel,
 	createProvider,
 	type Model,
 	type Provider,
@@ -11,6 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { openAIDecisionsApi } from "@earendil-works/pi-ai/api/openai-decisions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import {
 	type AccountCatalog,
@@ -46,6 +49,8 @@ export interface AccountProviderSpec {
 	/** Disabled accounts stay registered so sessions that used them fail with a clear reason. */
 	disabled: boolean;
 	models: Model<Api>[];
+	/** Classifier models served through this entry's broker route, for example the Decisions model of an OpenAI API key. */
+	classifiers?: ClassifierModel<ClassifierApi>[];
 }
 
 /** A spec the broker serves. */
@@ -66,6 +71,7 @@ export function providerSpecs(catalog: AccountCatalog): BrokerProviderSpec[] {
 				subscription: false,
 				disabled: false,
 				models: pool.models,
+				classifiers: pool.classifiers,
 			}),
 		),
 		...catalog.accounts.map(
@@ -77,6 +83,7 @@ export function providerSpecs(catalog: AccountCatalog): BrokerProviderSpec[] {
 				subscription: account.kind === "oauth",
 				disabled: account.disabled,
 				models: account.models,
+				classifiers: account.classifiers,
 			}),
 		),
 	];
@@ -85,7 +92,8 @@ export function providerSpecs(catalog: AccountCatalog): BrokerProviderSpec[] {
 /**
  * A Pi provider backed by the account broker. Requests use Pi's own native API adapters, so
  * streaming, tool calls, reasoning and usage parsing are unchanged; only the endpoint and the
- * credential differ. The credential is the broker's per-run token, never a provider secret.
+ * credential differ. The credential is the broker's per-run token, never a provider secret. Classifier
+ * models post to the route's `decisions` path, which the broker forwards to OpenAI's Decisions API.
  */
 export function createAccountProvider(
 	spec: BrokerProviderSpec,
@@ -116,13 +124,15 @@ export function createAccountProvider(
 				},
 			},
 		},
-		models: spec.models,
+		models: [...spec.models, ...(spec.classifiers ?? [])],
 		// A pool may mix APIs (Claude and GPT models), so every adapter is available.
 		api: {
 			"anthropic-messages": observed(anthropicMessagesApi(), observer),
 			"openai-responses": observed(openAIResponsesApi(), observer),
 			"openai-completions": observed(openAICompletionsApi(), observer),
 		},
+		// Not observed: a classification may be served by another pool account than the chat, so it must not move the footer.
+		classifiers: { "openai-decisions": openAIDecisionsApi() },
 	});
 }
 

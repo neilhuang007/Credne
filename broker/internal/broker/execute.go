@@ -78,6 +78,48 @@ func decodeKey(key string) (string, error) {
 	return string(raw), nil
 }
 
+// requestHead is the part of a request body the broker reads; the body itself is forwarded as sent.
+type requestHead struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
+}
+
+// readRequest reads a size-bounded JSON body that names a model. When it cannot, it answers the
+// client and reports false.
+func readRequest(c *gin.Context, protocol string) ([]byte, requestHead, bool) {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxRequestBytes+1))
+	if err != nil {
+		writeError(c, protocol, http.StatusBadRequest, "failed to read request body", nil)
+		return nil, requestHead{}, false
+	}
+	if len(body) > maxRequestBytes {
+		writeError(c, protocol, http.StatusRequestEntityTooLarge, "request body too large", nil)
+		return nil, requestHead{}, false
+	}
+	var head requestHead
+	if err = json.Unmarshal(body, &head); err != nil || head.Model == "" {
+		writeError(c, protocol, http.StatusBadRequest, "request body must be JSON with a model", nil)
+		return nil, requestHead{}, false
+	}
+	return body, head, true
+}
+
+// pinnedAccount resolves the account a pinned target names, with the label that error messages
+// use for it. A missing or disabled account is answered to the client and reported as false.
+func (s *server) pinnedAccount(c *gin.Context, protocol, authID string) (*coreauth.Auth, string, bool) {
+	auth, ok := s.handler.AuthManager.GetByID(authID)
+	if !ok {
+		writeError(c, protocol, http.StatusNotFound, fmt.Sprintf("account %s not found", authID), nil)
+		return nil, "", false
+	}
+	label := "account " + accountName(auth)
+	if auth.Disabled {
+		writeError(c, protocol, http.StatusForbidden, label+" is disabled", nil)
+		return nil, "", false
+	}
+	return auth, label, true
+}
+
 // execute serves one native-protocol request for a pinned account or a pool.
 func (s *server) execute(protocol string) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -86,21 +128,8 @@ func (s *server) execute(protocol string) gin.HandlerFunc {
 			writeError(c, protocol, http.StatusBadRequest, err.Error(), nil)
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxRequestBytes+1))
-		if err != nil {
-			writeError(c, protocol, http.StatusBadRequest, "failed to read request body", nil)
-			return
-		}
-		if len(body) > maxRequestBytes {
-			writeError(c, protocol, http.StatusRequestEntityTooLarge, "request body too large", nil)
-			return
-		}
-		var head struct {
-			Model  string `json:"model"`
-			Stream bool   `json:"stream"`
-		}
-		if err = json.Unmarshal(body, &head); err != nil || head.Model == "" {
-			writeError(c, protocol, http.StatusBadRequest, "request body must be JSON with a model", nil)
+		body, head, ok := readRequest(c, protocol)
+		if !ok {
 			return
 		}
 
@@ -115,16 +144,11 @@ func (s *server) execute(protocol string) gin.HandlerFunc {
 		}
 		label := "pool " + target.pool
 		if target.authID != "" {
-			auth, ok := s.handler.AuthManager.GetByID(target.authID)
-			if !ok {
-				writeError(c, protocol, http.StatusNotFound, fmt.Sprintf("account %s not found", target.authID), nil)
+			auth, accountLabel, found := s.pinnedAccount(c, protocol, target.authID)
+			if !found {
 				return
 			}
-			label = "account " + accountName(auth)
-			if auth.Disabled {
-				writeError(c, protocol, http.StatusForbidden, label+" is disabled", nil)
-				return
-			}
+			label = accountLabel
 			provider = strings.ToLower(auth.Provider)
 			release, errAcquire := s.limiter.acquire(ctx, target.authID)
 			if errAcquire != nil {

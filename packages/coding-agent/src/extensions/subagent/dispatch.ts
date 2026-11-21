@@ -14,6 +14,8 @@ import {
 } from "../accounts/catalog.ts";
 import { ACCOUNT_HEADER } from "../accounts/provider.ts";
 import { isAccountProvider, latestServingProvider } from "../accounts/served.ts";
+import { resolveModelAlias } from "./model-aliases.ts";
+import { type ModelTier, resolveModelTier, type TierSelection } from "./model-tiers.ts";
 
 /** Reasoning levels accepted by child dispatch tools. */
 export const reasoningEffortSchema = Type.Union([
@@ -28,7 +30,16 @@ export const reasoningEffortSchema = Type.Union([
 
 export interface DispatchSelection {
 	model?: string;
+	tier?: ModelTier;
 	reasoningEffort?: ThinkingLevel;
+}
+
+/** The defaults an agent profile contributes when the caller does not select a model. */
+export interface ProfileDefaults {
+	model?: string;
+	tier?: ModelTier;
+	/** An effort rated for this task: it replaces the effort of the tier row that selects the model, and nothing else. */
+	ratedEffort?: ThinkingLevel;
 }
 
 export interface DispatchResolution {
@@ -37,7 +48,8 @@ export interface DispatchResolution {
 }
 
 export interface SubagentDispatch {
-	resolve(selection: DispatchSelection, ctx: ExtensionContext, profileModel?: string): DispatchResolution;
+	/** Picks the child model: explicit model, explicit tier, profile model, profile tier, then the parent's model. */
+	resolve(selection: DispatchSelection, ctx: ExtensionContext, profile?: ProfileDefaults): DispatchResolution;
 	models(ctx: ExtensionContext, provider?: string): { provider: string; models: Model<Api>[] };
 }
 
@@ -101,31 +113,48 @@ export function createSubagentDispatch(pi: ExtensionAPI): SubagentDispatch {
 			models: ctx.modelRegistry.getAvailable().filter((model) => model.provider === target),
 		};
 	};
+	const modelFromReference = (reference: string, ctx: ExtensionContext, source: "caller" | "profile"): Model<Api> => {
+		const text = reference.trim();
+		// Only a provider explicitly supplied by the caller can opt out of the current account.
+		const named = ctx.modelRegistry
+			.getAll()
+			.filter((candidate) => text.toLowerCase().startsWith(`${candidate.provider.toLowerCase()}/`))
+			.sort((a, b) => b.provider.length - a.provider.length)[0];
+		const pool = models(ctx, source === "caller" ? named?.provider : undefined);
+		const literal = pool.models.find((candidate) => candidate.id.toLowerCase() === text.toLowerCase());
+		return literal ?? selectModel(named ? text.slice(named.provider.length + 1) : text, pool);
+	};
+	// A tier with no row served by the current account selects nothing, so the next source applies.
+	const modelFromTier = (tier: ModelTier | undefined, ctx: ExtensionContext): TierSelection | undefined =>
+		tier === undefined ? undefined : resolveModelTier(tier, models(ctx).models);
+	const inheritedModel = (ctx: ExtensionContext): Model<Api> => {
+		if (!ctx.model) throw new Error("A parent model or explicit subagent model is required.");
+		const provider = currentProvider(accountKey, ctx);
+		const inherited = ctx.modelRegistry.find(provider, ctx.model.id);
+		if (!inherited) throw new Error(`Current account ${provider} cannot serve ${ctx.model.id}. Use search_models.`);
+		return inherited;
+	};
+	// A tier row also carries the effort of its tier; other sources leave the effort to the caller and the parent.
+	// A rated effort replaces the row's effort only when the profile's tier selects the model, where the rating applies.
+	const pickModel = (
+		selection: DispatchSelection,
+		ctx: ExtensionContext,
+		profile: ProfileDefaults | undefined,
+	): { model: Model<Api>; effort?: ThinkingLevel } => {
+		if (selection.model !== undefined) return { model: modelFromReference(selection.model, ctx, "caller") };
+		const explicitTier = modelFromTier(selection.tier, ctx);
+		if (explicitTier) return explicitTier;
+		if (profile?.model !== undefined) return { model: modelFromReference(profile.model, ctx, "profile") };
+		const profileTier = modelFromTier(profile?.tier, ctx);
+		if (profileTier) return { model: profileTier.model, effort: profile?.ratedEffort ?? profileTier.effort };
+		return { model: inheritedModel(ctx) };
+	};
 	return {
 		models,
-		resolve(selection, ctx, profileModel) {
+		resolve(selection, ctx, profile) {
 			if (scope !== dispatchScope(ctx)) clear();
-			const reference = selection.model ?? profileModel;
-			let model: Model<Api>;
-			if (reference !== undefined) {
-				const text = reference.trim();
-				// Only a provider explicitly supplied by the caller can opt out of the current account.
-				const named = ctx.modelRegistry
-					.getAll()
-					.filter((candidate) => text.toLowerCase().startsWith(`${candidate.provider.toLowerCase()}/`))
-					.sort((a, b) => b.provider.length - a.provider.length)[0];
-				const pool = models(ctx, selection.model !== undefined ? named?.provider : undefined);
-				const literal = pool.models.find((candidate) => candidate.id.toLowerCase() === text.toLowerCase());
-				model = literal ?? selectModel(named ? text.slice(named.provider.length + 1) : text, pool);
-			} else {
-				if (!ctx.model) throw new Error("A parent model or explicit subagent model is required.");
-				const provider = currentProvider(accountKey, ctx);
-				const inherited = ctx.modelRegistry.find(provider, ctx.model.id);
-				if (!inherited)
-					throw new Error(`Current account ${provider} cannot serve ${ctx.model.id}. Use search_models.`);
-				model = inherited;
-			}
-			const requested = selection.reasoningEffort ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
+			const { model, effort } = pickModel(selection, ctx, profile);
+			const requested = selection.reasoningEffort ?? effort ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
 			if (selection.reasoningEffort !== undefined && !getSupportedThinkingLevels(model).includes(requested)) {
 				throw new Error(`Model ${model.provider}/${model.id} does not support reasoning effort ${requested}.`);
 			}
@@ -142,6 +171,8 @@ function selectModel(text: string, pool: { provider: string; models: Model<Api>[
 	const query = text.toLowerCase();
 	const exact = pool.models.find((model) => model.id.toLowerCase() === query);
 	if (exact) return exact;
+	const aliased = resolveModelAlias(query, pool.models);
+	if (aliased) return aliased;
 	const names = pool.models.filter((model) => model.name.toLowerCase() === query);
 	const matches = names.length
 		? names

@@ -52,11 +52,11 @@ Earlier versions kept Claude subscriptions in the broker. When a session starts,
 
 ## Subscription web search
 
-Ask Credne to “search the web for the current Node.js LTS release and cite the release page.” The built-in `web_search` tool sends only its query to hosted web search. It follows Claude Code's WebSearch design: a separate request on the subscription's model runs the provider's hosted search (up to 8 searches on Claude) and briefly summarizes the results. The tool returns each search's links and that summary, and the main model cites the links it uses. Pass `allowed_domains` or `blocked_domains` to restrict results; Claude filters them at the provider, while ChatGPT search is told the restriction and its links are filtered locally. Add a subscription once with `/accounts add codex` or `/accounts add claude-subscription`. Searches consume provider usage and require a model and plan with hosted search enabled.
+Ask Credne to “search the web for the current Node.js LTS release and cite the release page.” The built-in `web_search` tool sends only its query to hosted web search. It follows Claude Code's WebSearch design: a separate request on the subscription's light-tier model runs the provider's hosted search (up to 8 searches on Claude) and briefly summarizes the results. The tool returns each search's links and that summary, and the main model cites the links it uses. Pass `allowed_domains` or `blocked_domains` to restrict results; Claude filters them at the provider, while ChatGPT search is told the restriction and its links are filtered locally. Add a subscription once with `/accounts add codex` or `/accounts add claude-subscription`. Searches consume provider usage and require a model and plan with hosted search enabled.
 
-A session on a Claude subscription (`claude-sub:<id>`) searches with that account and model. A session on `pool:claude` or `pool:all` with a Claude model searches on the local Claude subscriptions that offer the model, the one that answered last first. A subscription at its usage limit passes the search to the next one; when all are at their limit, Credne reports it. From a non-Claude model, or when no Claude subscription is available, search uses a broker subscription (ChatGPT first). If the search provider rejects the request for another reason, Credne reports the error rather than retrying it on a different billing route. API-key accounts, Claude Console credits, and public search engines are never automatic fallbacks.
+A session on a Claude subscription (`claude-sub:<id>`) searches with that account. A session on `pool:claude` or `pool:all` with a Claude model searches on the local Claude subscriptions that offer the session's model, the one that answered last first. Whatever model the session uses, a search runs on the light-tier model of the subscription that serves it (see [Model tiers](subagents.md#model-tiers)); a subscription that serves no light-tier model searches on the session's model instead. A subscription at its usage limit passes the search to the next one; when all are at their limit, Credne reports it. From a non-Claude model, or when no Claude subscription is available, search uses a broker subscription (ChatGPT first). If the search provider rejects the request for another reason, Credne reports the error rather than retrying it on a different billing route. API-key accounts, Claude Console credits, and public search engines are never automatic fallbacks.
 
-On Claude, the search is a request on the subscription's model through Credne's model registry, so it goes out like any other request of that account, with Anthropic's hosted `web_search_20250305` tool added. ChatGPT searches call the provider's hosted tool through the account broker. This avoids a second login, a Claude bridge model, or sharing credentials with an external plugin. If you prefer a community extension, one that registers `web_search` replaces the built-in. For a separate keyless service, configure it explicitly using [MCP](mcp.md). The bundled explorer and deep-research (`crazy`) profiles include `web_search`; add the tool to `tools:` in a custom profile to enable it there.
+On Claude, the search is a request on the subscription's light-tier model through Credne's model registry, so it goes out like any other request of that account, with Anthropic's hosted `web_search_20250305` tool added. ChatGPT searches call the provider's hosted tool through the account broker. This avoids a second login, a Claude bridge model, or sharing credentials with an external plugin. If you prefer a community extension, one that registers `web_search` replaces the built-in. For a separate keyless service, configure it explicitly using [MCP](mcp.md). The bundled explorer and deep-research (`crazy`) profiles include `web_search`; add the tool to `tools:` in a custom profile to enable it there.
 
 ## Accounts and providers
 
@@ -99,6 +99,23 @@ A broker pool (`pool:codex`, `pool:openai`) keeps a conversation on one account 
 ## Pinned accounts
 
 A session on `claude-sub:<id>` or `acct:<id>` is pinned to one account. Every request uses that account. When it is rate-limited, out of quota or rejected, Pi reports the error with the account name and the provider's retry time, and it never moves the session to another account. Use a pool when you want failover, and a pinned account when you need a specific account.
+
+## Decision model through an OpenAI API key
+
+OpenAI's Decisions API classifies a state with structured questions, which Credne uses for cheap rating and routing decisions. It accepts only an OpenAI API key: Sign in with ChatGPT tokens are rejected, so a ChatGPT subscription cannot serve it. The built-in `openai` provider declares the `gpt-6-luna` classifier but hides it while you sign in with ChatGPT, and when the key lives in the broker instead of `OPENAI_API_KEY`, Pi has no key for it. The accounts extension closes that gap: an OpenAI API-key account in the broker provides its own `gpt-6-luna` classifier whose requests go through the broker.
+
+Each of these appears in `ctx.modelRegistry.getAvailableOfType("classifier")` and works with `classify()`:
+
+| Provider | Classifier | Served by |
+| --- | --- | --- |
+| `acct:<id>` of an OpenAI API key | `gpt-6-luna` | That key, never another account. |
+| `pool:openai` | `gpt-6-luna` | An enabled OpenAI API key that lists `gpt-6-luna`. |
+
+An account or pool gets the classifier only when an enabled OpenAI API key lists `gpt-6-luna` in its models. ChatGPT subscriptions, Claude accounts, `pool:codex`, `pool:claude` and `pool:all` have none: the last two are routed by Credne itself and are not broker routes. The classifier copies its cost and limits from the built-in `openai` entry, so session costs use the same Decisions rate (input tokens only). The key's own OpenAI project is billed.
+
+Requests use the same loopback connection and per-run token as chat. Pi posts to `/credne/v1/route/<target>/decisions`, and the broker sends the body to `/v1/decisions` with the account's key and returns OpenAI's status and body unchanged. A target that is not an OpenAI API key is refused with HTTP 400 and nothing is sent. The footer is not updated by a classification, because `pool:openai` may serve it with another key than the chat.
+
+The classifier is registered with the other models of the account from the catalog (`catalog.json`), so it is there at startup. The catalog refreshes when the broker is running at session start and after `/accounts` actions. Rebuild and restart the broker after updating (see Setup): a broker from before this feature answers the route with HTTP 404.
 
 ## Commands
 

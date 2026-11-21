@@ -86,7 +86,12 @@ export class AccountRegistry {
 					),
 				),
 			);
-			this.catalog = buildCatalog(accounts, accountModels, (provider, id) => ctx.modelRegistry.find(provider, id));
+			this.catalog = buildCatalog(
+				accounts,
+				accountModels,
+				(provider, id) => ctx.modelRegistry.find(provider, id),
+				(provider, id) => ctx.modelRegistry.findOfType("classifier", provider, id),
+			);
 			writeCatalog(this.catalogPath, this.catalog);
 			return accounts;
 		} catch (error) {
