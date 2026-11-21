@@ -120,25 +120,19 @@ export function getWorkerTeam(pi: ExtensionAPI, ctx: ExtensionContext): WorkerTe
 		if (ctx.hasUI) {
 			const team = owner.team;
 			const spinnerFor = sharedWorkerSpinner();
+			const openSession = (workerId: string | undefined) => {
+				if (workerId) showWorkerView(ctx.ui, team, workerId);
+				else ctx.ui.setMainView(undefined);
+			};
 			ctx.ui.setWidget(
 				"subagents",
-				(tui, theme) =>
-					new SubagentWidget(
-						team,
-						tui,
-						theme,
-						(workerId) => {
-							if (workerId) showWorkerView(ctx.ui, team, workerId);
-							else ctx.ui.setMainView(undefined);
-						},
-						spinnerFor(tui, theme),
-					),
+				(tui, theme) => new SubagentWidget(team, tui, theme, openSession, spinnerFor(tui, theme)),
 				{ placement: "belowEditor" },
 			);
 			// A disposed team has no workers, so a section left behind by a closed session renders nothing.
 			ctx.ui.setSidePanelSection(
 				"subagents",
-				(tui, theme) => new SubagentSection(team, tui, theme, spinnerFor(tui, theme)),
+				(tui, theme) => new SubagentSection(team, tui, theme, spinnerFor(tui, theme), openSession),
 				{ order: 10 },
 			);
 		}

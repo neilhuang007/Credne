@@ -303,6 +303,7 @@ function createOverlayOptions(getWidth: () => number, reservation: TranscriptRes
 		get maxHeight() {
 			return reservation.getRows();
 		},
+		selectionInsetLeft: 1,
 		nonCapturing: true,
 		visible: () => getWidth() > 0 && reservation.getRows() > 0,
 	};

@@ -83,6 +83,7 @@ export class SidePanel implements Component {
 	private fileRowIndices = new Map<number, number>();
 	private followSelection = true;
 	private sectionRows = 0;
+	private hoveredSection?: SectionViewport;
 	private isResizing = false;
 	/** Keep the hovered screen row, so scrolling the index highlights the file now under the pointer. */
 	private hoveredFileRow: number | undefined;
@@ -192,9 +193,18 @@ export class SidePanel implements Component {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const section = this.sections.find(({ start, rows }) => event.y >= start && event.y < start + rows);
+		const content = event.x >= 2 && event.x < event.width - 1 && event.type !== "leave" ? section : undefined;
 		if (event.type === "move" || event.type === "leave") {
-			const changed = this.updateHover(event);
-			return changed || this.hoveredFileRow !== undefined || this.isSeparatorHovered
+			let changed = this.updateHover(event);
+			if (this.hoveredSection && this.hoveredSection.component !== content?.component) {
+				const leave = this.sendSectionMouse(this.hoveredSection, { ...event, type: "leave" });
+				changed ||= leave?.render === true;
+			}
+			const result = content && this.sendSectionMouse(content, event);
+			this.hoveredSection = result?.handled ? content : undefined;
+			changed ||= result?.render === true;
+			return changed || result?.handled || this.hoveredFileRow !== undefined || this.isSeparatorHovered
 				? { handled: true, render: changed }
 				: undefined;
 		}
@@ -211,6 +221,10 @@ export class SidePanel implements Component {
 			}
 			return { handled: true, render: true };
 		}
+		if (content && event.type !== "wheel") {
+			const result = this.sendSectionMouse(content, event);
+			if (result) return result;
+		}
 		if (event.type === "press" && event.button === "left" && this.fileRowIndices.has(event.y)) {
 			return { handled: true, render: false };
 		}
@@ -225,8 +239,12 @@ export class SidePanel implements Component {
 		}
 		if (event.type !== "wheel" || event.wheelDelta === undefined) return undefined;
 		if (event.y < this.sectionRows) {
-			const section = this.sections.find(({ start, rows }) => event.y >= start && event.y < start + rows);
-			if (section) section.offset = Math.max(0, Math.min(section.offset + event.wheelDelta, section.maxOffset));
+			if (section) {
+				section.offset = Math.max(0, Math.min(section.offset + event.wheelDelta, section.maxOffset));
+				if (this.hoveredSection?.component === section.component && content) {
+					this.sendSectionMouse(section, { ...event, type: "move" });
+				}
+			}
 		} else if (event.y >= this.fileRegionStart && event.y < this.fileRegionEnd) {
 			this.fileOffset = Math.max(
 				0,
@@ -269,6 +287,18 @@ export class SidePanel implements Component {
 		while (lines.length < height) lines.push(blank);
 		this.outputCache = { sectionLines, changesLines, height, separatorActive, lines };
 		return lines;
+	}
+
+	private sendSectionMouse(section: SectionViewport, event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const row = event.y - section.start;
+		const pinned = row === 0 && section.component.stickyHeader && section.rows > 1;
+		return section.component.handleMouse?.({
+			...event,
+			x: event.x - 2,
+			y: pinned ? 0 : row + section.offset,
+			width: Math.max(1, event.width - 3),
+			height: section.rows + section.maxOffset,
+		});
 	}
 
 	private updateHover(event: TuiMouseEvent): boolean {

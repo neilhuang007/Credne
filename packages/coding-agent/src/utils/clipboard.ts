@@ -103,8 +103,17 @@ export async function copyToClipboard(text: string): Promise<void> {
 	if (!copied) {
 		const commands: [string, string[]][] = [];
 		if (p === "darwin") commands.push(["pbcopy", []]);
-		else if (p === "win32") commands.push(["clip", []]);
-		else {
+		else if (p === "win32") {
+			commands.push([
+				"powershell.exe",
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); Set-Clipboard -Value ([Console]::In.ReadToEnd()) -ErrorAction Stop",
+				],
+			]);
+		} else {
 			if (env.TERMUX_VERSION) commands.push(["termux-clipboard-set", []]);
 			if (env.WAYLAND_DISPLAY) commands.push(["wl-copy", []]);
 			if (env.DISPLAY) {

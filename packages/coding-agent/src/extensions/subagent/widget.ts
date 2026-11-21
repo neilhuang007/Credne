@@ -294,21 +294,50 @@ export class SubagentSection implements Component {
 	private readonly team: Pick<WorkerTeam, "count" | "getViews">;
 	private readonly theme: Theme;
 	private readonly spinner: WorkerSpinner;
+	private readonly openSession: ((workerId: string) => void) | undefined;
+	private rowWorkerIds: string[] = [];
+	private hoveredId: string | undefined;
 
-	constructor(team: Pick<WorkerTeam, "count" | "getViews">, _tui: TUI, theme: Theme, spinner: WorkerSpinner) {
+	constructor(
+		team: Pick<WorkerTeam, "count" | "getViews">,
+		_tui: TUI,
+		theme: Theme,
+		spinner: WorkerSpinner,
+		openSession?: (workerId: string) => void,
+	) {
 		this.team = team;
 		this.theme = theme;
 		this.spinner = spinner;
+		this.openSession = openSession;
 	}
 
 	render(width: number): string[] {
+		this.rowWorkerIds = [];
 		if (!this.team.count()) return [];
 		const workers = this.team.getViews();
+		this.rowWorkerIds = workers.map((worker) => worker.id);
 		const frame = this.spinner.frame();
 		return [
 			renderActivityRow(width, this.theme.bold("Agents"), this.theme.fg("muted", `${workers.length} total`)),
-			...workers.map((worker) => renderWorkerRow(worker, width, this.theme, frame)),
+			...workers.map((worker) => {
+				const row = renderWorkerRow(worker, width, this.theme, frame);
+				return worker.id === this.hoveredId ? highlightRow(row, width) : row;
+			}),
 		];
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const workerId = this.rowWorkerIds[event.y - 1];
+		if (event.type === "leave" || event.type === "move") {
+			const hoveredId = event.type === "move" ? workerId : undefined;
+			const changed = hoveredId !== this.hoveredId;
+			this.hoveredId = hoveredId;
+			return hoveredId || changed ? { handled: true, render: changed } : undefined;
+		}
+		if (event.type === "press" && event.button === "left" && workerId) return { handled: true, render: false };
+		if (event.type !== "click" || event.button !== "left" || !workerId) return undefined;
+		this.openSession?.(workerId);
+		return { handled: true };
 	}
 
 	invalidate(): void {}
