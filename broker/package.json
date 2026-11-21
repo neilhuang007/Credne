@@ -1,6 +1,6 @@
 {
 	"name": "@neilhuang007/credne-broker",
-	"version": "0.1.3",
+	"version": "0.1.4",
 	"private": true,
 	"type": "module",
 	"description": "Shared Credne account service backed by oh-my-pi AI",

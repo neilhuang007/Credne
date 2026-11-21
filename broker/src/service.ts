@@ -138,7 +138,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 		pid: process.pid,
 		url: "",
 		token: `cbk_${randomBytes(32).toString("hex")}`,
-		brokerVersion: options.version ?? process.env.CREDNE_BROKER_VERSION ?? "0.1.3",
+		brokerVersion: options.version ?? process.env.CREDNE_BROKER_VERSION ?? "0.1.4",
 		upstreamVersion: "19.0.0",
 		backend: "oh-my-pi",
 		startedAt: new Date().toISOString(),

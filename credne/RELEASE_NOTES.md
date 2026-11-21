@@ -1,14 +1,31 @@
-# Unreleased
+# Credne 0.1.4 — Windows x64 release candidate
 
-- The Credne CLI stays on Node.js. A separate `@oh-my-pi/pi-ai` service replaces the Go/CLIProxyAPI broker and manages provider credentials. Before upgrading, finish active requests, choose **Restart broker** in `/accounts` to stop the previous broker, then close the old CLI sessions.
-- Use `/accounts add` for Claude subscriptions, ChatGPT subscriptions, Anthropic API keys, and OpenAI API keys. Previously local `claude-sub:` accounts need a fresh sign-in and selection in `/model`; the original credential file is left intact. For Claude Console billing, add an Anthropic API key instead of signing in through `ant`.
-- Source builds require Node.js 22.19 or newer and Bun 1.4.4 or newer. Installed packages include the broker runtime; users do not need Bun or Go.
-- Build packages on the target platform and architecture with `npm ci --ignore-scripts`, `npm run build`, and `node credne/scripts/build.mjs`.
-- Keep the packaged `bin/pi_natives.*.node` files beside `credne-broker`. The broker uses these native assets for locking and credential storage. SQLite and the provider catalog are included in the compiled runtime.
+- The Credne CLI stays on Node.js. A Bun-compiled service built on `@oh-my-pi/pi-ai` replaces the Go/CLIProxyAPI account broker. It can import legacy broker-managed API keys and supported subscription sign-ins without overwriting the old records.
+- Use `/accounts add` for Claude and ChatGPT subscriptions and Anthropic and OpenAI API keys. **Other providers** lists only the oh-my-pi (OMP) methods Credne can enroll and route, including Google API keys and xAI device sign-in. Cloud credential chains, native CLI adapters, and some sign-ins are not supported. Key validation may incur a small charge.
+- `/model` lists models separately from accounts and accepts aliases such as `/model sonnet`. Pooled chat tries eligible subscriptions before ordinary API keys, even if a key served the last turn. The pool can fall back to a billed API key. Use `/accounts switch` to pin a subscription if you want an error instead of fallback.
 
-The 0.1.3 installation instructions below refer to the existing release archive, which still contains the original Go broker.
+## Upgrade from the Go broker
 
-# Credne 0.1.3
+Finish active requests and sign-ins, then close all but one old Credne session. In that session choose `/accounts` → **Restart broker** to stop the shared broker. Close the last old session without sending another request. If Credne still reports a previous broker PID, verify that it belongs to the old `credne-broker` before stopping that process. Do not remove accounts or delete the accounts directory; it contains saved credentials and settings.
+
+Local `claude-sub:` accounts need a fresh sign-in with `/accounts add claude-subscription`. Use `/accounts switch` if you want to pin the new account. The old credential file stays intact. For Claude Console billing, add an Anthropic API key; Console browser sign-in through `ant` is no longer supported.
+
+## Install on Windows x64
+
+Install Node.js 22.19 or newer. When the `0.1.4` release is available, install the Credne archive from PowerShell or Command Prompt:
+
+```shell
+curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.4/credne-0.1.4-windows-x64.tgz -o credne-0.1.4-windows-x64.tgz
+npm.cmd install --global --ignore-scripts .\credne-0.1.4-windows-x64.tgz
+credne.cmd --version
+credne.cmd
+```
+
+`credne.cmd --version` should print `0.1.4`. The archive includes the compiled broker, SQLite, and the provider catalog; you do not need Bun or Go to run it. Keep the packaged `bin/pi_natives.*.node` files beside `credne-broker` for locking and credential storage. For other platforms, follow the [tagged source instructions](https://github.com/neilhuang007/Credne/blob/0.1.4/README.md#build-credne-from-the-014-tag), which require Node.js 22.19 or newer and Bun 1.4.4 or newer.
+
+# Credne 0.1.3 (historical)
+
+This release archive still contains the original Go broker.
 
 - After a provider error such as “no credits remaining,” switch to a funded account or top up the current one, then run `/continue`. Credne retries the pending turn with its original prompt and attachments.
 - Switching models or accounts keeps your chosen reasoning effort unless you configured an explicit level for the destination. A model with fewer supported levels uses a compatible level without overwriting your preference.

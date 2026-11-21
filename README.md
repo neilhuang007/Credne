@@ -2,63 +2,51 @@
 
 Credne is a Pi-based coding agent with account switching, planning, and subagents. Install [Node.js](https://nodejs.org/) 22.19 or newer first.
 
-## Install the released version (0.1.3)
+## Install Credne 0.1.4 (Windows x64 release candidate)
 
-**Windows x64:** Run these commands in PowerShell or Command Prompt. The release includes the account broker and runtime dependencies; no source checkout or Go compiler is needed.
+Use the Credne archive, not the upstream Pi packages. The archive includes the compiled account broker and its runtime dependencies; only Node.js is needed at runtime, not Bun or Go. If upgrading, stop the old broker first (see below).
+
+When the `0.1.4` release is available, run these commands in PowerShell or Command Prompt:
 
 ```shell
-curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.3/credne-0.1.3-windows-x64.tgz -o credne-0.1.3-windows-x64.tgz
-npm.cmd install --global --ignore-scripts .\credne-0.1.3-windows-x64.tgz
+curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.4/credne-0.1.4-windows-x64.tgz -o credne-0.1.4-windows-x64.tgz
+npm.cmd install --global --ignore-scripts .\credne-0.1.4-windows-x64.tgz
 credne.cmd --version
 credne.cmd
 ```
 
-For the default Bash tool and `!` shell commands, install [Git for Windows](https://git-scm.com/download/win) if you don't already have Bash.
+`credne.cmd --version` should print `0.1.4`. Run Credne from the directory you want to work on. Install [Git for Windows](https://git-scm.com/download/win) if you need Bash for the Bash tool or `!` commands.
 
-**macOS and Linux (0.1.3 only):** The tagged release uses the previous Go broker. Build it with Git, Node.js and Go 1.26.10 or newer:
+### Upgrade from the Go broker
 
-```sh
-git clone --branch 0.1.3 --depth 1 https://github.com/neilhuang007/Credne.git
-cd Credne
-npm ci --ignore-scripts
-revision=$(node -p "require('./nix/model-catalog.json').revision")
-curl -fsSLo models.all.json "https://pi.dev/api/models/revisions/$revision?types=chat,image,classifier"
-node packages/ai/scripts/hydrate-model-catalog.ts models.all.json
-npm run build:offline
-node credne/scripts/build.mjs
-npm pack ./credne --ignore-scripts
-npm install --global --ignore-scripts ./neilhuang007-credne-0.1.3.tgz
-credne --version
-```
+Finish active requests and sign-ins, then close all but one old Credne session. In that session choose `/accounts` → **Restart broker**. This stops the shared broker; close the last old session without sending another request, which would restart it. If Credne still reports a previous broker PID, confirm that PID belongs to the old `credne-broker` before stopping that process. Do not remove accounts or delete the accounts directory to stop the broker; it contains your saved credentials and settings.
 
-Run `credne` in the directory you want to work on. Use `/accounts add` to connect an account. See the [0.1.3 release notes](https://github.com/neilhuang007/Credne/releases/tag/0.1.3) for changes.
+### Connect accounts and choose a payer
 
-## Build the current source
+Use `/accounts add` to connect Claude or ChatGPT subscriptions or Anthropic or OpenAI API keys. **Other providers** lists only the oh-my-pi (OMP) methods this broker can enroll and route, not the full OMP catalog. Some key-validation checks may incur a small charge.
 
-Current source replaces the Go broker with a Bun-compiled service built on `@oh-my-pi/pi-ai`. The Credne CLI still runs on Node.js.
+Use `/model` to select a model without choosing an account. Pooled chat tries eligible subscriptions for that model before ordinary API keys, but can fall back to a billed API key if no subscription can serve the request. Use `/accounts switch` to pin a subscription if you want an error instead of fallback.
 
-Install Git, Node.js 22.19 or newer, and [Bun](https://bun.sh/) 1.4.4 or newer. Build on the platform and architecture where you will install Credne:
+See the [release notes](credne/RELEASE_NOTES.md) for migration details and the [accounts guide](packages/coding-agent/docs/accounts.md) for routing and sign-in options.
+
+## Build Credne from the 0.1.4 tag
+
+Install Git, Node.js 22.19 or newer, and [Bun](https://bun.sh/) 1.4.4 or newer. Build on the platform and architecture where you will install Credne, including on macOS or Linux:
 
 ```sh
-git clone https://github.com/neilhuang007/Credne.git
+git clone --branch 0.1.4 --depth 1 https://github.com/neilhuang007/Credne.git
 cd Credne
 npm ci --ignore-scripts
 npm run build
 node credne/scripts/build.mjs
 npm pack ./credne --ignore-scripts
-npm install --global --ignore-scripts ./neilhuang007-credne-0.1.3.tgz
+npm install --global --ignore-scripts ./neilhuang007-credne-0.1.4.tgz
 credne --version
 ```
 
-On Windows, use `npm.cmd` and `credne.cmd` if PowerShell blocks the npm command wrappers.
+On Windows, use `npm.cmd` and `credne.cmd` if PowerShell blocks the command wrappers. Keep the packaged `bin/pi_natives.*.node` files beside `credne-broker`; it needs them for locking and credential storage. To build only the broker, run `npm --prefix broker run build` and keep all files from `broker/dist/` together. Use `--skip-broker` only when rebuilding CLI assets with an existing broker package.
 
-The package includes the compiled `credne-broker` executable and its runtime assets. Keep the `pi_natives.*.node` files beside the executable in `bin/`; the broker needs them for native locking and credential storage. SQLite and the provider catalog are included in the compiled runtime. Installed users need Node.js, but not Bun or Go.
-
-`--skip-broker` is only for rebuilding CLI assets when an existing broker package is already available. Normal releases must include the broker and its native assets.
-
-To build only the broker, run `npm --prefix broker run build`. Copy every file from `broker/dist/` together, not only the executable. Both build commands use `scripts/build-account-broker.mjs`.
-
-These source instructions do not describe the existing 0.1.3 release archive. That archive retains its original Go broker.
+The [historical 0.1.3 release](https://github.com/neilhuang007/Credne/releases/tag/0.1.3) still uses the Go broker. See its [tagged README](https://github.com/neilhuang007/Credne/blob/0.1.3/README.md) for its source instructions.
 
 ## About upstream Pi
 
