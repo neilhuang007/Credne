@@ -59,6 +59,12 @@ This replaces `bash` with `powershell` and enables `grep`: `["-bash", "+powershe
 
 CLI tool options override this setting for one invocation. `--tools` with only `+name` and `-name` entries changes the resolved `defaultTools` selection instead, for example `pi --tools +codemode`. On `/reload`, these entries apply to the reloaded setting too, so a tool removed with `-name` stays removed. See [Command Line](cli.md#tools).
 
+## Subagents
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `subagents.tierClassifier` | `"off" \| "shadow" \| "apply"` | `"apply"` | Rate how demanding each delegated task is before it is dispatched, with a classifier model or, when none is available, with the light-tier chat model of the current account. `shadow` records the rating and dispatches as usual. `apply` also uses the rated tier in place of the agent profile's tier when the classifier is confident. The task text is sent to the provider of the model that rates it. See [Tier classifier](subagents.md#tier-classifier). |
+
 ## Sessions and context
 
 | Setting | Type | Default | Description |

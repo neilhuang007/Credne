@@ -651,6 +651,29 @@
         }
       }
     },
+    "subagents": {
+      "type": "object",
+      "properties": {
+        "tierClassifier": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "off"
+            },
+            {
+              "type": "string",
+              "const": "shadow"
+            },
+            {
+              "type": "string",
+              "const": "apply"
+            }
+          ],
+          "description": "Rates how demanding each delegated task is before it is dispatched, with a classifier model or, when none is available, with the light-tier chat model of the current account. \"shadow\" records the rating and dispatches as usual. \"apply\" also uses the rated tier in place of the tier of the agent profile when the classifier is confident.",
+          "default": "apply"
+        }
+      }
+    },
     "sessionDir": {
       "type": "string",
       "description": "Custom session storage directory, in the same format as the --session-dir CLI flag."

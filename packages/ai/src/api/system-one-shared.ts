@@ -79,6 +79,14 @@ function probabilities(label: string, value: unknown, id: string): Record<string
 	);
 }
 
+/** The probability of each of `count` levels, lowest first, from System One's map keyed by level number. */
+function levelProbabilities(label: string, value: unknown, id: string, count: number): number[] {
+	if (!isRecord(value)) throw new Error(`${label} returned invalid probabilities for ${id}`);
+	return Array.from({ length: count }, (_, level) =>
+		requiredNumber(label, value[String(level)], `probability for ${id}.${level}`),
+	);
+}
+
 function parseAnswers(label: string, value: unknown, context: ClassifierContext): Record<string, ClassifierAnswer> {
 	if (!isRecord(value)) throw new Error(`${label} returned an unexpected response`);
 	const answers: Array<[string, ClassifierAnswer]> = [];
@@ -106,6 +114,10 @@ function parseAnswers(label: string, value: unknown, context: ClassifierContext)
 					type: "score",
 					score: requiredNumber(label, answer.score, `score for ${id}`),
 					confidence: requiredNumber(label, answer.confidence, `confidence for ${id}`),
+					// TypeSafe documents `probabilities` on every score answer; a service that omits it leaves the field unset.
+					...(answer.probabilities !== undefined && {
+						probabilities: levelProbabilities(label, answer.probabilities, id, question.criteria.length),
+					}),
 				},
 			]);
 		} else {

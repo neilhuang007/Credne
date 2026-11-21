@@ -10,10 +10,7 @@ export interface BrokerConnection {
 	pid: number;
 }
 
-/**
- * How an account authenticates. `oauth` uses oh-my-pi's subscription adapters, `api-credits` uses a
- * Claude Console organization through `ant`, and `api-key` uses a provider API key.
- */
+/** How an account authenticates. `api-credits` is a retired kind that can appear in older catalogs. */
 export type BrokerAccountKind = "oauth" | "api-key" | "api-credits";
 
 /** One account as the broker reports it. Never contains credentials. */
@@ -67,12 +64,11 @@ export interface BrokerModel {
 	inputModalities?: string[];
 }
 
-export interface BrokerLogin {
-	state: string;
-	url: string;
-	flow?: string;
-	userCode?: string;
-}
+export type BrokerLogin =
+	| { type: "browser"; state: string; url: string; userCode?: string }
+	| { type: "acknowledge-risk"; state: string; warning: string };
+
+export type BrokerLoginProvider = "claude" | "codex";
 
 export interface BrokerLoginStatus {
 	status: "wait" | "ok" | "error";
@@ -207,13 +203,20 @@ export class BrokerClient {
 		return account === undefined ? undefined : parseAccounts([account])[0];
 	}
 
-	/** Start a browser login. `name` names API-credit accounts, whose provider is `claude-api-credits`. */
-	async startLogin(provider: string, name?: string, signal?: AbortSignal): Promise<BrokerLogin> {
-		const data = await this.request("POST", "/logins", { provider, name }, signal);
-		const state = field(data, "state");
-		const url = field(data, "url");
-		if (typeof state !== "string" || typeof url !== "string") throw new BrokerError("Broker returned no login URL");
-		return { state, url, flow: optionalString(data, "flow"), userCode: optionalString(data, "userCode") };
+	/** Start a subscription login; it may pause until the user accepts a provider warning. */
+	async startLogin(provider: BrokerLoginProvider): Promise<BrokerLogin> {
+		const data = await this.request("POST", "/logins", { provider });
+		const state = optionalString(data, "state");
+		if (!state) throw new BrokerError("Broker returned no login state");
+		const warning = optionalString(data, "riskWarning");
+		return warning ? { type: "acknowledge-risk", state, warning } : parseBrowserLogin(data, state);
+	}
+
+	/** Resume a pending login only after the user explicitly accepts the warning. */
+	async acknowledgeLoginRisk(state: string): Promise<Extract<BrokerLogin, { type: "browser" }>> {
+		const data = await this.request("POST", `/logins/${encodeURIComponent(state)}/acknowledge`, { answer: "yes" });
+		if (field(data, "state") !== state) throw new BrokerError("Broker returned a mismatched login state");
+		return parseBrowserLogin(data, state);
 	}
 
 	async loginStatus(state: string, signal?: AbortSignal): Promise<BrokerLoginStatus> {
@@ -434,6 +437,12 @@ function optionalNumber(data: unknown, name: string): number | undefined {
 function optionalStrings(data: unknown, name: string): string[] | undefined {
 	const value = field(data, name);
 	return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
+}
+
+function parseBrowserLogin(data: unknown, state: string): Extract<BrokerLogin, { type: "browser" }> {
+	const url = optionalString(data, "url");
+	if (!url || optionalString(data, "riskWarning")) throw new BrokerError("Broker returned no login URL");
+	return { type: "browser", state, url, userCode: optionalString(data, "userCode") };
 }
 
 function parseAccounts(data: unknown): BrokerAccount[] {

@@ -1,7 +1,8 @@
 ---
 name: crazy
-description: Reserved exclusively for extremely hard tasks and deep research. Use an expensive, highly capable model at xhigh or max thinking effort. Supply relevant context, references, constraints, and a focused question so it can concentrate on the problem.
+description: Reserved exclusively for extremely hard tasks and deep research. Supply relevant context, references, constraints, and a focused question so it can concentrate on the problem.
 tools: read, bash, edit, write, tool_search, web_search
+tier: heavy
 ---
 
 # Subagent guidelines

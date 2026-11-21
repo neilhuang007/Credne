@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { requiredBrokerAddon } from "../../scripts/build-account-broker.mjs";
 import { execNpmSync } from "../../scripts/npm-command.mjs";
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -108,9 +109,7 @@ function validatePackage(directory, version) {
 		`bin/credne-broker${process.platform === "win32" ? ".exe" : ""}`,
 		"bin/pi-natives-LICENSE",
 		"bin/pi-natives-THIRD-PARTY-NOTICES.txt",
-		...(process.arch === "x64"
-			? ["baseline", "modern"].map((variant) => `bin/pi_natives.${process.platform}-${process.arch}-${variant}.node`)
-			: [`bin/pi_natives.${process.platform}-${process.arch}.node`]),
+		`bin/${requiredBrokerAddon()}`,
 	]) requireFile(directory, path);
 	for (const path of ["dist/bundle/chunks", "dist/modes/interactive/assets", "dist/extensions/subagent/agents", "docs", "examples"]) {
 		requireDirectory(directory, path);

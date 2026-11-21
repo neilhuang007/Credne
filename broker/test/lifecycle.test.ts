@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { object } from "../src/wire.ts";
 
 const homes: string[] = [];
@@ -15,7 +16,7 @@ afterEach(async () => {
 	pids.clear();
 	for (const home of homes.splice(0)) await rm(home, { recursive: true, force: true });
 });
-const cli = new URL("../src/cli.ts", import.meta.url).pathname;
+const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 async function discovery(home: string, oldToken?: string) {
 	const deadline = Date.now() + 20000;
 	while (Date.now() < deadline) {

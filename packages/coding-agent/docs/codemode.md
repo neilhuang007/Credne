@@ -126,8 +126,8 @@ interface ClassifierResult {
 
 type ClassifierAnswer =
   | { type: "choice"; choice: string; probabilities: Record<string, number>; confidence: number }
-  /** `score` is the expected level index, from 0 to `criteria.length - 1`. */
-  | { type: "score"; score: number; confidence: number }
+  /** `score` is the expected level index, from 0 to `criteria.length - 1`. `probabilities` has one entry per level, lowest first; it is absent when a System One service does not report it. */
+  | { type: "score"; score: number; confidence: number; probabilities?: number[] }
   /** Probability of `true`. */
   | { type: "bool"; probability: number };
 

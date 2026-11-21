@@ -65,11 +65,13 @@ import {
 	getAuthPath,
 	getDebugLogPath,
 	getDocsPath,
+	USES_BROKER_AUTH,
 	VERSION,
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
+import { BROKER_AUTH_GUIDANCE } from "../../core/auth-guidance.ts";
 import {
 	CACHE_TTL_MS,
 	type CacheMiss,
@@ -3544,6 +3546,14 @@ export class InteractiveMode {
 			if (text === "/trust") {
 				this.showTrustSelector();
 				this.editor.setText("");
+				return;
+			}
+			if (
+				USES_BROKER_AUTH &&
+				(text === "/login" || text.startsWith("/login ") || text === "/logout" || text.startsWith("/logout "))
+			) {
+				this.editor.setText("");
+				this.showStatus(BROKER_AUTH_GUIDANCE);
 				return;
 			}
 			if (text === "/login" || text.startsWith("/login ")) {

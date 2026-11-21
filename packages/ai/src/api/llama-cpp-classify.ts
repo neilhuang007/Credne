@@ -205,7 +205,7 @@ export function answerFromProbabilities(
 	const confidence = peakConfidence(probabilities);
 	if (question.type === "score") {
 		const score = probabilities.reduce((sum, probability, index) => sum + index * probability, 0);
-		return { type: "score", score, confidence };
+		return { type: "score", score, confidence, probabilities: [...probabilities] };
 	}
 	let best = 0;
 	for (let index = 1; index < probabilities.length; index++) {

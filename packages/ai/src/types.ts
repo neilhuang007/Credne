@@ -746,6 +746,8 @@ export interface ClassifierScoreAnswer {
 	type: "score";
 	score: number;
 	confidence: number;
+	/** Probability of each level, lowest level first, for services that report them. */
+	probabilities?: number[];
 }
 
 export interface ClassifierBoolAnswer {

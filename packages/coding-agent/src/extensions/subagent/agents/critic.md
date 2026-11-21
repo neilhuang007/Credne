@@ -2,7 +2,7 @@
 name: critic
 description: Review the current diff for correctness bugs (plus reuse/simplification/efficiency cleanups).
 tools: read, grep, find, ls, bash, edit, write
-models: gpt-6.1-sol, claude-opus-5-5
+tier: heavy
 ---
 
 # Subagent guidelines

@@ -5,7 +5,6 @@ import { type Api, type AuthCredential, AuthStorage, type Model } from "@oh-my-p
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { parse as parseYaml } from "yaml";
-import { AntTool } from "./ant.ts";
 import { array, object, stringArray, text, type WireObject } from "./wire.ts";
 
 export class HttpError extends Error {
@@ -21,12 +20,8 @@ export interface AccountRecord {
 	id: string;
 	provider?: string;
 	name: string;
-	kind: "api-key" | "api-credits" | "oauth";
-	apiKey?: string;
-	profile?: string;
+	kind: "api-key" | "oauth";
 	email?: string;
-	organization?: string;
-	organizationUuid?: string;
 	disabled?: boolean;
 	models?: string[];
 	createdAt: string;
@@ -66,24 +61,19 @@ async function readJson(path: string): Promise<unknown> {
 		throw new Error("Cannot read broker account storage.");
 	}
 }
-function parseRecord(raw: unknown): AccountRecord {
-	const value = object(raw);
+function parseRecord(value: WireObject): AccountRecord {
 	if (
 		typeof value.id !== "string" ||
 		typeof value.name !== "string" ||
-		!["api-key", "api-credits", "oauth"].includes(String(value.kind))
+		(value.kind !== "api-key" && value.kind !== "oauth")
 	)
 		throw new Error("Invalid broker account storage.");
 	return {
 		id: value.id,
 		name: value.name,
-		kind: value.kind as AccountRecord["kind"],
+		kind: value.kind,
 		provider: text(value.provider),
-		apiKey: text(value.apiKey),
-		profile: text(value.profile),
 		email: text(value.email),
-		organization: text(value.organization),
-		organizationUuid: text(value.organizationUuid),
 		disabled: value.disabled === true,
 		models: stringArray(value.models),
 		createdAt: text(value.createdAt) ?? new Date().toISOString(),
@@ -143,13 +133,13 @@ export function publicModels(account: Account): Record<string, unknown>[] {
 /** Each store contains exactly one account. Provider retries cannot cross this boundary. */
 export class Accounts {
 	readonly accounts = new Map<string, Account>();
-	readonly ant: AntTool;
 	readonly options: AccountOptions;
 	readonly routing = { affinity: true, retries: 1, strategy: "round-robin" };
+	private readonly metadataPath: string;
 	private mutation: Promise<unknown> = Promise.resolve();
 	constructor(options: AccountOptions) {
 		this.options = options;
-		this.ant = new AntTool(options.home);
+		this.metadataPath = join(options.home, "omp-accounts.json");
 	}
 	async locked<T>(fn: () => Promise<T>): Promise<T> {
 		const next = this.mutation.then(fn, fn);
@@ -159,16 +149,25 @@ export class Accounts {
 	async load(): Promise<void> {
 		await mkdir(join(this.options.home, "credentials"), { recursive: true, mode: 0o700 });
 		await chmod(join(this.options.home, "credentials"), 0o700);
-		const saved = object(await readJson(join(this.options.home, "api-accounts.json")));
+		const metadata = await readJson(this.metadataPath);
+		const migrating = metadata === undefined;
+		const saved = object(migrating ? await readJson(join(this.options.home, "api-accounts.json")) : metadata);
+		if (!migrating && (saved.version !== 2 || !Array.isArray(saved.accounts)))
+			throw new Error("Invalid OMP broker account storage.");
 		for (const raw of array(saved.accounts)) {
-			const record = parseRecord(raw);
+			const value = object(raw);
+			// Console credits stay in the legacy store; OMP does not serve them.
+			if (value.kind === "api-credits") continue;
+			const record = parseRecord(value);
 			record.provider ??= record.kind === "oauth" ? "codex" : "claude-api";
-			await this.register(
-				record,
-				record.apiKey ? { type: "api_key", key: record.apiKey, source: "login" } : undefined,
-			);
+			const key = migrating && record.kind === "api-key" ? text(value.apiKey) : undefined;
+			await this.register(record, key ? { type: "api_key", key, source: "login" } : undefined);
 		}
-		await this.importLegacy();
+		if (migrating) {
+			await this.importLegacy();
+			// An empty snapshot is authoritative too: later deletes must not revive legacy accounts.
+			await this.save();
+		}
 		let config: WireObject = {};
 		try {
 			config = object(parseYaml(await readFile(join(this.options.home, "config.yaml"), "utf8")));
@@ -227,20 +226,20 @@ export class Accounts {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 			throw error;
 		}
-		let changed = false;
 		for (const name of names) {
 			if (!name.endsWith(".json") || this.accounts.has(name)) continue;
 			const data = object(await readJson(join(this.options.home, "auths", name)));
-			if ((data.type ?? data.provider) !== "codex") continue;
+			const provider = data.type ?? data.provider;
+			if (provider !== "codex" && provider !== "claude") continue;
 			const access = data.access_token ?? object(data.tokens).access_token;
 			const refresh = data.refresh_token ?? object(data.tokens).refresh_token;
 			if (typeof access !== "string" || typeof refresh !== "string") continue;
-			const provider = (data.type ?? data.provider) === "codex" ? "codex" : "claude";
 			const expires =
 				Date.parse(text(data.expired ?? data.expires_at) ?? "") ||
 				(typeof data.expires === "number" ? data.expires : Date.now());
 			const email = text(data.email),
-				accountId = text(data.account_id);
+				accountId = text(data.account_id),
+				orgId = provider === "claude" ? text(data.organization_uuid) : accountId;
 			await this.register(
 				{
 					id: name,
@@ -252,11 +251,9 @@ export class Accounts {
 					disabled: data.disabled === true,
 					createdAt: new Date().toISOString(),
 				},
-				{ type: "oauth", access, refresh, expires, email, accountId, orgId: accountId },
+				{ type: "oauth", access, refresh, expires, email, accountId, orgId },
 			);
-			changed = true;
 		}
-		if (changed) await this.save();
 	}
 	async register(record: AccountRecord, credential?: AuthCredential): Promise<Account> {
 		const provider =
@@ -270,6 +267,7 @@ export class Accounts {
 			defaultReservePct: 0,
 		});
 		if (credential) await storage.credentials.set(provider, credential);
+		else await storage.credentials.reload();
 		// Static login keys rank above environment keys. Runtime overrides also prevent auth retry
 		// from ever resolving an inherited provider credential when this account is unavailable.
 		const current = storage.credentials.get(provider);
@@ -333,15 +331,10 @@ export class Accounts {
 	async save(): Promise<void> {
 		const records = [...this.accounts.values()]
 			.filter((account) => account.record.source !== "config")
-			.map((account) => {
-				const { apiKey: _key, ...record } = account.record;
-				return record;
-			});
-		await atomicJson(join(this.options.home, "api-accounts.json"), { version: 2, accounts: records });
+			.map((account) => account.record);
+		await atomicJson(this.metadataPath, { version: 2, accounts: records });
 	}
 	async credential(account: Account, signal?: AbortSignal): Promise<{ token: string; accountId?: string }> {
-		if (account.record.kind === "api-credits")
-			return { token: await this.ant.token(account.record.profile!, signal) };
 		if (account.record.kind === "oauth") {
 			const credential = await account.storage.oauth.access(account.provider, undefined, { signal });
 			if (!credential) throw new HttpError(401, "Account sign-in must be renewed.");
@@ -354,18 +347,10 @@ export class Accounts {
 	duplicate(record: AccountRecord, key?: string): void {
 		for (const existing of this.accounts.values()) {
 			if (existing.record.id === record.id)
-				throw new HttpError(
-					409,
-					`An ${record.kind === "api-credits" ? "API credits" : "API key"} account named ${record.name} already exists.`,
-				);
+				throw new HttpError(409, `An API key account named ${record.name} already exists.`);
 			const credential = existing.storage.credentials.get(existing.provider);
 			if (key && credential?.type === "api_key" && credential.key === key)
 				throw new HttpError(409, `This API key is already added as ${existing.record.name}.`);
-			if (record.organizationUuid && existing.record.organizationUuid === record.organizationUuid)
-				throw new HttpError(
-					409,
-					`This Claude Console organization${record.organization ? ` (${record.organization})` : ""} is already added as ${existing.record.name}.`,
-				);
 		}
 	}
 	async listModels(record: AccountRecord, token: string, signal?: AbortSignal): Promise<string[]> {
@@ -375,11 +360,8 @@ export class Accounts {
 			"",
 		);
 		const headers: Record<string, string> = anthropic ? { "anthropic-version": "2023-06-01" } : {};
-		if (anthropic && record.kind !== "api-credits") headers["x-api-key"] = token;
-		else {
-			headers.authorization = `Bearer ${token}`;
-			if (anthropic) headers["anthropic-beta"] = "oauth-2025-04-20";
-		}
+		if (anthropic) headers["x-api-key"] = token;
+		else headers.authorization = `Bearer ${token}`;
 		const models: string[] = [];
 		let after: string | undefined;
 		for (let page = 0; page < 100; page++) {
@@ -459,13 +441,9 @@ export class Accounts {
 			if (account.record.source === "config")
 				throw new HttpError(409, "API-key accounts are managed in the broker config.yaml");
 			if (action === "delete") {
-				if (account.record.kind === "api-credits") await this.ant.logout(account.record.profile!);
 				await account.storage.credentials.remove(account.provider);
 				this.accounts.delete(account.record.id);
 				account.storage.close();
-				// Preserve legacy files only until an explicit user deletion.
-				if (/^[^/\\]+\.json$/.test(account.record.id))
-					await rm(join(this.options.home, "auths", account.record.id), { force: true });
 			} else account.record.disabled = action === "disable";
 			await this.save();
 		});

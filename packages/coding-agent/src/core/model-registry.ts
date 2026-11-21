@@ -25,6 +25,8 @@ import type {
 	Provider,
 	ProviderHeaders,
 } from "@earendil-works/pi-ai";
+import { USES_BROKER_AUTH } from "../config.ts";
+import { BROKER_AUTH_GUIDANCE } from "./auth-guidance.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { AuthStatus, ProviderConfigInput } from "./provider-composer.ts";
 import type { VirtualModelDefinition } from "./virtual-models.ts";
@@ -90,6 +92,7 @@ export class ModelRegistry {
 		try {
 			const resolution = await this.runtime.getAuth(model);
 			if (!resolution) {
+				if (USES_BROKER_AUTH) return { ok: false, error: BROKER_AUTH_GUIDANCE };
 				const compatibility = this.runtime.getCompatibilityRequestConfig(model);
 				if (compatibility.authHeader) {
 					return { ok: false, error: `No API key found for "${model.provider}"` };
@@ -196,6 +199,8 @@ export class ModelRegistry {
 	}
 
 	async getApiKeyForProvider(provider: string): Promise<string | undefined> {
+		// MCP's provider-token auth would otherwise forward a private loopback broker token to another server.
+		if (USES_BROKER_AUTH) return undefined;
 		try {
 			return (await this.runtime.getAuth(provider))?.auth.apiKey;
 		} catch {
@@ -218,8 +223,13 @@ export class ModelRegistry {
 		this.runtime.registerNativeProvider(providerOrName);
 	}
 
-	unregisterProvider(providerName: string): void {
-		this.runtime.unregisterProvider(providerName);
+	/** @internal Register a provider with the origin assigned by the extension loader. */
+	registerNativeProvider(provider: Provider, extensionPath?: string): void {
+		this.runtime.registerNativeProvider(provider, extensionPath);
+	}
+
+	unregisterProvider(providerName: string, extensionPath?: string): void {
+		this.runtime.unregisterProvider(providerName, extensionPath);
 	}
 
 	registerVirtualModel(definition: VirtualModelDefinition): void {

@@ -120,8 +120,8 @@ export function findLatestResponse(messages: readonly AgentMessage[]): Assistant
 /**
  * The model selection a session branch records. A virtual `model_change` holds until the next
  * `model_change`, because responses name the physical models it routed to. Otherwise the latest
- * physical response wins, as in sessions without virtual models. A virtual model that is no longer
- * registered does not hold, so the selection falls back to the physical model that answered last.
+ * physical response wins, as in sessions without virtual models. Credne's legacy pool selections
+ * still hold now that the broker routes their requests; the old physical account is not a selection.
  *
  * Only the last `model_change` can hold, so this looks up at most one model in the catalog.
  */
@@ -137,6 +137,14 @@ export function getBranchSelection(
 		if (entry.type === "message" && entry.message.role === "assistant" && !isVirtualModel(entry.message)) {
 			const response = { provider: entry.message.provider, modelId: entry.message.model };
 			const change = findLastModelChange(branch, i);
+			// Historical pool routes wrote a pinned account's response. Do not restore that account
+			// even when the pool is missing from today's catalog; the caller can report a missing pool.
+			if (
+				change?.modelId === response.modelId &&
+				(change.provider === "pool:all" || change.provider === "pool:claude") &&
+				(response.provider.startsWith("acct:") || response.provider.startsWith("claude-sub:"))
+			)
+				return change;
 			const model = change && getModel(change.provider, change.modelId);
 			return change && model && isVirtualModel(model) ? change : response;
 		}

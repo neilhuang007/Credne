@@ -103,6 +103,23 @@ function choiceProbabilities(value: unknown, id: string): Record<string, number>
 	);
 }
 
+/** The probability of each of `count` levels, lowest first. Entries are placed by `value`, the level's index. */
+function levelProbabilities(value: unknown, id: string, count: number): number[] {
+	if (!Array.isArray(value)) throw new Error(`${LABEL} returned invalid probabilities for ${id}`);
+	const byLevel = new Map<number, number>();
+	for (const entry of value) {
+		const level = isRecord(entry) ? entry.value : undefined;
+		const isLevel = typeof level === "number" && Number.isInteger(level) && level >= 0 && level < count;
+		if (!isRecord(entry) || !isLevel || byLevel.has(level)) {
+			throw new Error(`${LABEL} returned invalid probabilities for ${id}`);
+		}
+		byLevel.set(level, requiredNumber(LABEL, entry.probability, `probability for ${id}.${level}`));
+	}
+	// Every entry is a distinct level below `count`, so a full map has every level.
+	if (byLevel.size !== count) throw new Error(`${LABEL} returned invalid probabilities for ${id}`);
+	return Array.from({ length: count }, (_, level) => byLevel.get(level)!);
+}
+
 function parseAnswer(id: string, question: ClassifierQuestion, answer: Record<string, unknown>): ClassifierAnswer {
 	if (answer.type === "refusal") throw new Error(`${LABEL} refused to answer ${id}`);
 	if (question.type === "choice") {
@@ -122,6 +139,7 @@ function parseAnswer(id: string, question: ClassifierQuestion, answer: Record<st
 			type: "score",
 			score: requiredNumber(LABEL, answer.score, `score for ${id}`),
 			confidence: requiredNumber(LABEL, answer.confidence, `confidence for ${id}`),
+			probabilities: levelProbabilities(answer.probabilities, id, question.criteria.length),
 		};
 	}
 	if (answer.type !== "predicate") throw new Error(`${LABEL} did not return a predicate answer for ${id}`);

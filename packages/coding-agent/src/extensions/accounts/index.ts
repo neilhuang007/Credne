@@ -1,11 +1,9 @@
 import { isAbsolute, join, relative } from "node:path";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { getAgentDir, getBinDir, getPackageDir } from "../../config.ts";
+import { getAgentDir, getPackageDir, getRuntimePackageDir } from "../../config.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import { isToolCallEventType } from "../../core/extensions/types.ts";
 import { resolveToCwd } from "../../core/tools/path-utils.ts";
-import { LocalClaude } from "./claude-local.ts";
-import { poolMembers } from "./claude-pool.ts";
 import { BrokerClient, locateBrokerBinary } from "./client.ts";
 import {
 	ACCOUNT_SUBCOMMANDS,
@@ -14,41 +12,24 @@ import {
 	runAccountCommand,
 	showModels,
 } from "./commands.ts";
-import type { AccountProviderSpec } from "./provider.ts";
 import { AccountRegistry } from "./registry.ts";
-import { latestServingProvider } from "./served.ts";
 
-export function createAccountBrokerClient(): BrokerClient {
+export function createAccountBrokerClient(agentDir = getAgentDir()): BrokerClient {
 	return new BrokerClient({
-		home: join(getAgentDir(), "accounts"),
-		locateBinary: () => locateBrokerBinary([join(getPackageDir(), "bin"), getBinDir()]),
+		home: join(agentDir, "accounts"),
+		locateBinary: () =>
+			locateBrokerBinary([join(getRuntimePackageDir(), "bin"), join(getPackageDir(), "bin"), join(agentDir, "bin")]),
 	});
 }
 
-/**
- * Multiple provider accounts. Claude subscriptions are served by this process: each is a Pi provider
- * `claude-sub:<id>` whose tokens are stored and refreshed locally and whose requests go straight to
- * api.anthropic.com. Every other account goes through the shared oh-my-pi account daemon
- * as a Pi provider `acct:<id>`; each family there gets a balanced `pool:<family>`. The pools
- * `pool:claude` and `pool:all` are virtual models that use subscriptions first, then API accounts.
- * Sessions, prompts, tools and the agent loop stay in Pi.
- */
-export default function accountsExtension(pi: ExtensionAPI): void {
-	// Accounts home: broker credentials, broker config, discovery file, account catalog and local subscriptions.
-	const client = createAccountBrokerClient();
+/** Registers accounts and pools backed by the shared oh-my-pi daemon. */
+export default function accountsExtension(pi: ExtensionAPI, agentDir = getAgentDir()): void {
+	const client = createAccountBrokerClient(agentDir);
 	const home = client.home;
-	const local = new LocalClaude({ home });
 
-	// The footer names the account and, for pools, the account that served the last request. A broker pool
-	// reports it in a response header; a virtual pool records the physical account on each answer.
+	// The broker reports the account that served the last pool request in a response header.
 	let statusContext: ExtensionContext | undefined;
-	let latestServedProvider: string | undefined;
 	const servedBy = new Map<string, string>();
-	const servingAccount = (spec: AccountProviderSpec): AccountProviderSpec | undefined => {
-		if (spec.target.type === "pool") return registry.accountByKey(servedBy.get(spec.id) ?? "");
-		if (spec.target.type !== "virtual-pool") return undefined;
-		return poolMembers(registry.providers(), spec.target.name).find((member) => member.id === latestServedProvider);
-	};
 	const showCurrentAccount = (ctx: ExtensionContext): void => {
 		statusContext = ctx;
 		const spec = registry.provider(ctx.model?.provider ?? "");
@@ -56,16 +37,12 @@ export default function accountsExtension(pi: ExtensionAPI): void {
 			ctx.ui.setStatus("accounts", undefined);
 			return;
 		}
-		const served = servingAccount(spec);
+		const served = spec.target.type === "pool" ? registry.accountByKey(servedBy.get(spec.id) ?? "") : undefined;
 		ctx.ui.setStatus("accounts", served ? `account: ${spec.name} -> ${served.name}` : `account: ${spec.name}`);
 	};
-	const resetServedProvider = (ctx: ExtensionContext): void => {
-		latestServedProvider = latestServingProvider(ctx.sessionManager.getBranch());
-		showCurrentAccount(ctx);
-	};
 
-	// Registers local subscriptions and cached broker accounts synchronously so a resumed session can restore its account.
-	const registry = new AccountRegistry(pi, client, local, join(home, "catalog.json"), (providerId, accountKey) => {
+	// Cached broker accounts register synchronously so a resumed session can restore its account.
+	const registry = new AccountRegistry(pi, client, join(home, "catalog.json"), (providerId, accountKey) => {
 		servedBy.set(providerId, accountKey);
 		if (!statusContext) return;
 		try {
@@ -74,33 +51,23 @@ export default function accountsExtension(pi: ExtensionAPI): void {
 			// The context went stale after a session switch; the next event refreshes the status.
 		}
 	});
-	const deps: AccountCommandDeps = { pi, client, registry, local };
+	const deps: AccountCommandDeps = { pi, client, registry };
 
 	pi.on("session_start", (_event, ctx) => {
-		resetServedProvider(ctx);
-		// Best effort. Subscriptions the broker still holds move to the local store first; that needs no running
-		// broker. Then the catalog refreshes from an already running broker, which is never started here.
+		servedBy.clear();
+		showCurrentAccount(ctx);
+		// Refresh only from an already running broker: opening a session must not start it.
 		void (async () => {
-			await registry.importBrokerSubscriptions(ctx);
-			showCurrentAccount(ctx);
 			if (!(await client.connectExisting())) return;
 			await registry.sync(ctx);
 			showCurrentAccount(ctx);
 		})().catch(() => {});
 	});
 
-	pi.on("model_select", (_event, ctx) => resetServedProvider(ctx));
+	pi.on("model_select", (_event, ctx) => showCurrentAccount(ctx));
 
-	pi.on("message_end", (event, ctx) => {
-		const message = event.message;
-		if (message.role !== "assistant" || message.stopReason === "error" || message.stopReason === "aborted") return;
-		latestServedProvider = message.provider;
-		showCurrentAccount(ctx);
-	});
-
-	// The accounts home holds OAuth refresh tokens and API keys, including the Claude subscription credentials in
-	// claude-subscriptions.json. Pi's file tools must not read them into model context. Shell tools run as the
-	// same OS user and are not covered; see broker/README.md.
+	// The accounts home holds credentials, including unused legacy files. Keep it out of model context.
+	// Shell tools run as the same OS user and are not covered; see broker/README.md.
 	pi.on("tool_call", (event, ctx) => {
 		if (
 			!isToolCallEventType("read", event) &&

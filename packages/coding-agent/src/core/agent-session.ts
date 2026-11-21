@@ -3835,12 +3835,12 @@ export class AgentSession {
 					this._modelRuntime.registerProvider(name, config);
 					this._refreshCurrentModelFromRegistry();
 				},
-				registerNativeProvider: (provider) => {
-					this._modelRuntime.registerNativeProvider(provider);
+				registerNativeProvider: (provider, extensionPath) => {
+					this._modelRuntime.registerNativeProvider(provider, extensionPath);
 					this._refreshCurrentModelFromRegistry();
 				},
-				unregisterProvider: (name) => {
-					this._modelRuntime.unregisterProvider(name);
+				unregisterProvider: (name, extensionPath) => {
+					this._modelRuntime.unregisterProvider(name, extensionPath);
 					this._refreshCurrentModelFromRegistry();
 				},
 				registerVirtualModel: (definition) => {

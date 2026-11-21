@@ -74,10 +74,42 @@ describe("TypeSafe System One", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.answers.approved).toEqual({ type: "bool", probability: 0.95 });
 		expect(result.answers.category).toMatchObject({ type: "choice", choice: "success" });
+		// A score answer without per-level probabilities leaves the field unset.
 		expect(result.answers.satisfaction).toEqual({ type: "score", score: 2, confidence: 0.7 });
+		expect(result.answers.satisfaction).not.toHaveProperty("probabilities");
 		expect(result.usage).toBeUndefined();
 		expect(pricedResult.usage).toMatchObject({ input: 308, output: 23, totalTokens: 331 });
 		expect(pricedResult.usage?.cost.total).toBeCloseTo(0.000012936, 12);
+	});
+
+	it("reports the per-level probabilities of a score answer, lowest level first", async () => {
+		// TypeSafe keys the probabilities of a score answer by level number, as a string.
+		const satisfaction = {
+			type: "score",
+			score: 1.43,
+			confidence: 0.35,
+			probabilities: { "2": 0.43, "0": 0, "1": 0.57 },
+		};
+		const result = await classify(model, context, {
+			apiKey: "secret",
+			fetch: async () => Response.json({ answers: { ...wireAnswers, satisfaction } }),
+		});
+		const incomplete = await classify(model, context, {
+			apiKey: "secret",
+			fetch: async () =>
+				Response.json({
+					answers: { ...wireAnswers, satisfaction: { ...satisfaction, probabilities: { "0": 0.5, "1": 0.5 } } },
+				}),
+		});
+
+		expect(result.answers.satisfaction).toEqual({
+			type: "score",
+			score: 1.43,
+			confidence: 0.35,
+			probabilities: [0, 0.57, 0.43],
+		});
+		// A level without a probability is a malformed answer, as for a choice.
+		expect(incomplete.stopReason).toBe("error");
 	});
 
 	it("posts OpenRouter System One requests to its TypeSafe-compatible endpoint", async () => {

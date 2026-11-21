@@ -16,9 +16,7 @@ const brokerAssets = [
 	`bin/credne-broker${process.platform === "win32" ? ".exe" : ""}`,
 	"bin/pi-natives-LICENSE",
 	"bin/pi-natives-THIRD-PARTY-NOTICES.txt",
-	...(process.arch === "x64"
-		? ["baseline", "modern"].map((variant) => `bin/pi_natives.${process.platform}-${process.arch}-${variant}.node`)
-		: [`bin/pi_natives.${process.platform}-${process.arch}.node`]),
+	`bin/pi_natives.${process.platform}-${process.arch}${process.arch === "x64" ? "-baseline" : ""}.node`,
 ];
 
 function write(path, contents = "fixture") {

@@ -203,7 +203,7 @@ export class AccountsPanel implements Component, Focusable {
 		if (!entry)
 			return [
 				row.id === "+add"
-					? "Add a subscription, API-credit account or API key."
+					? "Add a subscription or API key."
 					: "Stops the shared broker; the next request restarts it and reloads config.yaml.",
 			];
 		const theme = this.theme;

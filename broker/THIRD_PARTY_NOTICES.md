@@ -80,8 +80,6 @@ TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
 ```
 
-## Runtime downloads
-
-Anthropic ant is downloaded separately on demand, not bundled. The installer pins 2.9.0 and archive hashes. Source and release terms: https://github.com/anthropics/anthropic-cli.
+## Bun runtime
 
 Bun compiles the executable. Its runtime and SQLite notices remain applicable: https://github.com/oven-sh/bun/blob/main/LICENSE.md.

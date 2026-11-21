@@ -168,6 +168,22 @@ const CodemodeSettingsSchema = Type.Object({
 	),
 });
 
+function tierClassifierMode(options?: TSchemaOptions) {
+	return Type.Union([Type.Literal("off"), Type.Literal("shadow"), Type.Literal("apply")], options);
+}
+
+const TierClassifierModeSchema = tierClassifierMode();
+
+const SubagentSettingsSchema = Type.Object({
+	tierClassifier: Type.Optional(
+		tierClassifierMode({
+			description:
+				'Rates how demanding each delegated task is before it is dispatched, with a classifier model or, when none is available, with the light-tier chat model of the current account. "shadow" records the rating and dispatches as usual. "apply" also uses the rated tier in place of the tier of the agent profile when the classifier is confident.',
+			default: SETTINGS_DEFAULTS.subagents.tierClassifier,
+		}),
+	),
+});
+
 const PackageSourceSchema = Type.Union(
 	[
 		Type.String({ description: "Load all resources from the package." }),
@@ -399,6 +415,7 @@ export const SettingsSchema = Type.Object(
 		markdown: Type.Optional(MarkdownSettingsSchema),
 		warnings: Type.Optional(WarningSettingsSchema),
 		codemode: Type.Optional(CodemodeSettingsSchema),
+		subagents: Type.Optional(SubagentSettingsSchema),
 		sessionDir: Type.Optional(
 			Type.String({
 				description: "Custom session storage directory, in the same format as the --session-dir CLI flag.",
@@ -509,6 +526,7 @@ export interface MarkdownSettings extends Static<typeof MarkdownSettingsSchema> 
 export interface WarningSettings extends Static<typeof WarningSettingsSchema> {}
 export type CodemodeMode = Static<typeof CodemodeModeSchema>;
 export interface CodemodeSettings extends Static<typeof CodemodeSettingsSchema> {}
+export type TierClassifierMode = Static<typeof TierClassifierModeSchema>;
 export type DefaultProjectTrust = NonNullable<SettingsInput["defaultProjectTrust"]>;
 export type QuietStartup = NonNullable<SettingsInput["quietStartup"]>;
 export type TransportSetting = NonNullable<SettingsInput["transport"]>;

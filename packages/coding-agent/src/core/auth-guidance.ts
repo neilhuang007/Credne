@@ -1,9 +1,14 @@
 import { join } from "node:path";
-import { getDocsPath } from "../config.ts";
+import { getDocsPath, USES_BROKER_AUTH } from "../config.ts";
 
 const UNKNOWN_PROVIDER = "unknown";
 
+export const BROKER_AUTH_GUIDANCE = "Manage provider credentials with /accounts.";
+export const BROKER_MCP_AUTH_GUIDANCE =
+	"Credne cannot reuse model account credentials for MCP. Configure the MCP server's own authentication.";
+
 export function getProviderLoginHelp(): string {
+	if (USES_BROKER_AUTH) return BROKER_AUTH_GUIDANCE;
 	return [
 		"Use /login to log into a provider via OAuth or API key. See:",
 		`  ${join(getDocsPath(), "providers.md")}`,
@@ -21,5 +26,7 @@ export function formatNoModelSelectedMessage(): string {
 
 export function formatNoApiKeyFoundMessage(provider: string): string {
 	const providerDisplay = provider === UNKNOWN_PROVIDER ? "the selected model" : provider;
-	return `No API key found for ${providerDisplay}.\n\n${getProviderLoginHelp()}`;
+	return USES_BROKER_AUTH
+		? `No account configured for ${providerDisplay}. ${BROKER_AUTH_GUIDANCE}`
+		: `No API key found for ${providerDisplay}.\n\n${getProviderLoginHelp()}`;
 }

@@ -7,8 +7,10 @@ import { truncateHead } from "../../core/tools/truncate.ts";
 import { type AgentConfig, discoverBundledAgents } from "../subagent/agents.ts";
 import { captureSubagentContext, listSubagentContext, turnSchema } from "../subagent/context.ts";
 import { createSubagentDispatch, reasoningEffortSchema } from "../subagent/dispatch.ts";
+import { type ModelTier, modelTierSchema } from "../subagent/model-tiers.ts";
 import { type DispatchDefaults, getFinalOutput, type SingleResult } from "../subagent/runner.ts";
 import { type AssignmentInput, getWorkerTeam, revealTools, type WorkerTeam } from "../subagent/team.ts";
+import { classifyTiers, type TierRequest, withRating } from "../subagent/tier-classifier.ts";
 import {
 	completeTask,
 	createPlan,
@@ -479,7 +481,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		name: "assign_tasks",
 		label: "Assign tasks",
 		description:
-			"Assign ready tasks to new workers. Returns worker IDs; successful results complete tasks automatically. Model, reasoningEffort, and turn apply to the batch.",
+			"Assign ready tasks to new workers. Returns worker IDs; successful results complete tasks automatically. Model, tier, reasoningEffort, and turn apply to the batch.",
 		parameters: Type.Object({
 			revision: revisionSchema,
 			taskIds: taskIdsSchema,
@@ -492,9 +494,10 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			model: Type.Optional(
 				Type.String({
 					description:
-						"Model ID or unique name on the current account. Discover IDs with search_models. An explicit provider/model ID selects that route.",
+						"Model ID, unique name, or family alias such as sol, opus or flash (newest of that family) on the current account. Discover IDs with search_models. An explicit provider/model ID selects that route.",
 				}),
 			),
+			tier: Type.Optional(modelTierSchema),
 			reasoningEffort: Type.Optional(reasoningEffortSchema),
 			turn: Type.Optional(turnSchema),
 		}),
@@ -508,29 +511,41 @@ export default function planningExtension(pi: ExtensionAPI): void {
 				throw new Error("Planning model must be a model ID or name");
 			const agent = discoverBundledAgents().find((candidate) => candidate.name === "worker");
 			if (!agent) throw new Error("The worker agent profile is unavailable.");
-			const resolved = dispatch.resolve(
-				{ model: configuredModel, reasoningEffort: args.reasoningEffort },
-				ctx,
-				agent.model,
-			);
 			const context = captureSubagentContext(args.turn, ctx);
+			// Each task is rated on its own, so the tasks of one call can run at different tiers. A model or tier
+			// chosen for the call applies to all of them and skips the rating.
+			const requests = args.taskIds.map((id) =>
+				plannedTierRequest(current, id, agent, { model: configuredModel, tier: args.tier }),
+			);
+			const ratings = await classifyTiers(pi, dispatch, requests, ctx, signal);
+			if (signal?.aborted) throw new Error("Task assignment aborted before starting");
+			const resolved = ratings.map((rating) =>
+				dispatch.resolve(
+					{ model: configuredModel, tier: args.tier, reasoningEffort: args.reasoningEffort },
+					ctx,
+					// The rated tier replaces the profile's tier, and the rated effort the effort of its tier row;
+					// neither is a choice of the caller, so an explicit model, tier or reasoningEffort still wins.
+					withRating(agent, rating),
+				),
+			);
 			const background = args.background ?? true;
-			const next = queueTasks(current, args.taskIds);
+			// Workers may have reported while the classifier ran, so queue the tasks on the plan as it is now.
+			const next = queueTasks(requirePlan(args.revision), args.taskIds);
 			save(next, ctx);
-			const dispatched = args.taskIds.map((id) => ({
+			const dispatched = args.taskIds.map((id, index) => ({
 				taskId: id,
 				job: launch(
 					next.tasks.find((task) => task.spec.id === id)!.spec,
 					{
 						kind: "new",
 						agent,
-						defaults: { ...resolved, context, extraArgs: ["--planning-worker", "--subagent-worker"] },
+						defaults: { ...resolved[index], context, extraArgs: ["--planning-worker", "--subagent-worker"] },
 					},
 					background ? "background" : "foreground",
 					ctx,
 				),
 			}));
-			const workers = dispatched.map(({ taskId, job }) => ({ taskId, workerId: job.id }));
+			const workers = dispatched.map(({ taskId, job }, index) => ({ taskId, workerId: job.id, ...resolved[index] }));
 			const completed = background
 				? undefined
 				: await waitForWorkers(
@@ -545,7 +560,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 				errorMessage: result.errorMessage,
 			}));
 			const result = snapshot();
-			const assignment = { workers, ...resolved, turn: args.turn ?? 0, background };
+			const assignment = { workers, turn: args.turn ?? 0, background };
 			return {
 				content: [...result.content, { type: "text", text: bounded(JSON.stringify({ ...assignment, results })) }],
 				details: { ...result.details, assignment, results },
@@ -657,6 +672,27 @@ async function waitForWorkers(jobs: WorkerJob[], signal: AbortSignal | undefined
 		signal?.removeEventListener("abort", cancel);
 		await cancellation;
 	}
+}
+
+/** What the tier classifier is asked about one task of a plan: the task itself, with the objective and step names as background. */
+function plannedTierRequest(
+	plan: Plan,
+	taskId: string,
+	agent: AgentConfig,
+	choice: { model?: string; tier?: ModelTier },
+): TierRequest | undefined {
+	const task = plan.tasks.find((candidate) => candidate.spec.id === taskId);
+	if (!task) return undefined;
+	const steps = plan.tasks
+		.filter((candidate) => candidate.state.status !== "superseded")
+		.map((candidate) => candidate.spec)
+		.sort((left, right) => left.order - right.order);
+	return {
+		agent,
+		work: { kind: "planned", objective: plan.objective, plan: steps.map((step) => step.name), task: task.spec },
+		model: choice.model,
+		tier: choice.tier,
+	};
 }
 
 /** Supplies the assignment and only includes the full plan when it is new to the worker. */

@@ -18,6 +18,10 @@ export function assertBunVersion(version) {
 	}
 }
 
+export function requiredBrokerAddon() {
+	return `pi_natives.${process.platform}-${process.arch}${process.arch === "x64" ? "-baseline" : ""}.node`;
+}
+
 export function buildAccountBroker({ outDir = join(brokerDir, "dist") } = {}) {
 	let bunVersion;
 	try {
@@ -43,9 +47,9 @@ export function buildAccountBroker({ outDir = join(brokerDir, "dist") } = {}) {
 	if (installedNative.version !== nativeVersion) {
 		throw new Error(`${nativeName}: installed ${installedNative.version}, expected ${nativeVersion}.`);
 	}
-	const addons = process.arch === "x64"
-		? [`pi_natives.${platformTag}-baseline.node`, `pi_natives.${platformTag}-modern.node`]
-		: [`pi_natives.${platformTag}.node`];
+	const addons = [requiredBrokerAddon()];
+	const modernAddon = `pi_natives.${platformTag}-modern.node`;
+	if (process.arch === "x64" && existsSync(join(nativeDir, modernAddon))) addons.push(modernAddon);
 	const notices = ["LICENSE", "THIRD-PARTY-NOTICES.txt"];
 	for (const asset of [...addons, ...notices]) {
 		if (!existsSync(join(nativeDir, asset))) throw new Error(`Missing broker native asset: ${join(nativeDir, asset)}`);
@@ -61,7 +65,6 @@ export function buildAccountBroker({ outDir = join(brokerDir, "dist") } = {}) {
 	], { cwd: brokerDir, stdio: "inherit" });
 
 	// pi-natives resolves adjacent addons dynamically, so Bun cannot discover these as static imports.
-	// Keep both x64 ISA variants for the upstream loader's runtime CPU selection.
 	for (const addon of addons) cpSync(join(nativeDir, addon), join(output, addon));
 	for (const notice of notices) cpSync(join(nativeDir, notice), join(output, `pi-natives-${notice}`));
 	// bun:sqlite ships in the compiled runtime; pi-catalog's static models/rules JSON imports are bundled.

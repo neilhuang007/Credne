@@ -2,7 +2,8 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { lock } from "proper-lockfile";
-import { type Account, Accounts, atomicJson, boundedText, HttpError, publicAccount, publicModels } from "./accounts.ts";
+import { Accounts, atomicJson, boundedText, HttpError, publicAccount, publicModels } from "./accounts.ts";
+import { decisionsError } from "./decisions.ts";
 import { Gateway, protocolError } from "./gateway.ts";
 import { Logins } from "./logins.ts";
 import { fetchAccountUsage } from "./usage.ts";
@@ -215,7 +216,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 						const callback = new URL(redirect);
 						callback.search = url.search;
 						try {
-							await login.callback(callback.href);
+							login.callback(callback.href);
 							return new Response("Sign-in received. Return to Credne.");
 						} catch {
 							break;
@@ -261,21 +262,11 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 						const accountMatch = /^\/accounts\/([A-Za-z0-9_-]+)(?:\/(models|usage|disable|enable|reset))?$/.exec(
 							path,
 						);
-						const loginMatch = /^\/logins\/([A-Za-z0-9_-]+)(\/callback)?$/.exec(path);
-						const routeMatch = /^\/route\/([^/]+)(\/v1\/messages|\/responses|\/chat\/completions)$/.exec(path);
+						const loginMatch = /^\/logins\/([A-Za-z0-9_-]+)(?:\/(callback|acknowledge))?$/.exec(path);
+						const routeMatch =
+							/^\/route\/([^/]+)(\/v1\/messages|\/responses|\/chat\/completions|\/decisions)$/.exec(path);
 						if (accountMatch) {
-							let account: Account;
-							try {
-								account = store.get(accountMatch[1]);
-							} catch (error) {
-								// Node owns legacy local Claude migration and deletes its old source only after adoption.
-								const id = Buffer.from(accountMatch[1], "base64url").toString("utf8");
-								if (request.method === "DELETE" && /^claude-[^/\\]+\.json$/.test(id)) {
-									await rm(join(home, "auths", id), { force: true });
-									return Response.json({ ok: true });
-								}
-								throw error;
-							}
+							const account = store.get(accountMatch[1]);
 							const action = accountMatch[2];
 							if (request.method === "GET" && action === "models")
 								response = Response.json({ models: publicModels(account) });
@@ -300,11 +291,14 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 							else if (request.method === "DELETE" && !loginMatch[2]) {
 								await loginApi.cancel(loginMatch[1]);
 								response = Response.json({ ok: true });
-							} else if (request.method === "POST" && loginMatch[2]) {
+							} else if (request.method === "POST" && loginMatch[2] === "callback") {
 								const redirectUrl = text((await managementBody(request)).redirectUrl);
 								if (!redirectUrl) throw new HttpError(400, "redirectUrl is required");
-								await loginApi.get(loginMatch[1]).callback(redirectUrl);
+								loginApi.get(loginMatch[1]).callback(redirectUrl);
 								response = Response.json({ ok: true });
+							} else if (request.method === "POST" && loginMatch[2] === "acknowledge") {
+								const { answer } = await managementBody(request);
+								response = Response.json(await loginApi.acknowledge(loginMatch[1], answer, request.signal));
 							} else throw new HttpError(404, "not found");
 						} else if (routeMatch && request.method === "POST")
 							response = await routes.execute(request, routeMatch[1], routeMatch[2]);
@@ -355,7 +349,8 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 							: status === 499
 								? "Request cancelled."
 								: "Broker request failed.";
-					if (url.pathname.includes("/route/"))
+					if (url.pathname.includes("/route/")) {
+						if (url.pathname.endsWith("/decisions")) return decisionsError(status, message);
 						return protocolError(
 							status,
 							message,
@@ -365,6 +360,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 									? "responses"
 									: "chat",
 						);
+					}
 					return Response.json({ error: message }, { status });
 				} finally {
 					if (!bodyOwnsActivity) done();

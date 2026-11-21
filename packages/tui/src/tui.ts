@@ -299,6 +299,8 @@ export interface OverlayOptions {
 	 * Called each render cycle with current terminal dimensions.
 	 */
 	visible?: (termWidth: number, termHeight: number) => boolean;
+	/** Leading columns reserved for decoration, excluded from fullscreen text selection. */
+	selectionInsetLeft?: number;
 	/** If true, don't capture keyboard focus when shown */
 	nonCapturing?: boolean;
 }
@@ -348,6 +350,7 @@ type OverlayStackEntry = {
 
 type RenderedOverlayLayout = {
 	entry: OverlayStackEntry;
+	lines: readonly string[];
 	row: number;
 	col: number;
 	width: number;
@@ -934,7 +937,7 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	/** Dispatch to the visually topmost overlay under the pointer. */
-	protected dispatchMouseToOverlay(event: TuiMouseEvent): { hit: boolean; result?: TuiMouseDispatchResult } {
+	protected dispatchMouseToOverlay(event: TuiMouseEvent): { hit?: Component; result?: TuiMouseDispatchResult } {
 		for (let index = this.renderedOverlayLayouts.length - 1; index >= 0; index--) {
 			const layout = this.renderedOverlayLayouts[index]!;
 			if (
@@ -954,12 +957,16 @@ export abstract class TuiBase extends Container implements TUI {
 			});
 			return result
 				? {
-						hit: true,
+						hit: layout.entry.component,
 						result: result.focus ? { ...result, focusTarget: layout.entry.component } : result,
 					}
-				: { hit: true };
+				: { hit: layout.entry.component };
 		}
-		return { hit: false };
+		return {};
+	}
+
+	protected getRenderedOverlay(component: Component): RenderedOverlayLayout | undefined {
+		return this.renderedOverlayLayouts.findLast((layout) => layout.entry.component === component);
 	}
 
 	/** Check if an overlay entry is currently visible */
@@ -1457,6 +1464,7 @@ export abstract class TuiBase extends Container implements TUI {
 			col,
 			width: w,
 			height: overlayLines.length,
+			lines: overlayLines,
 		}));
 
 		// Pad to at least terminal height so overlays have screen-relative positions.

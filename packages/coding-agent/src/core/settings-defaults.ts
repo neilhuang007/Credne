@@ -61,6 +61,9 @@ export const SETTINGS_DEFAULTS = {
 		mode: "on",
 		inlineBudget: 3000,
 	},
+	subagents: {
+		tierClassifier: "apply",
+	},
 	cacheWarming: "idle",
 	sidePanel: {
 		enabled: false,

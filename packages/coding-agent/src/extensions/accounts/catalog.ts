@@ -1,41 +1,22 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, ClassifierApi, ClassifierModel, Model } from "@earendil-works/pi-ai";
 import type { BrokerAccount, BrokerAccountKind, BrokerModel } from "./client.ts";
 
 /** Prefix of providers that pin one broker account. */
 export const ACCOUNT_PROVIDER_PREFIX = "acct:";
-/** Prefix of the providers that serve one local Claude subscription, `claude-sub:<id>`. */
-export const LOCAL_CLAUDE_PROVIDER_PREFIX = "claude-sub:";
 /** Prefix of providers that let the broker balance requests across accounts. */
 export const POOL_PROVIDER_PREFIX = "pool:";
 /** Pool over every account of every family; the default for new sessions. */
 export const ALL_POOL = "all";
-/** Pools that virtual models serve in this process instead of the broker: subscriptions first, then API accounts. */
-export const VIRTUAL_POOLS: readonly string[] = [ALL_POOL, "claude"];
-
-/** Whether `providerId` is a physical provider of one local Claude subscription. */
+/** Whether `providerId` names the retired in-process Claude subscription provider. */
 export function isLocalClaudeProvider(providerId: string): boolean {
-	return providerId.startsWith(LOCAL_CLAUDE_PROVIDER_PREFIX);
+	return providerId.toLowerCase().startsWith("claude-sub:");
 }
 
-/** Pi provider id of a local Claude subscription. */
-export function localClaudeProviderId(accountId: string): string {
-	return `${LOCAL_CLAUDE_PROVIDER_PREFIX}${accountId}`;
-}
-
-/** Whether `providerId` is a virtual pool (`pool:claude`, `pool:all`): its models route to physical accounts in this process. */
-export function isVirtualPoolProvider(providerId: string): boolean {
-	return (
-		providerId.startsWith(POOL_PROVIDER_PREFIX) &&
-		VIRTUAL_POOLS.includes(providerId.slice(POOL_PROVIDER_PREFIX.length))
-	);
-}
-
-/** Whether requests of `providerId` go through the account broker: a pinned broker account or a broker pool. */
+/** Whether requests of `providerId` go through the account broker: a pinned account or a pool. */
 export function isBrokerProvider(providerId: string): boolean {
-	if (providerId.startsWith(ACCOUNT_PROVIDER_PREFIX)) return true;
-	return providerId.startsWith(POOL_PROVIDER_PREFIX) && !isVirtualPoolProvider(providerId);
+	return providerId.startsWith(ACCOUNT_PROVIDER_PREFIX) || providerId.startsWith(POOL_PROVIDER_PREFIX);
 }
 
 /**
@@ -43,6 +24,15 @@ export function isBrokerProvider(providerId: string): boolean {
  * auth supplies it at request time and it is never persisted.
  */
 export const BROKER_PLACEHOLDER_URL = "http://127.0.0.1/credne-broker";
+
+/** Broker provider key of OpenAI API keys. ChatGPT subscriptions are `codex`. */
+const OPENAI_API_PROVIDER = "openai-api";
+/** The only model of OpenAI's Decisions API. */
+const DECISIONS_MODEL_ID = "gpt-6-luna";
+/** Pi's built-in provider whose catalog entry describes the Decisions model. */
+const DECISIONS_CATALOG_PROVIDER = "openai";
+/** The classifier API the broker's decisions route speaks. */
+const DECISIONS_API = "openai-decisions";
 
 /** A broker account as cached for synchronous provider registration at startup. No secrets. */
 export interface CachedAccount {
@@ -55,6 +45,8 @@ export interface CachedAccount {
 	plan?: string;
 	disabled: boolean;
 	models: Model<Api>[];
+	/** Classifier models the broker serves for this account: the Decisions model of an OpenAI API key. */
+	classifiers?: ClassifierModel<ClassifierApi>[];
 }
 
 /** A broker pool: every enabled account of its family funds its models. */
@@ -63,6 +55,8 @@ export interface CachedPool {
 	name: string;
 	accountCount: number;
 	models: Model<Api>[];
+	/** Classifier models the broker serves for this pool: `pool:openai` offers the Decisions model. */
+	classifiers?: ClassifierModel<ClassifierApi>[];
 }
 
 /**
@@ -76,14 +70,6 @@ export interface AccountCatalog {
 }
 
 export const EMPTY_CATALOG: AccountCatalog = { version: 2, accounts: [], pools: [] };
-
-/**
- * Claude subscriptions are signed in, stored and refreshed by this process (`claude-sub:*` providers). A broker
- * account of that kind is legacy data that the one-time import moves out of the broker.
- */
-export function isBrokerClaudeSubscription(account: { provider: string; kind: BrokerAccountKind }): boolean {
-	return account.provider === "claude" && account.kind === "oauth";
-}
 
 /** Catalog file contents, or an empty catalog when the file is missing, outdated or unreadable. */
 export function readCatalog(path: string): AccountCatalog {
@@ -99,21 +85,27 @@ export function readCatalog(path: string): AccountCatalog {
 	if (catalog.version !== 2 || !Array.isArray(catalog.accounts) || !Array.isArray(catalog.pools)) {
 		return EMPTY_CATALOG;
 	}
-	return {
-		version: 2,
-		// A catalog written before subscriptions moved out of the broker may still list them and their pools.
-		accounts: catalog.accounts.filter(
+	const accounts = catalog.accounts
+		.filter(
 			(entry) =>
 				typeof entry?.id === "string" &&
 				typeof entry.key === "string" &&
+				typeof entry.provider === "string" &&
 				Array.isArray(entry.models) &&
-				!isBrokerClaudeSubscription(entry),
-		),
-		pools: catalog.pools.filter(
-			(entry) =>
-				typeof entry?.name === "string" && Array.isArray(entry.models) && !VIRTUAL_POOLS.includes(entry.name),
-		),
-	};
+				entry.kind !== "api-credits",
+		)
+		.map((entry) => ({ ...entry, classifiers: readClassifiers(entry.classifiers) }));
+	// Older catalogs omitted pool:all and pool:claude when they were served locally.
+	return { version: 2, accounts, pools: buildPools(accounts) };
+}
+
+/** The classifier models of a catalog file entry that this version serves. Files from before classifiers have none. */
+function readClassifiers(value: unknown): ClassifierModel<ClassifierApi>[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return value.filter(
+		(entry): entry is ClassifierModel<ClassifierApi> =>
+			entry?.type === "classifier" && entry.api === DECISIONS_API && typeof entry.id === "string",
+	);
 }
 
 /** Write the catalog atomically; concurrent harness processes write equivalent broker-derived data. */
@@ -134,11 +126,11 @@ export function poolProviderId(name: string): string {
 }
 
 /**
- * Model family of a broker provider. Claude subscriptions (`claude`) and official-API accounts
- * (`claude-api`: API credits and API keys) serve the same Claude models.
+ * Model family of a broker provider. Claude subscriptions (`claude`) and API keys (`claude-api`)
+ * serve the same Claude models.
  */
 export function familyOf(provider: string): string {
-	if (provider === "openai-api") return "openai";
+	if (provider === OPENAI_API_PROVIDER) return "openai";
 	return provider === "claude-api" ? "claude" : provider;
 }
 
@@ -151,13 +143,17 @@ export function apiForFamily(family: string): Api {
 }
 
 /** Pi's built-in providers whose catalog describes the same upstream models. */
-const CATALOG_SOURCES: Record<string, readonly string[]> = {
+const CATALOG_SOURCES: Record<string, readonly CatalogSource[]> = {
 	claude: ["anthropic"],
 	codex: ["openai-codex", "openai"],
 	openai: ["openai"],
 };
 
-export type CatalogLookup = (provider: string, modelId: string) => Model<Api> | undefined;
+type CatalogSource = "anthropic" | "openai-codex" | "openai";
+export type CatalogLookup = (provider: CatalogSource, modelId: string) => Model<Api> | undefined;
+
+/** Finds a classifier model of Pi's catalog. */
+export type ClassifierLookup = (provider: string, modelId: string) => ClassifierModel<ClassifierApi> | undefined;
 
 const KIND_LABELS: Record<BrokerAccountKind, string> = {
 	oauth: "subscription",
@@ -187,17 +183,17 @@ export function poolDisplayName(pool: Pick<CachedPool, "name" | "accountCount">)
 }
 
 /**
- * Build the catalog from broker data, describing models with Pi's catalog metadata where it knows
- * them. Every family with an enabled account gets a broker pool, except the virtual pools (`pool:claude`
- * and `pool:all`), which span these accounts and the local Claude subscriptions. Broker copies of Claude
- * subscriptions are left out.
+ * Build the catalog from broker data, using Pi's model metadata where available. Each family with
+ * an enabled account gets a broker pool, as does the union of all families. OpenAI API keys and
+ * their family pool also offer the Decisions classifier if the key lists it.
  */
 export function buildCatalog(
 	brokerAccounts: readonly BrokerAccount[],
 	accountModels: ReadonlyMap<string, readonly BrokerModel[]>,
 	lookup: CatalogLookup,
+	lookupClassifier?: ClassifierLookup,
 ): AccountCatalog {
-	const accounts = brokerAccounts.filter((account) => !isBrokerClaudeSubscription(account));
+	const accounts = brokerAccounts.filter((account) => account.kind !== "api-credits");
 	const cachedAccounts = accounts.map((account): CachedAccount => {
 		const providerId = accountProviderId(account.id);
 		return {
@@ -212,31 +208,35 @@ export function buildCatalog(
 			models: chatModels(account, accountModels, lookup).map((model) =>
 				toPiModel(providerId, familyOf(account.provider), model, lookup),
 			),
+			classifiers: decisionsClassifiers(providerId, account, accountModels, lookupClassifier),
 		};
 	});
 
+	return { version: 2, accounts: cachedAccounts, pools: buildPools(cachedAccounts) };
+}
+
+function buildPools(accounts: readonly CachedAccount[]): CachedPool[] {
 	const enabled = accounts.filter((account) => !account.disabled);
-	const families = [...new Set(enabled.map((account) => familyOf(account.provider)))]
-		.filter((family) => !VIRTUAL_POOLS.includes(family))
-		.sort();
-	const poolFor = (name: string, members: readonly BrokerAccount[]): CachedPool => {
+	if (enabled.length === 0) return [];
+	const families = [...new Set(enabled.map((account) => familyOf(account.provider)))].sort();
+	return [ALL_POOL, ...families].map((name) => {
+		const members = name === ALL_POOL ? enabled : enabled.filter((account) => familyOf(account.provider) === name);
+		const provider = poolProviderId(name);
 		const models = new Map<string, Model<Api>>();
 		for (const account of members) {
-			for (const model of chatModels(account, accountModels, lookup)) {
-				if (!models.has(model.id)) {
-					models.set(model.id, toPiModel(poolProviderId(name), familyOf(account.provider), model, lookup));
-				}
+			for (const model of account.models) {
+				if (!models.has(model.id)) models.set(model.id, { ...model, provider });
 			}
 		}
-		return { name, accountCount: members.length, models: [...models.values()] };
-	};
-	const pools = families.map((family) =>
-		poolFor(
-			family,
-			enabled.filter((account) => familyOf(account.provider) === family),
-		),
-	);
-	return { version: 2, accounts: cachedAccounts, pools };
+		// The broker's Decisions route is restricted to pinned OpenAI API keys and their family pool.
+		const classifiers = name === "openai" ? members.find((account) => account.classifiers)?.classifiers : undefined;
+		return {
+			name,
+			accountCount: members.length,
+			models: [...models.values()],
+			classifiers: classifiers?.map((model) => ({ ...model, provider })),
+		};
+	});
 }
 
 function chatModels(
@@ -246,7 +246,28 @@ function chatModels(
 ): readonly BrokerModel[] {
 	const models = accountModels.get(account.key) ?? [];
 	// OpenAI lists image, audio and embedding models too; only registered chat models belong here.
-	return account.provider === "openai-api" ? models.filter((model) => lookup("openai", model.id)) : models;
+	return account.provider === OPENAI_API_PROVIDER ? models.filter((model) => lookup("openai", model.id)) : models;
+}
+
+/**
+ * The Decisions classifier of a pinned OpenAI API key that lists the model. The Decisions API
+ * rejects ChatGPT sign-in credentials. The model uses Pi's built-in cost and limits.
+ */
+function decisionsClassifiers(
+	providerId: string,
+	account: BrokerAccount,
+	accountModels: ReadonlyMap<string, readonly BrokerModel[]>,
+	lookupClassifier: ClassifierLookup | undefined,
+): ClassifierModel<ClassifierApi>[] | undefined {
+	if (
+		account.provider !== OPENAI_API_PROVIDER ||
+		account.kind !== "api-key" ||
+		!(accountModels.get(account.key) ?? []).some((model) => model.id === DECISIONS_MODEL_ID)
+	)
+		return undefined;
+	const known = lookupClassifier?.(DECISIONS_CATALOG_PROVIDER, DECISIONS_MODEL_ID);
+	if (known?.api !== DECISIONS_API) return undefined;
+	return [{ ...known, provider: providerId, baseUrl: BROKER_PLACEHOLDER_URL }];
 }
 
 function toPiModel(providerId: string, family: string, model: BrokerModel, lookup: CatalogLookup): Model<Api> {

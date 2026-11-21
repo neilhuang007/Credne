@@ -24,7 +24,7 @@ Credne finds the executable through `PI_ACCOUNTS_BROKER`, its package `bin` dire
 | `--home` | `$PI_CODING_AGENT_DIR/accounts` or `~/.pi/agent/accounts` | Shared accounts home |
 | `--idle-timeout` | `30m` | Exit after inactivity; `0` disables idle exit |
 | `--max-concurrency-per-account` | `0` | In-flight inference limit per account; `0` is unlimited |
-| `--anthropic-base-url` | `https://api.anthropic.com` | Anthropic API-key/API-credit endpoint |
+| `--anthropic-base-url` | `https://api.anthropic.com` | Anthropic API-key endpoint |
 | `--openai-base-url` | `https://api.openai.com` | OpenAI API-key endpoint |
 | `--debug` | off | Log daemon lifecycle metadata; never provider bodies or credentials |
 | `--version` | | Print broker version |
@@ -46,20 +46,19 @@ Before upgrading an already running legacy broker, stop it explicitly. Health id
 | Public provider | Kind | Authentication |
 | --- | --- | --- |
 | `codex` | `oauth` | ChatGPT browser login through pi-ai |
-| `claude` | `oauth` | Legacy broker login through pi-ai |
+| `claude` | `oauth` | Claude subscription login through OMP |
 | `claude-api` | `api-key` | Anthropic API key |
-| `claude-api` | `api-credits` | Claude Console profile through ant |
 | `openai-api` | `api-key` | OpenAI API key |
 
-Existing local Claude subscriptions remain Node-owned. The daemon does not import or refresh their files. Legacy Claude broker login remains callable.
+To move from a local `claude-sub:` account, sign in again with `/accounts add claude-subscription` and select the new account in `/model`. Credne leaves the old local credentials on disk. Console credit profiles are not OMP credentials; use an Anthropic API key for API billing.
 
 Each account has its own pi-ai SQLite auth store and gateway router inside the shared daemon. Each store contains only that account. Pinned routes cannot select siblings, including inside pi-ai authentication retries.
 
 `acct:<id>` addresses `a.<base64url id>`. A missing, disabled, cooling, or rejected pinned account fails without fallback.
 
-`pool:all` addresses `p.all`. Family pools are `p.claude`, `p.codex`, and `p.openai`. Pools use only enabled accounts that list the model. Claude keys, credits, and broker subscriptions share a family. OpenAI API billing and ChatGPT subscriptions remain separate families.
+`pool:all` addresses `p.all`. Family pools are `p.claude`, `p.codex`, and `p.openai`. Pools use only enabled accounts that list the model. Claude keys and subscriptions share a family. OpenAI API billing and ChatGPT subscriptions remain separate families.
 
-Pools use round-robin selection by default. `X-Session-Affinity`, `Session-Id`, or `X-Session-Id` retains the previous usable account. Pools can select another eligible account on a pre-emission failure. Rate limits, insufficient credits, and temporary unavailability create cooldowns. `X-Credne-Account` identifies the selected account with its base64url key.
+For a Claude model, `p.claude` and `p.all` prefer an available subscription over an API key, even if a key served the previous turn. The broker uses the configured strategy and session affinity within each group. A pool can fall back to a paid API key; pin a subscription to rule out that charge. The default strategy is round-robin. The broker recognizes `X-Session-Affinity`, `Session-Id`, and `X-Session-Id`. Pools can select another eligible account on a pre-emission failure. Rate limits, insufficient credits, and temporary unavailability create cooldowns. `X-Credne-Account` identifies the selected account with its base64url key.
 
 On pool account changes, signed Anthropic thinking and encrypted OpenAI reasoning become bounded, labeled summaries. Redacted reasoning is removed. Visible text, tool calls, and results remain. A thinking-signature rejection receives one rewritten retry. Anthropic thinking is disabled for an in-flight tool-result turn if its required thinking block was removed.
 
@@ -70,10 +69,6 @@ Requests use pi-ai's gateway and providers. A transport bridge restores native h
 API keys are validated through the provider model endpoint before storage. Duplicate names and keys return 409. Final duplicate checks and writes are serialized.
 
 Subscription login supports browser redirects, manual callback submission, status, and cancellation. Callbacks must match the pending redirect destination and state. Signing in to an existing identity renews its credential but reports that no account was added. Its disabled setting remains.
-
-API-credit login uses ant 2.9.0. `CREDNE_ANT` selects a local binary without downloading. Otherwise the broker checks the downloaded archive against compiled-in SHA-256 pins before extracting the executable. Releases cover Linux x86/x64/ARM, macOS x64/ARM64, and Windows x86/x64/ARM64.
-
-ant runs with `ANTHROPIC_CONFIG_DIR=<home>/ant` and blank inherited API-key/token variables. Profile operations are serialized because refresh tokens rotate. Cached tokens refresh three minutes before expiry. Taken names are refused before login. Duplicate Console organizations are refused after login; only the new profile is logged out. Deletion logs out its Console profile.
 
 ### Read-only user configuration
 
@@ -112,17 +107,21 @@ Read URL, token, and PID from `<home>/broker.json`. Supply `Authorization: Beare
 | `POST /accounts/{key}/reset` | Clear cooldown |
 | `DELETE /accounts/{key}` | Remove account and credential |
 | `POST /api-keys` `{provider,name,key}` | Validate/add key; provider is `claude`, `anthropic`, or `openai` |
-| `POST /logins` `{provider,name?}` | Start `codex`, `claude`, or `claude-api-credits` login |
+| `POST /logins` `{provider}` | Start `codex` or `claude` login. If OMP returns `riskWarning` instead of a browser URL, display it and wait for the user's decision. |
+| `POST /logins/{state}/acknowledge` `{"answer":"yes"}` | Continue only after the user accepts the displayed warning. If they decline, cancel with `DELETE /logins/{state}`. |
 | `GET /logins/{state}` | `wait`, `ok`, or `error`; optional account/error |
 | `POST /logins/{state}/callback` `{redirectUrl}` | Submit complete browser redirect |
 | `DELETE /logins/{state}` | Cancel login |
 | `POST /route/{target}/v1/messages` | Anthropic Messages |
 | `POST /route/{target}/responses` | OpenAI Responses |
 | `POST /route/{target}/chat/completions` | Chat Completions |
+| `POST /route/{target}/decisions` | OpenAI Decisions, for a pinned OpenAI API key or `p.openai` only |
+
+Decisions requests use the selected account’s OpenAI API key from OMP. The broker forwards the request body unchanged to `/v1/decisions` and passes the status, body, content type, request ID, and retry hint back to the client. Subscription accounts cannot serve this endpoint. A failed classification does not put the account on cooldown for chat.
 
 Inference supports streaming and non-streaming. Errors use the request protocol envelope and retain provider status and `Retry-After`, without raw upstream bodies.
 
-Live usage calls only Anthropic OAuth usage or ChatGPT WHAM usage. Redirects are refused, requests time out after ten seconds, and bodies are capped at 256 KiB. Only allowlisted quota windows and credits are returned. Missing values remain missing. Keys and API credits return an explicit unsupported reason. Session token cost is not subscription billing.
+Live usage calls only Anthropic OAuth usage or ChatGPT WHAM usage. Redirects are refused, requests time out after ten seconds, and bodies are capped at 256 KiB. Only allowlisted quota windows and credits are returned. Missing values remain missing. API keys return an explicit unsupported reason. Session token cost is not subscription billing.
 
 ## Storage and security
 
@@ -130,15 +129,14 @@ Live usage calls only Anthropic OAuth usage or ChatGPT WHAM usage. Redirects are
 | --- | --- |
 | `broker.json` | Per-run discovery and token |
 | `broker.lock.d`, `broker.owner.json` | Singleton lock and owner |
-| `api-accounts.json` | Managed metadata; legacy key records import without changing IDs |
+| `omp-accounts.json` | OMP broker account metadata; provider secrets are stored separately |
+| `api-accounts.json` | Legacy Go broker metadata and API keys; kept for rollback |
 | `credentials/<base64url id>.db` | pi-ai credentials and refresh state |
-| `auths/` | Existing subscription files; Codex imports, local Claude stays Node-owned |
+| `auths/` | Subscription files from the legacy Go broker |
 | `config.yaml` | User configuration |
-| `ant/` | Isolated Console profiles |
-| `bin/ant[.exe]` | Verified ant installation unless overridden |
 | `broker.log` | Lifecycle output captured by launcher |
 
-Storage directories and credentials are owner-only. Existing Codex and managed API-account IDs remain stable. Migration retains source credential files. Explicit deletion removes the account's legacy source when applicable.
+Storage directories and credentials are owner-only. Existing Codex and managed API-account IDs remain stable. During the initial migration, the broker imports legacy managed API keys and Claude and Codex subscription files without replacing the Go broker's records. It leaves former Console credit profiles on disk, but does not list or route those accounts.
 
 The gate rejects foreign Host and Origin values. Only broker routes and validated pending OAuth callbacks are exposed. Caller authorization, keys, and cookies are stripped before dispatch. The selected account supplies its credential. Provider errors and logs do not expose credential bodies through IPC.
 
@@ -146,7 +144,7 @@ The trust boundary is the OS user. Shell tools and other applications under that
 
 ## Tests and upgrades
 
-`bun test test` uses isolated homes and local fake upstreams with the real pi-ai gateway/provider stack. Tests cover pinning, pools, reasoning, hosted search, gate security, duplicate adds, OAuth callbacks, ant, usage, and separate-process singleton/crash recovery.
+`bun test test` uses isolated homes and local fake upstreams with the real pi-ai gateway/provider stack. Tests cover pinning, pools, reasoning, hosted search, gate security, duplicate adds, OAuth callbacks, usage, and separate-process singleton/crash recovery.
 
 Node-side account tests remain in `packages/coding-agent/test`. Set `PI_ACCOUNTS_BROKER` to the compiled executable for broker end-to-end tests.
 

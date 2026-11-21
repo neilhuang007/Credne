@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { DEFAULT_RADIUS_GATEWAY } from "@earendil-works/pi-ai/providers/radius-config";
 import { type Container, type EditorComponent, hyperlink, type TUI } from "@earendil-works/pi-tui";
 import { getAuthCredential } from "../../cli/auth-command.ts";
-import { getShareViewerUrl } from "../../config.ts";
+import { getShareViewerUrl, USES_BROKER_AUTH } from "../../config.ts";
 import type { AgentSession } from "../../core/agent-session.ts";
 import { exportSessionToJsonl } from "../../core/session-export.ts";
 import { BorderedLoader } from "./components/bordered-loader.ts";
@@ -70,7 +70,11 @@ export async function shareSession(context: SessionShareContext): Promise<void> 
 		if (destination !== "gist") {
 			if (await tryShareViaRadius(jsonlFile, context)) return;
 			if (destination === "radius") {
-				context.showError("Radius authentication is not configured. Run '/login radius' first.");
+				context.showError(
+					USES_BROKER_AUTH
+						? "Radius sharing is not supported by the account broker. Set sessionShareDestination to gist or use /export."
+						: "Radius authentication is not configured. Run '/login radius' first.",
+				);
 				return;
 			}
 		}

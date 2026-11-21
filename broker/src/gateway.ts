@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type Api, type FetchImpl, type Model, resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai";
 import { type AuthGatewayRouter, createAuthGatewayRouter } from "@oh-my-pi/pi-ai/auth-gateway/server";
+import { wrapFetchForCch } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { setTransports } from "@oh-my-pi/pi-utils/logger";
 import { type Account, type Accounts, accountKey, boundedText, HttpError } from "./accounts.ts";
+import { Decisions } from "./decisions.ts";
 import { hasReasoningError, rewriteReasoning } from "./reasoning.ts";
 import { array, object, text, type WireObject } from "./wire.ts";
 
@@ -117,9 +119,7 @@ function* cacheBlocks(body: WireObject): Generator<WireObject> {
 	for (const message of array(body.messages)) for (const block of array(object(message).content)) yield object(block);
 }
 
-function restoreCacheControls(body: WireObject, source: WireObject): void {
-	const markers = [...cacheBlocks(source)].filter((block) => block.cache_control !== undefined);
-	if (markers.length === 0) return;
+function restoreCacheControls(body: WireObject, markers: WireObject[]): void {
 	const blocks = [...cacheBlocks(body)];
 	let start = 0;
 	const selected: WireObject[] = [];
@@ -148,7 +148,35 @@ function restoreCacheControls(body: WireObject, source: WireObject): void {
 	for (let index = 0; index < markers.length; index++) selected[index].cache_control = markers[index].cache_control;
 }
 
+async function providerBody(request: Request, attempt: Attempt): Promise<BodyInit> {
+	const { account, body: source, protocol } = attempt;
+	const anthropic = protocol === "anthropic" && account.provider === "anthropic";
+	if (anthropic && account.record.kind === "api-key") {
+		// Preserve native Anthropic fields and explicit cache boundaries for API keys.
+		return JSON.stringify({ ...source, stream: true });
+	}
+	const markers = anthropic ? [...cacheBlocks(source)].filter((block) => block.cache_control !== undefined) : [];
+	// Keep OMP's exact bytes (including its billing attestation and compression) unless a native field needs restoring.
+	if (!attempt.hosted && !markers.length) return request.arrayBuffer();
+	const raw = await request.arrayBuffer();
+	const bytes = request.headers.get("content-encoding") === "gzip" ? Bun.gunzipSync(new Uint8Array(raw)) : raw;
+	const body = object(JSON.parse(new TextDecoder().decode(bytes)));
+	if (attempt.hosted) {
+		for (const field of ["tools", "tool_choice", "include"])
+			if (source[field] !== undefined) body[field] = source[field];
+	}
+	if (markers.length) restoreCacheControls(body, markers);
+	// OMP signed the body before this transport seam; a rewritten body must be signed again.
+	if (anthropic) {
+		const billing = object(array(body.system)[0]);
+		if (text(billing.text)?.startsWith("x-anthropic-billing-header:"))
+			billing.text = String(billing.text).replace(/\bcch=[0-9a-f]{5}\b/, "cch=00000");
+	}
+	return JSON.stringify(body);
+}
+
 export class Gateway {
+	private readonly decisions: Decisions;
 	private readonly routers = new Map<string, { account: Account; router: AuthGatewayRouter }>();
 	private readonly sessions = new Map<string, string>();
 	private readonly inFlight = new Map<string, number>();
@@ -157,11 +185,14 @@ export class Gateway {
 	constructor(
 		private readonly accounts: Accounts,
 		private readonly maxConcurrency: number,
-	) {}
+	) {
+		this.decisions = new Decisions(accounts, (account, signal) => this.acquire(account, signal));
+	}
 	private router(account: Account): AuthGatewayRouter {
 		const cached = this.routers.get(account.record.id);
 		if (cached?.account === account) return cached.router;
 		cached?.router.close();
+		const attest: FetchImpl = wrapFetchForCch((input, init) => fetch(input, init));
 		const transport: FetchImpl = async (input, init) => {
 			const attempt = context.getStore();
 			if (!attempt || attempt.account !== account) throw new Error("Missing account request context.");
@@ -171,57 +202,38 @@ export class Gateway {
 				for (const name of ["cookie", "cookie2", "proxy-authorization", "x-api-key", "authorization"])
 					headers.delete(name);
 				let credential = await this.accounts.credential(account, attempt.signal);
-				if (account.record.kind === "api-credits") {
-					headers.set("anthropic-beta", "oauth-2025-04-20");
-					for (const name of ["x-app", "anthropic-dangerous-direct-browser-access"]) headers.delete(name);
+				const body = await providerBody(request, attempt);
+				if (typeof body === "string") {
+					headers.delete("content-encoding");
+					headers.delete("content-length");
 				}
-				let body = object(await request.json());
-				// The gateway drops hosted tool definitions. Restore only native tool fields at its transport seam;
-				// provider authentication, account refresh, cancellation and response parsing remain pi-ai's.
-				if (attempt.hosted) {
-					for (const field of ["tools", "tool_choice", "include"])
-						if (attempt.body[field] !== undefined) body[field] = attempt.body[field];
-				}
-				if (
-					attempt.protocol === "anthropic" &&
-					account.provider === "anthropic" &&
-					account.record.kind !== "oauth"
-				) {
-					// Native API accounts need no OAuth request shaping. Retain explicit cache boundaries
-					// and provider fields that the gateway's common context cannot represent.
-					body = { ...attempt.body, stream: true };
-				} else if (attempt.protocol === "anthropic" && account.provider === "anthropic")
-					restoreCacheControls(body, attempt.body);
-				const serialized = JSON.stringify(body);
+				const send = account.provider === "anthropic" && account.record.kind === "oauth" ? attest : fetch;
 				let response: Response;
 				for (let authAttempt = 0; ; authAttempt++) {
 					if (account.provider === "anthropic" && account.record.kind === "api-key")
 						headers.set("x-api-key", credential.token);
 					else headers.set("authorization", `Bearer ${credential.token}`);
-					if (credential.accountId) headers.set("chatgpt-account-id", credential.accountId);
-					response = await fetch(request.url, {
+					if (account.provider === "openai-codex" && credential.accountId)
+						headers.set("chatgpt-account-id", credential.accountId);
+					response = await send(request.url, {
+						...init,
 						method: request.method,
 						headers,
-						body: serialized,
+						body,
 						signal: request.signal,
 						redirect: "error",
 					});
 					if (response.status !== 401 || authAttempt > 0 || account.record.kind === "api-key") break;
-					await response.body?.cancel();
 					try {
-						if (account.record.kind === "api-credits") {
-							this.accounts.ant.forget(account.record.profile!);
-							credential = await this.accounts.credential(account, attempt.signal);
-						} else {
-							const refreshed = await account.storage.oauth.access(account.provider, undefined, {
-								signal: attempt.signal,
-								forceRefresh: true,
-								refreshReason: "auth-recovery",
-								rejectedAccessToken: credential.token,
-							});
-							if (!refreshed) break;
-							credential = { token: refreshed.accessToken, accountId: refreshed.accountId };
-						}
+						const refreshed = await account.storage.oauth.access(account.provider, undefined, {
+							signal: attempt.signal,
+							forceRefresh: true,
+							refreshReason: "auth-recovery",
+							rejectedAccessToken: credential.token,
+						});
+						if (!refreshed) break;
+						await response.body?.cancel();
+						credential = { token: refreshed.accessToken, accountId: refreshed.accountId };
 					} catch {
 						// Failed recovery must report the original rejection, not a different account.
 						break;
@@ -232,8 +244,6 @@ export class Gateway {
 				if (!response.ok) {
 					const detail = await boundedText(response, 256 * 1024);
 					attempt.reasoningRejected = hasReasoningError(response.status, detail);
-					if (response.status === 401 && account.record.kind === "api-credits")
-						this.accounts.ant.forget(account.record.profile!);
 					if (response.status === 400 && /credit balance.*too low|insufficient.*credit/i.test(detail)) {
 						attempt.status = 402;
 						attempt.retryAfter = "3600";
@@ -305,7 +315,31 @@ export class Gateway {
 			for (const wake of this.queues.get(id) ?? []) wake();
 		};
 	}
+	private orderPool(candidates: Account[], pool: string, previous?: string): Account[] {
+		const enabled = candidates.filter((account) => !account.record.disabled);
+		const index = enabled.length && this.accounts.routing.strategy !== "fill-first" ? this.cursor++ : 0;
+		const order = (accounts: Account[]): Account[] => {
+			if (accounts.length < 2) return accounts;
+			const start = index % accounts.length;
+			const ordered = start ? [...accounts.slice(start), ...accounts.slice(0, start)] : accounts;
+			if (previous && this.accounts.routing.affinity)
+				ordered.sort((a, b) => Number(b.record.id === previous) - Number(a.record.id === previous));
+			return ordered;
+		};
+		if (pool !== "claude" && pool !== "all") return order(enabled);
+
+		// Affinity may pick a sibling with a warm cache, but must not keep billing an API key
+		// once a Claude subscription can serve the model again. Cooldown and retry still apply.
+		const subscriptions: Account[] = [];
+		const remaining: Account[] = [];
+		for (const account of enabled) {
+			const group = account.family === "claude" && account.record.kind === "oauth" ? subscriptions : remaining;
+			group.push(account);
+		}
+		return [...order(subscriptions), ...order(remaining)];
+	}
 	async execute(request: Request, target: string, path: string): Promise<Response> {
+		if (path === "/decisions") return this.decisions.execute(request, target);
 		const protocol: Protocol = path === "/v1/messages" ? "anthropic" : path === "/responses" ? "responses" : "chat";
 		let body: WireObject;
 		try {
@@ -328,15 +362,7 @@ export class Gateway {
 			.find(Boolean);
 		const sessionKey = session ? `${target}\0${session}` : undefined;
 		const previous = sessionKey ? this.sessions.get(sessionKey) : undefined;
-		if (!pin) {
-			candidates = candidates.filter((account) => !account.record.disabled);
-			if (candidates.length && this.accounts.routing.strategy !== "fill-first") {
-				const index = this.cursor++ % candidates.length;
-				candidates = [...candidates.slice(index), ...candidates.slice(0, index)];
-			}
-			if (previous && this.accounts.routing.affinity)
-				candidates.sort((a, b) => Number(b.record.id === previous) - Number(a.record.id === previous));
-		}
+		if (!pin) candidates = this.orderPool(candidates, pool, previous);
 		if (!candidates.length)
 			return protocolError(
 				404,
@@ -381,8 +407,6 @@ export class Gateway {
 					])
 						headers.delete(name);
 					if (session) headers.set("x-prompt-cache-key", session);
-					if (account.record.kind === "api-credits")
-						account.storage.keys.setRuntime(account.provider, `credne-ant-${key}`);
 					const credential = account.storage.credentials.get(account.provider);
 					if (credential?.type === "oauth") {
 						const identity = resolveCredentialIdentityKey(account.provider, credential);

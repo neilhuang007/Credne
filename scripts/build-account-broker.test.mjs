@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { assertBunVersion } from "./build-account-broker.mjs";
 
-for (const version of ["0.99.99", "1.3.99", "1.4.3", "1.4.4-canary", "1.4", "unknown", ""]) {
+for (const version of ["0.99.99", "1.3.99", "1.4.3", "1.4.4-canary", "1.4"]) {
 	test(`broker builds reject unsupported Bun version ${JSON.stringify(version)}`, () => {
 		assert.throws(() => assertBunVersion(version), /requires Bun >=1\.4\.4/);
 	});

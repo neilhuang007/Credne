@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
-import { getAgentDir } from "../config.ts";
+import { getAgentDir, USES_BROKER_AUTH } from "../config.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { getFileRevision, normalizePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
@@ -499,6 +499,7 @@ export function readStoredCredential(
 	providerId: string,
 	authPath: string = join(getAgentDir(), "auth.json"),
 ): Credential | undefined {
+	if (USES_BROKER_AUTH) return undefined;
 	try {
 		const data = JSON.parse(stripBom(readFileSync(normalizePath(authPath), "utf-8"))) as AuthStorageData;
 		return data[providerId];

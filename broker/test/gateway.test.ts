@@ -107,3 +107,136 @@ for (const kind of ["api-key", "oauth"] as const) {
 		}
 	}, 10000);
 }
+
+test("Claude pools favor subscriptions over API keys even after an API key served the session", async () => {
+	const home = await mkdtemp(join(tmpdir(), "credne-claude-pool-"));
+	const model = "claude-test";
+	const limited = new Set<string>();
+	const calls: string[] = [];
+	const upstream = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			await request.arrayBuffer();
+			const token = request.headers.get("x-api-key") ?? request.headers.get("authorization")?.slice(7) ?? "";
+			calls.push(token);
+			if (limited.has(token))
+				return Response.json(
+					{ error: { message: "Rate limited" } },
+					{
+						status: 429,
+						headers: { "retry-after": "60" },
+					},
+				);
+			const events = [
+				{
+					type: "message_start",
+					message: {
+						id: "reply",
+						type: "message",
+						role: "assistant",
+						model,
+						content: [],
+						usage: { input_tokens: 4, output_tokens: 0 },
+					},
+				},
+				{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+				{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Done." } },
+				{ type: "content_block_stop", index: 0 },
+				{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
+				{ type: "message_stop" },
+			];
+			return new Response(
+				events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
+				{
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		},
+	});
+	const accounts = new Accounts({ home, anthropicBaseUrl: upstream.url.origin, openaiBaseUrl: upstream.url.origin });
+	const gateway = new Gateway(accounts, 0);
+	const apiKeys = ["key-one", "key-two"];
+	const subscriptions = ["sk-ant-oat01-one", "sk-ant-oat01-two"];
+	const send = async (target: string, session?: string, id = model) => {
+		calls.length = 0;
+		const headers = new Headers({ "content-type": "application/json" });
+		if (session) headers.set("x-session-affinity", session);
+		const response = await gateway.execute(
+			new Request("http://gateway-test", {
+				method: "POST",
+				headers,
+				body: JSON.stringify({
+					model: id,
+					max_tokens: 32,
+					stream: false,
+					messages: [{ role: "user", content: "Hello." }],
+				}),
+			}),
+			target,
+			"/v1/messages",
+		);
+		expect(response.status).toBe(200);
+		expect(await response.text()).toContain("Done.");
+		expect(response.headers.get("x-credne-account")).toBe(accountKey(calls.at(-1)!));
+		return [...calls];
+	};
+	try {
+		await accounts.load();
+		for (const key of apiKeys) {
+			await accounts.register(
+				{
+					id: key,
+					name: key,
+					provider: "claude-api",
+					kind: "api-key",
+					models: [model, "claude-key-only"],
+					createdAt: "",
+				},
+				{ type: "api_key", key, source: "login" },
+			);
+		}
+		for (const access of subscriptions) {
+			await accounts.register(
+				{ id: access, name: access, provider: "claude", kind: "oauth", models: [model], createdAt: "" },
+				{
+					type: "oauth",
+					access,
+					refresh: "fixture-refresh",
+					email: `${access}@test.invalid`,
+					expires: Date.now() + 3600000,
+				},
+			);
+		}
+		for (const pool of ["p.claude", "p.all"]) {
+			accounts.routing.strategy = "fill-first";
+			const [affine] = await send(pool, "thread");
+			expect(affine).toBe(subscriptions[0]);
+			expect(await send(pool, undefined, "claude-key-only")).toEqual([apiKeys[0]]);
+			expect(await send(`a.${accountKey(apiKeys[0])}`, "thread")).toEqual([apiKeys[0]]);
+			accounts.routing.strategy = "round-robin";
+			const rotated = [...(await send(pool)), ...(await send(pool))];
+			expect(rotated.sort()).toEqual([...subscriptions].sort());
+			expect(await send(pool, "thread")).toEqual([affine]);
+			limited.add(affine);
+			expect(await send(pool, "thread")).toEqual(subscriptions);
+			limited.add(subscriptions[1]);
+			const fallback = await send(pool, "thread");
+			expect(fallback).toHaveLength(2);
+			expect(fallback[0]).toBe(subscriptions[1]);
+			const paid = fallback[1];
+			expect(apiKeys).toContain(paid);
+			expect(await send(pool, "thread")).toEqual([paid]);
+			limited.delete(affine);
+			await accounts.mutate(accounts.accounts.get(affine)!, "reset");
+			expect(await send(pool, "thread")).toEqual([affine]);
+			limited.clear();
+			await accounts.mutate(accounts.accounts.get(subscriptions[1])!, "reset");
+		}
+	} finally {
+		gateway.close();
+		accounts.close();
+		await upstream.stop(true);
+		await rm(home, { recursive: true, force: true });
+	}
+}, 10000);

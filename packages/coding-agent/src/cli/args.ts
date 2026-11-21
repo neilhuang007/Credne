@@ -4,7 +4,7 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
-import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
+import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR, USES_BROKER_AUTH } from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 import { getToolListError, type TuiMode } from "../core/settings-manager.ts";
 
@@ -292,15 +292,18 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} uninstall <source> [-l]   Alias for remove
   ${APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
   ${APP_NAME} list                      List installed extensions from settings
-  ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
-  ${APP_NAME} auth <command>            Log in or out, print credentials, or check provider readiness
+  ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)${
+		USES_BROKER_AUTH
+			? ""
+			: `
+  ${APP_NAME} auth <command>            Log in or out, print credentials, or check provider readiness`
+  }
   ${APP_NAME} mcp <command>             Manage MCP servers
-  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth/mcp
+  ${APP_NAME} <command> --help          Show command help${USES_BROKER_AUTH ? "\n  /accounts (interactive)      Manage provider credentials" : ""}
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider to search for --model (requires --model)
-  --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
-  --api-key <key>                API key (defaults to env vars)
+  --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")${USES_BROKER_AUTH ? "" : "\n  --api-key <key>                API key (defaults to env vars)"}
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
@@ -347,13 +350,17 @@ ${chalk.bold("Options:")}
 
 Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
 
-${chalk.bold("Examples:")}
+${chalk.bold("Examples:")}${
+	USES_BROKER_AUTH
+		? ""
+		: `
   # Print a provider API key for an external client
   ${APP_NAME} auth print-api-key --provider openai
 
   # Print an OAuth bearer token for an external client (refreshes if expired)
   ${APP_NAME} auth print-bearer-token --provider openai-codex
-
+`
+}
   # Interactive mode
   ${APP_NAME}
 
@@ -415,7 +422,10 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} --export ~/${CONFIG_DIR_NAME}/agent/sessions/--path--/session.jsonl
   ${APP_NAME} --export session.jsonl output.html
 
-${chalk.bold("Environment Variables:")}
+${chalk.bold("Environment Variables:")}${
+	USES_BROKER_AUTH
+		? "\n  LLAMA_BASE_URL                   - URL of an unauthenticated loopback llama.cpp server"
+		: `
   ANTHROPIC_AUTH_TOKEN             - Anthropic bearer auth token
   ANTHROPIC_API_KEY                - Anthropic Claude API key
   ANTHROPIC_OAUTH_TOKEN            - Anthropic OAuth token (alternative to API key)
@@ -460,7 +470,8 @@ ${chalk.bold("Environment Variables:")}
   AWS_ACCESS_KEY_ID                - AWS access key for Amazon Bedrock
   AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock
   AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
-  AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
+  AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)`
+}
   ${ENV_AGENT_DIR.padEnd(32)} - Config directory (default: ~/${CONFIG_DIR_NAME}/agent)
   ${ENV_SESSION_DIR.padEnd(32)} - Session storage directory (overridden by --session-dir)
   PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
