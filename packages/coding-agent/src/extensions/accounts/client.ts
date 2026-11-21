@@ -11,9 +11,8 @@ export interface BrokerConnection {
 }
 
 /**
- * How an account authenticates. They are not interchangeable: `oauth` uses a subscription through
- * CLIProxyAPI's client emulation, `api-credits` uses a Claude Console organization (for example the
- * monthly API credits of Max, Ultra and Team plans) through `ant`, and `api-key` uses a provider API key.
+ * How an account authenticates. `oauth` uses oh-my-pi's subscription adapters, `api-credits` uses a
+ * Claude Console organization through `ant`, and `api-key` uses a provider API key.
  */
 export type BrokerAccountKind = "oauth" | "api-key" | "api-credits";
 
@@ -22,7 +21,7 @@ export interface BrokerAccount {
 	id: string;
 	/** base64url account id used in broker URLs. */
 	key: string;
-	/** CLIProxyAPI provider key: "claude", "claude-api", "codex", ... */
+	/** Broker provider key: "claude", "claude-api", "codex", ... */
 	provider: string;
 	kind: BrokerAccountKind;
 	source: string;
@@ -57,7 +56,7 @@ export type BrokerUsage =
 	| { status: "available"; windows: BrokerQuotaWindow[]; credits: BrokerCredit[] }
 	| { status: "unavailable" | "unsupported"; reason: string; windows: []; credits: [] };
 
-/** A model an account or pool can serve, as reported by CLIProxyAPI's registry. */
+/** A model an account or pool can serve, as reported by the broker. */
 export interface BrokerModel {
 	id: string;
 	displayName?: string;
@@ -147,7 +146,19 @@ export class BrokerClient {
 	async connectExisting(signal?: AbortSignal): Promise<BrokerConnection | undefined> {
 		if (this.connection && Date.now() - this.checkedAt < HEALTH_TTL_MS) return this.connection;
 		const discovered = this.readDiscovery();
-		if (!discovered || !(await this.healthy(discovered, signal))) return undefined;
+		if (!discovered) return undefined;
+		if (!(await this.healthy(discovered, signal))) {
+			// A stalled daemon still owns its credentials; only a dead process can be replaced.
+			try {
+				process.kill(discovered.pid, 0);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return undefined;
+				throw error;
+			}
+			throw new BrokerError(
+				`Account daemon PID ${discovered.pid} is still running but not responding. Stop it before starting another daemon.`,
+			);
+		}
 		this.remember(discovered);
 		return discovered;
 	}
@@ -226,7 +237,7 @@ export class BrokerClient {
 
 	/** Stop the broker for every harness process. The next request starts a new one. */
 	async shutdown(): Promise<void> {
-		const connection = await this.connectExisting();
+		const connection = this.readDiscovery();
 		if (!connection) return;
 		await fetchBroker(`${connection.url}/credne/v1/shutdown`, {
 			method: "POST",
@@ -271,7 +282,7 @@ export class BrokerClient {
 		const binary = this.locateBinary();
 		if (!binary) {
 			throw new BrokerError(
-				"Account broker not installed. Build broker/ with Go and place credne-broker on PATH, in the pi bin directory, or set PI_ACCOUNTS_BROKER.",
+				"Account broker not installed. Build broker/ with Bun and place credne-broker on PATH, in the pi bin directory, or set PI_ACCOUNTS_BROKER.",
 			);
 		}
 		const stale = this.readDiscovery();
@@ -337,11 +348,14 @@ export class BrokerClient {
 		const pid = field(data, "pid");
 		// Only a loopback URL may receive the broker token.
 		if (typeof url !== "string" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(url)) return undefined;
-		if (typeof token !== "string" || typeof pid !== "number") return undefined;
+		if (typeof token !== "string" || typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) {
+			return undefined;
+		}
 		return { url, token, pid };
 	}
 
 	private async healthy(connection: BrokerConnection, signal?: AbortSignal): Promise<boolean> {
+		let data: unknown;
 		try {
 			const response = await fetchBroker(`${connection.url}/credne/v1/health`, {
 				headers: { authorization: `Bearer ${connection.token}` },
@@ -349,11 +363,20 @@ export class BrokerClient {
 					? AbortSignal.any([signal, AbortSignal.timeout(HEALTH_TIMEOUT_MS)])
 					: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
 			});
-			await response.body?.cancel();
-			return response.ok;
+			if (!response.ok) {
+				await response.body?.cancel();
+				return false;
+			}
+			data = await response.json();
 		} catch {
 			return false;
 		}
+		if (field(data, "backend") !== "oh-my-pi") {
+			throw new BrokerError(
+				`A previous account broker is still running (PID ${connection.pid}). Stop it before using this version of Credne.`,
+			);
+		}
+		return true;
 	}
 
 	private remember(connection: BrokerConnection): void {

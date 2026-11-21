@@ -1,3 +1,12 @@
+# Unreleased
+
+- Replace the Go account broker with a Bun-compiled service built on `@oh-my-pi/pi-ai`. The Credne CLI stays on Node.js.
+- Source builds require Node.js 22.19 or newer and Bun 1.4.4 or newer. Installed packages include the broker runtime; users do not need Bun or Go.
+- Build packages on the target platform and architecture with `npm ci --ignore-scripts`, `npm run build`, and `node credne/scripts/build.mjs`.
+- Keep the packaged `bin/pi_natives.*.node` files beside `credne-broker`. The broker uses these native assets for locking and credential storage. SQLite and the provider catalog are included in the compiled runtime.
+
+The 0.1.3 installation instructions below refer to the existing release archive, which still contains the original Go broker.
+
 # Credne 0.1.3
 
 - After a provider error such as “no credits remaining,” switch to a funded account or top up the current one, then run `/continue`. Credne retries the pending turn with its original prompt and attachments.

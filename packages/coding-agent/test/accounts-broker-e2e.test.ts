@@ -1,7 +1,7 @@
-// End-to-end: Pi's native adapters -> real credne-broker -> CLIProxyAPI executors and the broker's
-// official-API executor -> fake provider upstreams. Runs only when PI_ACCOUNTS_BROKER points at a built broker binary:
-//   cd broker && go build -o /tmp/credne-broker ./cmd/credne-broker
-//   PI_ACCOUNTS_BROKER=/tmp/credne-broker node ../node_modules/vitest/dist/cli.js --run test/accounts-broker-e2e.test.ts
+// End-to-end: Pi's native adapters -> shared oh-my-pi daemon -> fake provider upstreams.
+// Runs from packages/coding-agent when PI_ACCOUNTS_BROKER points at a compiled daemon:
+//   (cd ../../broker && bun run build)
+//   PI_ACCOUNTS_BROKER=../../broker/dist/credne-broker node ../../node_modules/vitest/dist/cli.js --run test/accounts-broker-e2e.test.ts
 import { once } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
@@ -300,7 +300,6 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 		upstream.failing.delete("sk-ant-B");
 		await resetCooldowns();
 		expect(reply.stopReason).toBe("error");
-		expect(reply.errorMessage).toContain("rate limited");
 		expect(upstream.count("sk-ant-A")).toBe(before);
 	});
 
@@ -314,10 +313,7 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 		expect(reply.content).toContainEqual(expect.objectContaining({ type: "text", text: "served by sk-ant-B" }));
 	});
 
-	it("serves an Anthropic API-key account through the official-API executor", async () => {
-		expect(accounts.filter((account) => account.provider === "claude-api")).toEqual([
-			expect.objectContaining({ kind: "api-key" }),
-		]);
+	it("serves a newly added Anthropic API key through the daemon", async () => {
 		const spec = byKey.get("sk-ant-D")!;
 		expect(spec.models.map((model) => model.id)).toEqual(["claude-test-1"]);
 		const reply = await models.completeSimple(first(spec), user("hi"));

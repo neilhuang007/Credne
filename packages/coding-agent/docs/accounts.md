@@ -1,16 +1,20 @@
 # Multiple Accounts
 
-The built-in `accounts` extension connects several accounts per provider, for example two Claude subscriptions, a Claude API key and a ChatGPT subscription. Each session chooses which account it uses, and two terminals can use two different accounts at the same time. Claude Pro, Max and Team subscriptions are signed in and served by Credne itself: it keeps their tokens and sends their requests straight to Anthropic. Every other account (ChatGPT subscriptions, Claude API credits and API keys, OpenAI API keys) is held by a separate shared process, the account broker (`credne-broker`), which embeds [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). Pi keeps sessions, prompts, tools and the agent loop. The broker design is described in `broker/README.md` in the repository.
+The built-in `accounts` extension connects several accounts per provider, for example two Claude subscriptions, a Claude API key and a ChatGPT subscription. Each session chooses which account it uses, and two terminals can use two different accounts at the same time. Claude Pro, Max and Team subscriptions are signed in and served by Credne itself: it keeps their tokens and sends their requests straight to Anthropic. Every other account (ChatGPT subscriptions, Claude API credits and API keys, OpenAI API keys) uses one shared Bun daemon, `credne-broker`, backed by [oh-my-pi AI](https://github.com/can1357/oh-my-pi/tree/main/packages/ai). Pi keeps sessions, prompts, tools and the agent loop. The daemon design is described in `broker/README.md` in the repository.
 
 ## Setup
 
-Build the broker once and put it in Pi's bin directory or on `PATH`:
+Build the daemon with Bun 1.4.4 or newer and put it in Pi's bin directory or on `PATH`:
 
 ```bash
-cd broker && go build -o ~/.pi/agent/bin/credne-broker ./cmd/credne-broker
+npm --prefix broker run build
+mkdir -p ~/.pi/agent/bin
+cp broker/dist/* ~/.pi/agent/bin/
 ```
 
-Pi starts the broker on demand, and every Pi process shares it. The broker stops after 30 minutes without requests and starts again on the next one. Set `PI_ACCOUNTS_BROKER` to use a binary elsewhere. A setup with only Claude subscriptions never starts the broker.
+Pi discovers the daemon through `broker.json` in the accounts directory. If none is running, Pi starts it detached. Concurrent starts share one daemon, and it outlives the Pi process that started it. The daemon stops after 30 minutes without requests and starts again on the next one. Set `PI_ACCOUNTS_BROKER` to use a binary elsewhere. Installed Credne distributions include the executable and do not need Bun installed. A setup with only Claude subscriptions never starts the daemon.
+
+Stop a previous-version broker before starting this version. Credne reports its process ID instead of reusing the previous backend or starting a second daemon beside it.
 
 With no accounts configured, the extension registers no providers. Open `/accounts` to add one, or run `/accounts add`.
 
@@ -165,10 +169,10 @@ This applies in two places. Switching a session between accounts, and moving a c
 
 ## Configuration file
 
-Accounts defined in `~/.pi/agent/accounts/config.yaml`, using the CLIProxyAPI v8 `api-keys` layout, appear in the list as API-key accounts. The extension cannot disable, enable or remove them, because the file is their source of truth. Edit the file and choose `Restart broker` in `/accounts` to apply changes. The broker reads the file only at startup. Routing options such as the account selection strategy can also be set there.
+Accounts defined in `~/.pi/agent/accounts/config.yaml`, under `api-keys`, appear in the list as API-key accounts. The extension cannot disable, enable or remove them, because the file is their source of truth. Edit the file and choose `Restart broker` in `/accounts` to apply changes. The daemon reads the file only at startup. See `broker/README.md` for the configuration format and supported routing options.
 
 ## Security
 
-Credentials stay in `~/.pi/agent/accounts`: Claude subscription logins in `claude-subscriptions.json`, ChatGPT subscription logins in `auths`, Anthropic and OpenAI API keys in `api-accounts.json`, and Claude Console sign-in state in `ant`. They are readable only by your user. The broker process holds its credentials in memory while it runs; Credne holds the Claude subscription tokens in memory only as long as a request needs them. For the broker, Pi holds only a per-run token for the loopback connection, which stops working when the broker restarts.
+Credentials stay beneath `~/.pi/agent/accounts`. Local Claude subscription logins remain in `claude-subscriptions.json`; the daemon stores its account credentials separately, and Claude Console sign-in state stays in `ant`. See `broker/README.md` for the daemon's storage layout. Credential files are readable only by your user. The daemon holds its credentials in memory while it runs; Credne holds local Claude subscription tokens only as long as a request needs them. For daemon requests, Pi holds only a per-run loopback token, which stops working when the daemon restarts.
 
 Pi's `read`, `edit` and `write` tools cannot access the accounts directory. Shell commands run as your user and can read it, as they can read [`auth.json`](configuration.md#agent-directory). Treat the accounts directory the same way you treat `auth.json`.

@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -20,6 +20,8 @@ import {
 	readCatalog,
 	writeCatalog,
 } from "../src/extensions/accounts/catalog.ts";
+import { importBrokerClaudeAccounts } from "../src/extensions/accounts/claude-import.ts";
+import { LocalClaudeStore } from "../src/extensions/accounts/claude-store.ts";
 import { type BrokerAccount, BrokerClient, type BrokerModel } from "../src/extensions/accounts/client.ts";
 import accountsExtension from "../src/extensions/accounts/index.ts";
 import { type BrokerProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
@@ -254,7 +256,7 @@ async function startFakeBroker(
 			response.writeHead(200, { "Content-Type": "application/json" });
 			response.end(JSON.stringify(value));
 		};
-		if (path === "/credne/v1/health") return json({ ok: true });
+		if (path === "/credne/v1/health") return json({ ok: true, backend: "oh-my-pi" });
 		if (path === "/credne/v1/accounts") return json({ accounts: [claudeA, claudeB, codexC, { id: 7 }] });
 		if (path.endsWith("/models")) return json({ models: [claudeModel, { name: "no id" }] });
 		const target = /^\/credne\/v1\/route\/a\.([^/]+)\//.exec(path)?.[1];
@@ -571,6 +573,61 @@ describe("broker client", () => {
 
 	it("reports a missing broker binary instead of hanging", async () => {
 		await expect(clientFor(tempDir()).listAccounts()).rejects.toThrow("Account broker not installed");
+	});
+});
+
+describe("daemon upgrade", () => {
+	it("refuses a previous backend without starting a second daemon", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) => (request.path === "/credne/v1/health" ? { status: 200, body: { ok: true } } : undefined),
+		});
+		const locateBinary = vi.fn(() => undefined);
+		const client = new BrokerClient({ home: broker.home, locateBinary });
+		await expect(client.connect()).rejects.toThrow("previous account broker");
+		expect(locateBinary).not.toHaveBeenCalled();
+		expect(broker.requests.map((request) => request.path)).toEqual(["/credne/v1/health"]);
+	});
+
+	it("does not start a second core while the existing daemon is unresponsive", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path === "/credne/v1/health" ? { status: 503, body: { error: "busy" } } : undefined,
+		});
+		const locateBinary = vi.fn(() => undefined);
+		await expect(new BrokerClient({ home: broker.home, locateBinary }).connect()).rejects.toThrow(
+			"still running but not responding",
+		);
+		expect(locateBinary).not.toHaveBeenCalled();
+		expect(broker.requests.map((request) => request.path)).toEqual(["/credne/v1/health"]);
+	});
+
+	it("does not copy rotating Claude credentials while a previous daemon owns them", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) => (request.path === "/credne/v1/health" ? { status: 200, body: { ok: true } } : undefined),
+		});
+		const path = join(broker.home, "auths", "claude-work.json");
+		mkdirSync(join(broker.home, "auths"));
+		writeFileSync(
+			path,
+			JSON.stringify({ type: "claude", access_token: "fake-access", refresh_token: "fake-refresh" }),
+		);
+		const store = new LocalClaudeStore(broker.home);
+		await expect(importBrokerClaudeAccounts(store, clientFor(broker.home))).rejects.toThrow(
+			"previous account broker",
+		);
+		expect(store.list()).toEqual([]);
+		expect(existsSync(path)).toBe(true);
+	});
+
+	it("can stop a previous daemon without accepting its provider backend", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path === "/credne/v1/shutdown" ? { status: 200, body: { ok: true } } : undefined,
+		});
+		await clientFor(broker.home).shutdown();
+		expect(broker.requests.map((request) => [request.method, request.path])).toEqual([
+			["POST", "/credne/v1/shutdown"],
+		]);
 	});
 });
 

@@ -20,7 +20,8 @@ export async function importBrokerClaudeAccounts(store: LocalClaudeStore, client
 	const authsDir = join(store.home, authsDirName);
 	const files = claudeAuthFiles(authsDir);
 	if (files.length === 0) return 0;
-	const broker = await client.connectExisting().catch(() => undefined);
+	// An incompatible live daemon may still refresh these tokens; never treat it as stopped.
+	const broker = await client.connectExisting();
 	let handled = 0;
 	for (const file of files) {
 		const credential = readBrokerClaudeCredential(join(authsDir, file));

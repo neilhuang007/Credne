@@ -28,8 +28,8 @@ export function createAccountBrokerClient(): BrokerClient {
 /**
  * Multiple provider accounts. Claude subscriptions are served by this process: each is a Pi provider
  * `claude-sub:<id>` whose tokens are stored and refreshed locally and whose requests go straight to
- * api.anthropic.com. Every other account goes through the shared account broker (CLIProxyAPI embedded in
- * credne-broker) as a Pi provider `acct:<id>`; each family there gets a balanced `pool:<family>`. The pools
+ * api.anthropic.com. Every other account goes through the shared oh-my-pi account daemon
+ * as a Pi provider `acct:<id>`; each family there gets a balanced `pool:<family>`. The pools
  * `pool:claude` and `pool:all` are virtual models that use subscriptions first, then API accounts.
  * Sessions, prompts, tools and the agent loop stay in Pi.
  */

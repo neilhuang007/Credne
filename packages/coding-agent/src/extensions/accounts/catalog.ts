@@ -146,7 +146,7 @@ export function familyOf(provider: string): string {
 export function apiForFamily(family: string): Api {
 	if (family === "claude") return "anthropic-messages";
 	if (family === "codex" || family === "openai") return "openai-responses";
-	// Other providers go through CLIProxyAPI's Chat Completions translation.
+	// Other providers go through the daemon's Chat Completions gateway.
 	return "openai-completions";
 }
 
@@ -275,10 +275,10 @@ function toPiModel(providerId: string, family: string, model: BrokerModel, looku
 }
 
 /**
- * Compatibility flags for a broker route. Flags that depend on wire features CLIProxyAPI may
- * rewrite (Claude Code request emulation, Codex backend adaptation) are dropped; Pi then uses its
- * portable request shape. Anthropic message threads stay off: they are server-side continuation
- * state bound to one account. Session affinity headers let pools keep a conversation on one account.
+ * Compatibility flags for the daemon's protocol gateway. Pi sends a portable request shape; the
+ * daemon's provider adapters apply upstream-specific options. Anthropic message threads stay off:
+ * their server-side continuation state is bound to one account. Session affinity headers let pools
+ * keep a conversation on one account.
  */
 function brokerCompat(api: Api, known: Model<Api>["compat"]): Model<Api>["compat"] {
 	const source = (known ?? {}) as Record<string, unknown>;
