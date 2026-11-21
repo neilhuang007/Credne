@@ -36,14 +36,22 @@ import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
+import {
+	APP_NAME,
+	ENV_SESSION_DIR,
+	expandTildePath,
+	getAgentDir,
+	getPackageDir,
+	USES_BROKER_AUTH,
+	VERSION,
+} from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./core/agent-session-services.ts";
-import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
+import { BROKER_AUTH_GUIDANCE, formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
 import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
@@ -169,6 +177,14 @@ async function runAuthLogoutCommand(args: string[]): Promise<number> {
 }
 
 async function runAuthCommand(args: string[]): Promise<boolean> {
+	if (USES_BROKER_AUTH && args[0] === "auth") {
+		if (isAuthCommandHelp(args)) console.log(BROKER_AUTH_GUIDANCE);
+		else {
+			console.error(chalk.red(BROKER_AUTH_GUIDANCE));
+			process.exitCode = 1;
+		}
+		return true;
+	}
 	if (isAuthCommandHelp(args)) {
 		printAuthCommandHelp();
 		return true;
@@ -654,6 +670,11 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	const parsed = parseArgs(args);
+	if (USES_BROKER_AUTH && parsed.apiKey !== undefined) {
+		console.error(chalk.red(`--api-key is not supported. ${BROKER_AUTH_GUIDANCE}`));
+		process.exitCode = 1;
+		return;
+	}
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;

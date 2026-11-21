@@ -12,6 +12,12 @@ const dependencies = {
 	jiti: "2.7.0",
 	"quickjs-wasi": "3.6.2",
 };
+const brokerAssets = [
+	`bin/credne-broker${process.platform === "win32" ? ".exe" : ""}`,
+	"bin/pi-natives-LICENSE",
+	"bin/pi-natives-THIRD-PARTY-NOTICES.txt",
+	`bin/pi_natives.${process.platform}-${process.arch}${process.arch === "x64" ? "-baseline" : ""}.node`,
+];
 
 function write(path, contents = "fixture") {
 	mkdirSync(dirname(path), { recursive: true });
@@ -47,11 +53,11 @@ console.log(${JSON.stringify(installedVersionFails)} && !staged || ${JSON.string
 		"README.md": "fixture",
 		"CHANGELOG.md": "fixture",
 		"THIRD_PARTY_NOTICES.md": "fixture",
-		[`bin/credne-broker${process.platform === "win32" ? ".exe" : ""}`]: "fixture",
 		"node_modules/quickjs-wasi/quickjs.wasm": "fixture",
 		"node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm": "fixture",
 		"node_modules/jiti/lib/jiti.mjs": "fixture",
 	})) write(join(source, path), contents);
+	for (const asset of brokerAssets) write(join(source, asset));
 	for (const [name, pinnedVersion] of Object.entries(dependencies)) {
 		write(join(source, "node_modules", ...name.split("/"), "package.json"), JSON.stringify({ name, version: pinnedVersion }));
 	}
@@ -102,6 +108,23 @@ test("invalid staged package leaves the target untouched and cleans staging", ()
 		rmSync(temp, { recursive: true });
 	}
 });
+
+for (const asset of brokerAssets) {
+	test(`a missing broker asset (${asset}) leaves the target untouched`, () => {
+		const { temp, source, target } = fixture();
+		try {
+			rmSync(join(source, asset));
+			assert.throws(
+				() => installLocal({ target, source, skipBuild: true }),
+				(error) => error.message.includes(asset.slice(asset.lastIndexOf("/") + 1)),
+			);
+			assert.equal(readFileSync(join(target, "old.txt"), "utf8"), "previous package");
+			assert.deepEqual(stages(target), []);
+		} finally {
+			rmSync(temp, { recursive: true });
+		}
+	});
+}
 
 test("a staged CLI version mismatch does not move the old package", () => {
 	const { temp, source, target } = fixture({ stagedVersionFails: true });

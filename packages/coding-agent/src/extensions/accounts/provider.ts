@@ -1,10 +1,9 @@
 import {
 	type Api,
-	type AssistantMessage,
-	type AssistantMessageEventStream,
 	type ClassifierApi,
 	type ClassifierModel,
 	createProvider,
+	type FetchFunction,
 	type Model,
 	type Provider,
 	type ProviderResponse,
@@ -20,32 +19,19 @@ import {
 	accountDisplayName,
 	accountProviderId,
 	BROKER_PLACEHOLDER_URL,
-	familyOf,
 	poolDisplayName,
 	poolProviderId,
 } from "./catalog.ts";
-import type { BrokerClient, BrokerTarget } from "./client.ts";
+import { type BrokerClient, type BrokerTarget, fetchBroker } from "./client.ts";
 
 /** Response header naming the account that served a request, base64url encoded. */
 export const ACCOUNT_HEADER = "x-credne-account";
 
-/** What one Pi provider routes to. */
-export type AccountTarget =
-	| BrokerTarget
-	/** A Claude subscription signed in to this process. */
-	| { type: "local"; id: string }
-	/** A virtual pool: its virtual models route each request to one of the physical accounts. */
-	| { type: "virtual-pool"; name: string };
-
-/** One entry of the account list: a physical provider, or a virtual pool of them. */
+/** One entry of the account list: a pinned broker account or a broker pool. */
 export interface AccountProviderSpec {
 	id: string;
 	name: string;
-	target: AccountTarget;
-	/** Model family of the account, or the pool's name. */
-	family: string;
-	/** Whether the account is a subscription; routing uses subscriptions before API accounts. */
-	subscription: boolean;
+	target: BrokerTarget;
 	/** Disabled accounts stay registered so sessions that used them fail with a clear reason. */
 	disabled: boolean;
 	models: Model<Api>[];
@@ -53,34 +39,27 @@ export interface AccountProviderSpec {
 	classifiers?: ClassifierModel<ClassifierApi>[];
 }
 
-/** A spec the broker serves. */
-export type BrokerProviderSpec = AccountProviderSpec & { target: BrokerTarget };
-
 /** Called with the account key that served a request of a provider. */
 export type ServedByListener = (providerId: string, accountKey: string) => void;
 
-/** One spec per cached broker pool and account; the virtual pools and local subscriptions are not the broker's. */
-export function providerSpecs(catalog: AccountCatalog): BrokerProviderSpec[] {
+/** One spec per cached broker pool and account. */
+export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
 	return [
 		...catalog.pools.map(
-			(pool): BrokerProviderSpec => ({
+			(pool): AccountProviderSpec => ({
 				id: poolProviderId(pool.name),
 				name: poolDisplayName(pool),
 				target: { type: "pool", name: pool.name },
-				family: pool.name,
-				subscription: false,
 				disabled: false,
 				models: pool.models,
 				classifiers: pool.classifiers,
 			}),
 		),
 		...catalog.accounts.map(
-			(account): BrokerProviderSpec => ({
+			(account): AccountProviderSpec => ({
 				id: accountProviderId(account.id),
 				name: accountDisplayName(account),
 				target: { type: "account", key: account.key },
-				family: familyOf(account.provider),
-				subscription: account.kind === "oauth",
 				disabled: account.disabled,
 				models: account.models,
 				classifiers: account.classifiers,
@@ -96,7 +75,7 @@ export function providerSpecs(catalog: AccountCatalog): BrokerProviderSpec[] {
  * models post to the route's `decisions` path, which the broker forwards to OpenAI's Decisions API.
  */
 export function createAccountProvider(
-	spec: BrokerProviderSpec,
+	spec: AccountProviderSpec,
 	client: BrokerClient,
 	onServedBy?: ServedByListener,
 ): Provider {
@@ -104,7 +83,7 @@ export function createAccountProvider(
 		const key = response.headers[ACCOUNT_HEADER];
 		if (key) onServedBy?.(spec.id, key);
 	};
-	const observer: StreamObserver = { response: report };
+	const decisions = openAIDecisionsApi();
 	return createProvider({
 		id: spec.id,
 		name: spec.name,
@@ -127,39 +106,51 @@ export function createAccountProvider(
 		models: [...spec.models, ...(spec.classifiers ?? [])],
 		// A pool may mix APIs (Claude and GPT models), so every adapter is available.
 		api: {
-			"anthropic-messages": observed(anthropicMessagesApi(), observer),
-			"openai-responses": observed(openAIResponsesApi(), observer),
-			"openai-completions": observed(openAICompletionsApi(), observer),
+			"anthropic-messages": observed(anthropicMessagesApi(), report),
+			"openai-responses": observed(openAIResponsesApi(), report),
+			"openai-completions": observed(openAICompletionsApi(), report),
 		},
-		// Not observed: a classification may be served by another pool account than the chat, so it must not move the footer.
-		classifiers: { "openai-decisions": openAIDecisionsApi() },
+		// A classification may be served by another pool account than the chat, so it must not move the footer.
+		classifiers: {
+			"openai-decisions": {
+				classify: (model, context, options) =>
+					decisions.classify(model, context, { ...options, fetch: fetchInference }),
+			},
+		},
 	});
 }
 
-/** What an observed adapter reports about its requests. */
-export interface StreamObserver {
-	/** Called with each HTTP response before the caller's own onResponse runs. */
-	response?: (response: ProviderResponse, model: Model<Api>) => void;
-	/** Called with the final message of each request, including failed ones. */
-	result?: (message: AssistantMessage) => void;
-}
-
-/** Wraps an adapter so its responses and final messages are reported to `observer`. */
-export function observed(streams: ProviderStreams, observer: StreamObserver): ProviderStreams {
+/** Reports broker responses before invoking the caller's own response handler. */
+function observed(streams: ProviderStreams, report: (response: ProviderResponse) => void): ProviderStreams {
 	const withReport = <T extends StreamOptions>(options: T | undefined): T =>
 		({
 			...options,
+			fetch: fetchInference,
 			onResponse: (response: ProviderResponse, model: Model<Api>) => {
-				observer.response?.(response, model);
+				report(response);
 				return options?.onResponse?.(response, model);
 			},
 		}) as T;
-	const watched = (stream: AssistantMessageEventStream): AssistantMessageEventStream => {
-		if (observer.result) void stream.result().then(observer.result, () => {});
-		return stream;
-	};
 	return {
-		stream: (model, context, options) => watched(streams.stream(model, context, withReport(options))),
-		streamSimple: (model, context, options) => watched(streams.streamSimple(model, context, withReport(options))),
+		stream: (model, context, options) => streams.stream(model, context, withReport(options)),
+		streamSimple: (model, context, options) => streams.streamSimple(model, context, withReport(options)),
 	};
 }
+
+/** Keep the broker token on the loopback route even when proxy or redirect settings would send it elsewhere. */
+const fetchInference: FetchFunction = async (input, init) => {
+	const request = new Request(input, init);
+	const url = new URL(request.url);
+	if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(url.origin) || !url.pathname.startsWith("/credne/v1/route/")) {
+		throw new Error("Inference requests must use a loopback account broker route.");
+	}
+	const response = await fetchBroker(url.href, {
+		method: request.method,
+		headers: [...request.headers],
+		body: request.body,
+		duplex: "half",
+		signal: request.signal,
+	});
+	// Undici and the platform use the same Fetch response protocol, with different declared stream types.
+	return response as unknown as Awaited<ReturnType<FetchFunction>>;
+};

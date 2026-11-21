@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { requiredBrokerAddon } from "../../scripts/build-account-broker.mjs";
 import { execNpmSync } from "../../scripts/npm-command.mjs";
 
 const sourceDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -106,6 +107,9 @@ function validatePackage(directory, version) {
 		"CHANGELOG.md",
 		"THIRD_PARTY_NOTICES.md",
 		`bin/credne-broker${process.platform === "win32" ? ".exe" : ""}`,
+		"bin/pi-natives-LICENSE",
+		"bin/pi-natives-THIRD-PARTY-NOTICES.txt",
+		`bin/${requiredBrokerAddon()}`,
 	]) requireFile(directory, path);
 	for (const path of ["dist/bundle/chunks", "dist/modes/interactive/assets", "dist/extensions/subagent/agents", "docs", "examples"]) {
 		requireDirectory(directory, path);

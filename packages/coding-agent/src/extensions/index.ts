@@ -8,10 +8,16 @@ import subagentExtension from "./subagent/index.ts";
 import toolSearchExtension from "./tool-search/index.ts";
 import webSearchExtension from "./web-search/index.ts";
 
+/** First-party model providers used by Credne's CLI and headless SDK. */
+export function getBuiltInModelExtensions(agentDir?: string): InlineExtension[] {
+	return [
+		{ name: "llama.cpp", factory: llamaExtension, builtin: true },
+		{ name: "accounts", factory: (pi) => accountsExtension(pi, agentDir), builtin: true },
+	];
+}
+
 export const builtInExtensions: InlineExtension[] = [
-	{ name: "llama.cpp", factory: llamaExtension, builtin: true },
-	// Provider accounts through the shared credne-broker; registers nothing until accounts exist.
-	{ name: "accounts", factory: accountsExtension, builtin: true },
+	...getBuiltInModelExtensions(),
 	{ name: "web-search", factory: webSearchExtension, replaceable: true, builtin: true },
 	{ name: "planning", factory: planningExtension, builtin: true },
 	{ name: "subagent", factory: subagentExtension, replaceable: true, builtin: true },

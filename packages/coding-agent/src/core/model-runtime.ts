@@ -25,11 +25,13 @@ import {
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
+	getModelType,
 	getOpenCodeSessionHeaders,
 	type ImageApi,
 	type ImageModel,
 	type ImagesContext,
 	type ImagesOptions,
+	InMemoryCredentialStore,
 	type LoginOptions,
 	lazyStream,
 	type Message,
@@ -67,8 +69,9 @@ import {
 	classifierErrorResult,
 	imageErrorResult,
 } from "@earendil-works/pi-ai/utils/model-operations";
-import { getAgentDir } from "../config.ts";
+import { getAgentDir, USES_BROKER_AUTH } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
+import { BROKER_AUTH_GUIDANCE } from "./auth-guidance.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
@@ -84,6 +87,7 @@ import {
 } from "./provider-composer.ts";
 import { withPersonalizedCatalog, withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
+import { BUILTIN_PATH_PREFIX } from "./source-info.ts";
 import {
 	createVirtualModel,
 	findLatestResponse,
@@ -108,7 +112,7 @@ interface ModelRuntimeSnapshot {
 }
 
 export interface CreateModelRuntimeOptions {
-	/** Credential storage. Defaults to the file at authPath. */
+	/** Credential storage for native Pi providers. Ignored in Credne. */
 	credentials?: CredentialStore;
 	authPath?: string;
 	modelsPath?: string | null;
@@ -152,6 +156,34 @@ export class CredentialSynchronizationError extends Error {
 		this.operation = operation;
 		this.credential = credential;
 	}
+}
+
+/** This install does not allow third-party provider registration; other extension features may still load. */
+export class ProviderRegistrationDisabledError extends ModelsError {
+	constructor(providerId: string) {
+		super(
+			"provider",
+			`Provider ${providerId} cannot register outside Credne's built-in model extensions. ${BROKER_AUTH_GUIDANCE}`,
+		);
+		this.name = "ProviderRegistrationDisabledError";
+	}
+}
+
+const ACCOUNTS_EXTENSION_PATH = `${BUILTIN_PATH_PREFIX}accounts`;
+const LLAMA_EXTENSION_PATH = `${BUILTIN_PATH_PREFIX}llama.cpp`;
+const AUTH_HEADERS = new Set(["authorization", "proxy-authorization", "api-key", "x-api-key", "cf-aig-authorization"]);
+const BROKER_ROUTE = /^http:\/\/127\.0\.0\.1:\d{1,5}\/credne\/v1\/route\/[ap]\.[A-Za-z0-9_-]+$/;
+
+function getNativeProviders(catalogBaseUrl?: string): Provider[] {
+	const generatedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
+	return builtinProviderCatalog.builtinProviders().map((provider) => {
+		if (provider.id === "radius") return provider;
+		// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
+		if (provider.id === "openrouter") {
+			return withPersonalizedCatalog(provider, personalizeOpenRouterCatalog, catalogBaseUrl, generatedAt);
+		}
+		return withRemoteCatalog(provider, catalogBaseUrl, generatedAt);
+	});
 }
 
 function mergeHeaders(
@@ -211,34 +243,34 @@ export class ModelRuntime implements Models {
 		this.modelNetworkEnabled = modelNetworkEnabled;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
-		this.models = createModels({ credentials, modelsStore });
+		this.models = createModels({
+			credentials,
+			modelsStore,
+			...(USES_BROKER_AUTH && {
+				authContext: { env: async () => undefined, fileExists: async () => false },
+			}),
+		});
 		this.rebuildProviders();
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
-		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
-		const modelsPath =
+		const credentials = new RuntimeCredentials(
+			USES_BROKER_AUTH
+				? new InMemoryCredentialStore()
+				: (options.credentials ?? DefaultAuthStorage.create(options.authPath)),
+		);
+		const configuredModelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
+		// models.json may contain keys, shell commands and provider URLs. In Credne the accounts catalog
+		// owns those models and their routes; models-store.json only caches non-secret model metadata.
+		const modelsPath = USES_BROKER_AUTH ? undefined : configuredModelsPath;
 		const config = await ModelConfig.load(modelsPath);
 		const modelsStore =
 			options.modelsStore ??
-			(modelsPath
-				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
+			(configuredModelsPath
+				? new FileModelsStore(options.modelsStorePath ?? join(dirname(configuredModelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
-		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
-		const providers = builtinProviderCatalog.builtinProviders().map((provider) => {
-			if (provider.id === "radius") return provider;
-			// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
-			if (provider.id === "openrouter") {
-				return withPersonalizedCatalog(
-					provider,
-					personalizeOpenRouterCatalog,
-					options.catalogBaseUrl,
-					builtinModelDataGeneratedAt,
-				);
-			}
-			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
-		});
+		const providers = USES_BROKER_AUTH ? [] : getNativeProviders(options.catalogBaseUrl);
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -559,6 +591,12 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
+		if (USES_BROKER_AUTH) {
+			// Resolve only against the registered model and never let a caller overlay the account token or route.
+			const providerId =
+				typeof providerOrModel === "string" ? providerOrModel : this.registeredModel(providerOrModel).provider;
+			return this.models.getAuth(providerId, { signal: overrides.signal });
+		}
 		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
 		const resolution = await this.models.getAuth(providerOrModel, overrides);
 		if (!resolution) return undefined;
@@ -620,6 +658,7 @@ export class ModelRuntime implements Models {
 	}
 
 	setRuntimeApiKey(providerId: string, apiKey: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (USES_BROKER_AUTH) return Promise.reject(new ModelsError("auth", BROKER_AUTH_GUIDANCE));
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.setRuntimeApiKey(providerId, apiKey);
@@ -633,6 +672,7 @@ export class ModelRuntime implements Models {
 	}
 
 	removeRuntimeApiKey(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (USES_BROKER_AUTH) return Promise.reject(new ModelsError("auth", BROKER_AUTH_GUIDANCE));
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.removeRuntimeApiKey(providerId);
@@ -664,6 +704,18 @@ export class ModelRuntime implements Models {
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 
+	private registeredModel<TModel extends AnyModel>(model: TModel): TModel {
+		const registered = this.models.getModelOfType(getModelType(model), model.provider, model.id);
+		if (!registered || registered.api !== model.api) {
+			throw new ModelsError(
+				"model_validation",
+				`Unknown model ${model.provider}/${model.id}. ${BROKER_AUTH_GUIDANCE}`,
+			);
+		}
+		// The registry lookup uses the model's exact type and the API identifier was checked above.
+		return registered as TModel;
+	}
+
 	private async prepareRequest<
 		TModel extends AnyModel,
 		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
@@ -677,16 +729,25 @@ export class ModelRuntime implements Models {
 	}> {
 		const provider = this.models.getProvider(model.provider);
 		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
-		const resolution = await this.getAuth(model, {
-			apiKey: options?.apiKey,
-			env: options?.env,
-			signal: options?.signal,
-		});
+		if (USES_BROKER_AUTH) model = this.registeredModel(model);
+		const resolution = USES_BROKER_AUTH
+			? await this.models.getAuth(model.provider, { signal: options?.signal })
+			: await this.getAuth(model, { apiKey: options?.apiKey, env: options?.env, signal: options?.signal });
 		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
-		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		if (USES_BROKER_AUTH && model.provider !== "llama.cpp") {
+			// A missing token or route must fail closed rather than handing an SDK its ambient defaults.
+			if (!resolution.auth.apiKey || !resolution.auth.baseUrl || !BROKER_ROUTE.test(resolution.auth.baseUrl)) {
+				throw new ModelsError("auth", `Missing broker credentials or route for ${model.provider}.`);
+			}
+		}
+		const requestModel: TModel = USES_BROKER_AUTH
+			? { ...model, baseUrl: resolution.auth.baseUrl ?? model.baseUrl, headers: undefined }
+			: resolution.auth.baseUrl
+				? { ...model, baseUrl: resolution.auth.baseUrl }
+				: model;
 		const sessionId =
 			"sessionId" in providerOptions && typeof providerOptions.sessionId === "string"
 				? providerOptions.sessionId
@@ -696,8 +757,17 @@ export class ModelRuntime implements Models {
 			providerOptions.headers,
 		);
 		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+		if (USES_BROKER_AUTH) {
+			headers = mergeHeaders(model.headers, headers);
+			const safeHeaders =
+				headers &&
+				Object.fromEntries(
+					Object.entries(headers).filter(([name]) => !AUTH_HEADERS.has(name.trim().toLowerCase())),
+				);
+			headers = mergeHeaders(safeHeaders, resolution.auth.headers);
+		}
 		const env =
-			resolution.env || providerOptions.env
+			!USES_BROKER_AUTH && (resolution.env || providerOptions.env)
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
 		return {
@@ -705,7 +775,7 @@ export class ModelRuntime implements Models {
 			model: requestModel,
 			options: {
 				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+				apiKey: USES_BROKER_AUTH ? resolution.auth.apiKey : (providerOptions.apiKey ?? resolution.auth.apiKey),
 				headers,
 				env,
 			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
@@ -866,6 +936,7 @@ export class ModelRuntime implements Models {
 		interaction: AuthInteraction,
 		options?: LoginOptions,
 	): Promise<Credential> {
+		if (USES_BROKER_AUTH) return Promise.reject(new ModelsError("auth", BROKER_AUTH_GUIDANCE));
 		const signal = operationSignal(interaction.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			const credential = await this.models.login(providerId, type, { ...interaction, signal }, options);
@@ -875,6 +946,7 @@ export class ModelRuntime implements Models {
 	}
 
 	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (USES_BROKER_AUTH) return Promise.reject(new ModelsError("auth", BROKER_AUTH_GUIDANCE));
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			await this.models.logout(providerId, { signal });
@@ -925,8 +997,22 @@ export class ModelRuntime implements Models {
 		return { aborted: result.aborted || (options.signal?.aborted ?? false), errors };
 	}
 
-	registerNativeProvider(provider: Provider): void {
+	registerNativeProvider(provider: Provider, extensionPath?: string): void {
 		if (!provider.id.trim()) throw new Error("Provider id must not be empty.");
+		if (USES_BROKER_AUTH) {
+			if (
+				extensionPath !== ACCOUNTS_EXTENSION_PATH &&
+				!(extensionPath === LLAMA_EXTENSION_PATH && provider.id === "llama.cpp")
+			) {
+				throw new ProviderRegistrationDisabledError(provider.id);
+			}
+			if (provider.auth.oauth || provider.auth.apiKey?.login) {
+				throw new ModelsError(
+					"provider",
+					`Provider ${provider.id} cannot expose a native login flow. ${BROKER_AUTH_GUIDANCE}`,
+				);
+			}
+		}
 		this.extensionProviders.delete(provider.id);
 		this.nativeExtensionProviders.set(provider.id, provider);
 		this.recomposeProvider(provider.id);
@@ -963,6 +1049,7 @@ export class ModelRuntime implements Models {
 	}
 
 	registerProvider(providerId: string, config: ProviderConfigInput): void {
+		if (USES_BROKER_AUTH) throw new ProviderRegistrationDisabledError(providerId);
 		// Validate the incoming registration on its own, like the legacy registry:
 		// a broken re-registration must throw without touching the stored config.
 		validateExtensionProvider(providerId, this.builtins.get(providerId), this.config.getProvider(providerId), config);
@@ -985,7 +1072,8 @@ export class ModelRuntime implements Models {
 		void this.refresh({ allowNetwork: false });
 	}
 
-	unregisterProvider(providerId: string): void {
+	unregisterProvider(providerId: string, extensionPath?: string): void {
+		if (USES_BROKER_AUTH && extensionPath !== ACCOUNTS_EXTENSION_PATH) return;
 		this.extensionProviders.delete(providerId);
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);

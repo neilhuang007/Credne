@@ -426,11 +426,12 @@ export function getPackageDir(): string {
 		return normalizePath(envDir);
 	}
 
-	if (isBunBinary) {
-		// Bun binary: process.execPath points to the compiled executable
-		return dirname(process.execPath);
-	}
-	return findNodePackageDir(__dirname);
+	return getRuntimePackageDir();
+}
+
+/** Resolve the installed executable's package, independently of asset overrides. */
+export function getRuntimePackageDir(): string {
+	return isBunBinary ? dirname(process.execPath) : findNodePackageDir(__dirname);
 }
 
 /**
@@ -613,6 +614,23 @@ try {
 
 const piConfigName: string | undefined = pkg.piConfig?.name;
 export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
+const crednePackageName = "@neilhuang007/credne";
+/** The shipped Credne runtime delegates provider authentication to its account broker. */
+export const USES_BROKER_AUTH = PACKAGE_NAME === crednePackageName || isCredneInstall();
+
+function isCredneInstall(): boolean {
+	if (!process.env.PI_PACKAGE_DIR) return false;
+	// An asset override can relocate assets, but must not change the installed executable's auth policy.
+	try {
+		const installed = JSON.parse(
+			stripBom(readFileSync(join(getRuntimePackageDir(), "package.json"), "utf-8")),
+		) as PackageJson;
+		return installed.name === crednePackageName;
+	} catch {
+		return false;
+	}
+}
+
 export const APP_NAME: string = piConfigName || "pi";
 export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";

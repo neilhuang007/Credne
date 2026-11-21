@@ -7,7 +7,7 @@ import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-co
 import { type Api, type AssistantMessage, type Message, type Model, type Usage, uuidv7 } from "@earendil-works/pi-ai";
 import { ToolCallArgumentsStream } from "@earendil-works/pi-ai/utils/streaming-json";
 import { Value } from "typebox/value";
-import { APP_NAME } from "../../config.ts";
+import { APP_NAME, getRuntimePackageDir, isBunBinary, USES_BROKER_AUTH } from "../../config.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "../../core/session-manager.ts";
 import { withFileMutationQueue } from "../../core/tools/file-mutation-queue.ts";
 import { createUsageTotals, type UsageTotals } from "../../core/usage-totals.ts";
@@ -808,6 +808,13 @@ function errorText(error: unknown): string {
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	if (USES_BROKER_AUTH) {
+		// SDK callers may start from an unrelated entry script; never spawn that or a native Pi from PATH.
+		return {
+			command: process.execPath,
+			args: isBunBinary ? args : [path.join(getRuntimePackageDir(), "dist", "bundle", "cli.js"), ...args],
+		};
+	}
 	const currentScript = process.argv[1];
 	const isBunVirtualScript =
 		currentScript !== undefined &&

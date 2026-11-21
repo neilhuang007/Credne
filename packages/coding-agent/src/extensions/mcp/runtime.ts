@@ -34,7 +34,8 @@ import {
 	type McpOAuthSettings,
 	type OAuthChallenge,
 } from "@earendil-works/pi-mcp/oauth";
-import { VERSION } from "../../config.ts";
+import { USES_BROKER_AUTH, VERSION } from "../../config.ts";
+import { BROKER_MCP_AUTH_GUIDANCE } from "../../core/auth-guidance.ts";
 import { resolveConfigValueOrThrow, resolveHeadersOrThrow } from "../../core/resolve-config-value.ts";
 import { sliceTail } from "../../core/tools/truncate.ts";
 import type { McpServerEntry } from "./config.ts";
@@ -78,6 +79,7 @@ function isTransientError(error: unknown): boolean {
 
 function signInRequiredMessage(entry: McpServerEntry): string {
 	const provider = "url" in entry.config ? entry.config.auth?.provider : undefined;
+	if (provider && USES_BROKER_AUTH) return BROKER_MCP_AUTH_GUIDANCE;
 	return `MCP server "${entry.name}" requires sign-in. Run ${provider ? `/login ${provider}` : "/mcp"} to sign in.`;
 }
 

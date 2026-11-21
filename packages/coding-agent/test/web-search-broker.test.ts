@@ -6,6 +6,7 @@ import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/ex
 import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import type * as brokerClient from "../src/extensions/accounts/client.ts";
 import type { BrokerAccount, BrokerModel } from "../src/extensions/accounts/client.ts";
+import { ACCOUNT_HEADER } from "../src/extensions/accounts/provider.ts";
 import webSearchExtension from "../src/extensions/web-search/index.ts";
 
 // No test reaches a real broker or provider: the client is a fake and `fetchBroker` records the request it would send.
@@ -80,14 +81,23 @@ function session(provider: string, id: string, api: Api): Model<Api> {
 }
 
 /** Runs one search for a session on `active`, with the broker's accounts and what each account serves. */
-async function runSearch(active: Model<Api>, accounts: BrokerAccount[], models: Record<string, BrokerModel[]>) {
+async function runSearch(
+	active: Model<Api>,
+	accounts: BrokerAccount[],
+	models: Record<string, BrokerModel[]>,
+	options: { servedKey?: string; branch?: unknown[] } = {},
+) {
 	broker.listAccounts.mockResolvedValue(accounts);
 	broker.accountModels.mockImplementation(async (key: string) => models[key] ?? []);
 	const ctx = {
 		cwd: process.cwd(),
 		model: active,
-		modelRegistry: { getAvailable: () => [] },
-		sessionManager: { getBranch: () => [] },
+		sessionManager: { getSessionId: () => "search-test", getBranch: () => options.branch ?? [] },
+		modelRegistry: {
+			streamSimple: () => {
+				throw new Error("Hosted web search must never use the agent stream.");
+			},
+		},
 	} as unknown as ExtensionContext;
 	const extension = await loadExtensionFromFactory(
 		webSearchExtension,
@@ -96,6 +106,18 @@ async function runSearch(active: Model<Api>, accounts: BrokerAccount[], models: 
 		createExtensionRuntime(),
 		"builtin:web-search",
 	);
+	if (options.servedKey) {
+		const emit = async <T extends { type: string }>(event: T) => {
+			for (const handler of extension.handlers.get(event.type) ?? []) await handler(event, ctx);
+		};
+		await emit({ type: "before_provider_request", payload: {} } as const);
+		await emit({
+			type: "after_provider_response",
+			status: 200,
+			headers: { [ACCOUNT_HEADER]: options.servedKey },
+		} as const);
+		await emit({ type: "provider_stream_event", provider: active.provider, model: active.id, data: {} } as const);
+	}
 	const tool = extension.tools.get("web_search")!.definition;
 	return tool.execute("call", { query: "pi coding agent" } as never, undefined, undefined, ctx as never);
 }
@@ -152,5 +174,62 @@ describe("web search on a broker subscription", () => {
 			model: "claude-haiku-5-5",
 		});
 		expect(result.details).toMatchObject({ family: "claude", model: "claude-haiku-5-5" });
+	});
+
+	it("starts on the Claude subscription that served the pool and tries the next on a usage limit", async () => {
+		const first = account("claude-1", "claude");
+		const second = account("claude-2", "claude");
+		const opus = "claude-opus-5-5";
+		fetchBroker.mockResolvedValueOnce(Response.json({ error: { message: "Usage limit" } }, { status: 429 }));
+		fetchBroker.mockResolvedValueOnce(Response.json(claudeReply));
+
+		const result = await runSearch(
+			session("pool:claude", opus, "anthropic-messages"),
+			[second, first],
+			{ [first.key]: served(opus, "claude-haiku-5-5"), [second.key]: served(opus) },
+			{ servedKey: first.key },
+		);
+
+		expect(fetchBroker.mock.calls.map(([url]) => url)).toEqual(
+			[first, second].map(({ key }) => `http://127.0.0.1:1234/credne/v1/route/a.${key}/v1/messages`),
+		);
+		expect(result.details).toMatchObject({ family: "claude", model: opus, searchCount: 1 });
+	});
+
+	it("does not prefer a paid account even when it answered most recently", async () => {
+		const paid = { ...account("claude-api", "claude"), kind: "api-key" as const };
+		const subscription = account("claude-1", "claude");
+		const opus = "claude-opus-5-5";
+		fetchBroker.mockResolvedValueOnce(Response.json(claudeReply));
+		await runSearch(
+			session("pool:claude", opus, "anthropic-messages"),
+			[paid, subscription],
+			{ [paid.key]: served(opus), [subscription.key]: served(opus) },
+			{ servedKey: paid.key },
+		);
+		expect(sentRequest().url).toContain(`/route/a.${subscription.key}/`);
+	});
+
+	it.each([
+		["matching preceding pool selection", "pool:claude", "acct:claude-2", "key-claude-2"],
+		["answer from a different selection", "acct:claude-2", "acct:claude-2", "key-claude-1"],
+		["answer without a pinned account", "pool:claude", "pool:claude", "key-claude-1"],
+	])("restores pool affinity only with explicit evidence: %s", async (_label, previous, reply, expected) => {
+		const first = account("claude-1", "claude");
+		const second = account("claude-2", "claude");
+		const opus = "claude-opus-5-5";
+		fetchBroker.mockResolvedValueOnce(Response.json(claudeReply));
+		await runSearch(
+			session("pool:claude", opus, "anthropic-messages"),
+			[first, second],
+			{ [first.key]: served(opus), [second.key]: served(opus) },
+			{
+				branch: [
+					{ type: "model_change", provider: previous, modelId: opus },
+					{ type: "message", message: { role: "assistant", model: opus, provider: reply, stopReason: "stop" } },
+				],
+			},
+		);
+		expect(sentRequest().url).toContain(`/route/a.${expected}/`);
 	});
 });

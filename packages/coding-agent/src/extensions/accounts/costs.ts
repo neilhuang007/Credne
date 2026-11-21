@@ -1,6 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "../../core/session-manager.ts";
-import { isVirtualPoolProvider } from "./catalog.ts";
+import { POOL_PROVIDER_PREFIX } from "./catalog.ts";
 
 export interface SessionAccountCosts {
 	account: Usage["cost"];
@@ -10,10 +10,8 @@ export interface SessionAccountCosts {
 }
 
 /**
- * Sum recorded assistant costs for a pinned provider. A response a virtual pool routed records the physical
- * provider that served it, so it counts for that account. Broker pools balance on the broker's side and record
- * only the pool, so their costs remain separate and unattributed. A request that failed before routing leaves the
- * virtual pool on its message and cost nothing, so it counts for no one.
+ * Sum recorded assistant costs for a pinned provider. Broker pool responses record only the pool,
+ * so their costs remain separate and unattributed.
  */
 export function sessionAccountCosts(entries: readonly SessionEntry[], providerId: string): SessionAccountCosts {
 	const result: SessionAccountCosts = {
@@ -25,8 +23,7 @@ export function sessionAccountCosts(entries: readonly SessionEntry[], providerId
 	for (const entry of entries) {
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 		const message = entry.message;
-		if (isVirtualPoolProvider(message.provider)) continue;
-		const pool = message.provider.startsWith("pool:");
+		const pool = message.provider.startsWith(POOL_PROVIDER_PREFIX);
 		if (!pool && message.provider !== providerId) continue;
 		const target = pool ? result.unattributedPools : result.account;
 		if (pool) result.poolResponses++;

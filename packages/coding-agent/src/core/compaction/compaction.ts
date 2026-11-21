@@ -24,6 +24,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { USES_BROKER_AUTH } from "../../config.ts";
 import { convertToLlm, createFailureFilter, filterFailedMessages } from "../messages.ts";
 import {
 	buildSessionProjection,
@@ -632,6 +633,7 @@ export async function completeSummarization(
 		cacheRetention: "none",
 		sessionId: options.sessionId ?? uuidv7(),
 	};
+	if (!streamFn && USES_BROKER_AUTH) throw new Error("Summarization requires the configured model runtime.");
 	const produce = async (): Promise<AssistantMessage> =>
 		streamFn
 			? (await streamFn(model, context, requestOptions)).result()

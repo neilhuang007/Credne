@@ -5,7 +5,7 @@
 import chalk from "chalk";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
-import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.ts";
+import { CONFIG_DIR_NAME, getAgentDir, getBinDir, USES_BROKER_AUTH } from "./config.ts";
 import { migrateKeybindingsConfig } from "./core/keybindings.ts";
 import { stripBom } from "./utils/text.ts";
 
@@ -19,6 +19,7 @@ const EXTENSIONS_DOC_URL = "https://github.com/earendil-works/pi/blob/main/packa
  * @returns Array of provider names that were migrated
  */
 export function migrateAuthToAuthJson(): string[] {
+	if (USES_BROKER_AUTH) return [];
 	const agentDir = getAgentDir();
 	const authPath = join(agentDir, "auth.json");
 	const oauthPath = join(agentDir, "oauth.json");

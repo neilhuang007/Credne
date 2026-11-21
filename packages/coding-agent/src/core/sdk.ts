@@ -8,9 +8,11 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
-import { getAgentDir } from "../config.ts";
+import { getAgentDir, USES_BROKER_AUTH } from "../config.ts";
+import { getBuiltInModelExtensions } from "../extensions/index.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
+import { registerPendingProviders } from "./agent-session-services.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
@@ -49,7 +51,7 @@ import { getBranchSelection } from "./virtual-models.ts";
 // Preserve the pre-0.81 fallback for extensions that construct Agent instances
 // or invoke low-level agent loops without supplying streamFn. Agent core remains
 // provider-agnostic and does not import pi-ai/compat itself.
-setDefaultStreamFn(streamSimple);
+if (!USES_BROKER_AUTH) setDefaultStreamFn(streamSimple);
 
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: process.cwd() */
@@ -57,7 +59,7 @@ export interface CreateAgentSessionOptions {
 	/** Global config directory. Default: ~/.pi/agent */
 	agentDir?: string;
 
-	/** Canonical model/auth runtime. Defaults to a runtime using agentDir/auth.json and models.json. */
+	/** Canonical model runtime. Credne uses broker accounts; Pi defaults to agentDir/auth.json and models.json. */
 	modelRuntime?: ModelRuntime;
 
 	/** Model to use. Default: from settings, else first available */
@@ -207,9 +209,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
-		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+		resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			extensionFactories: USES_BROKER_AUTH ? getBuiltInModelExtensions(agentDir) : undefined,
+		});
 		await resourceLoader.reload();
 		time("resourceLoader.reload");
+	}
+	const extensionsResult = resourceLoader.getExtensions();
+	if (
+		USES_BROKER_AUTH &&
+		(extensionsResult.runtime.pendingProviderRegistrations.length ||
+			extensionsResult.runtime.pendingNativeProviderRegistrations.length ||
+			extensionsResult.runtime.pendingVirtualModelRegistrations.length)
+	) {
+		const diagnostics = await registerPendingProviders(modelRuntime, extensionsResult);
+		for (const { type, message } of diagnostics) {
+			if (type === "warning") {
+				extensionsResult.warnings ??= [];
+				extensionsResult.warnings.push({ path: "providers", warning: message });
+			} else {
+				extensionsResult.errors.push({ path: "providers", error: message });
+			}
+		}
 	}
 
 	// Check if session has existing data to restore
@@ -472,8 +496,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});
-
-	const extensionsResult = resourceLoader.getExtensions();
 
 	// The handshake overlaps the rest of startup. A no-op unless the model is served by a Claude subscription;
 	// subscription providers that extensions register later are warmed by the model change that selects them.

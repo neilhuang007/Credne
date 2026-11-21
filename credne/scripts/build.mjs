@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 // Assembles the Credne package from the built Pi coding agent and the account broker.
 //
-// Prerequisites: `npm run build` at the repo root (packages/coding-agent/dist) and Go on PATH.
+// Prerequisites: `npm run build` at the repo root and Bun >=1.4.4 on PATH.
 // Usage: node credne/scripts/build.mjs [--skip-broker]
 //
 // Pi resolves its assets (docs, README, CHANGELOG, themes, export templates) from the package
 // directory, so everything is copied next to credne/package.json. The bundle's external runtime
 // dependencies are copied from the monorepo's node_modules, so no registry install is needed and the
 // root package-lock.json stays untouched.
-import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildAccountBroker } from "../../scripts/build-account-broker.mjs";
 
 const credneDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(credneDir, "..");
@@ -50,13 +50,8 @@ for (const [name, version] of Object.entries(manifest.dependencies)) {
 
 // The account broker, found by the accounts extension in <packageDir>/bin.
 if (!skipBroker) {
-	const binary = join(credneDir, "bin", process.platform === "win32" ? "credne-broker.exe" : "credne-broker");
 	rmSync(join(credneDir, "bin"), { recursive: true, force: true });
-	const ldflags = `-s -w -X main.version=${manifest.version}`;
-	execFileSync("go", ["build", "-trimpath", `-ldflags=${ldflags}`, "-o", binary, "./cmd/credne-broker"], {
-		cwd: brokerDir,
-		stdio: "inherit",
-	});
+	buildAccountBroker({ outDir: join(credneDir, "bin") });
 }
 copy(join(brokerDir, "THIRD_PARTY_NOTICES.md"), join(credneDir, "THIRD_PARTY_NOTICES.md"));
 

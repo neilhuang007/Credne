@@ -1,3 +1,13 @@
+# Unreleased
+
+- The Credne CLI stays on Node.js. A separate `@oh-my-pi/pi-ai` service replaces the Go/CLIProxyAPI broker and manages provider credentials. Before upgrading, finish active requests, choose **Restart broker** in `/accounts` to stop the previous broker, then close the old CLI sessions.
+- Use `/accounts add` for Claude subscriptions, ChatGPT subscriptions, Anthropic API keys, and OpenAI API keys. Previously local `claude-sub:` accounts need a fresh sign-in and selection in `/model`; the original credential file is left intact. For Claude Console billing, add an Anthropic API key instead of signing in through `ant`.
+- Source builds require Node.js 22.19 or newer and Bun 1.4.4 or newer. Installed packages include the broker runtime; users do not need Bun or Go.
+- Build packages on the target platform and architecture with `npm ci --ignore-scripts`, `npm run build`, and `node credne/scripts/build.mjs`.
+- Keep the packaged `bin/pi_natives.*.node` files beside `credne-broker`. The broker uses these native assets for locking and credential storage. SQLite and the provider catalog are included in the compiled runtime.
+
+The 0.1.3 installation instructions below refer to the existing release archive, which still contains the original Go broker.
+
 # Credne 0.1.3
 
 - After a provider error such as “no credits remaining,” switch to a funded account or top up the current one, then run `/continue`. Credne retries the pending turn with its original prompt and attachments.

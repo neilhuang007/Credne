@@ -10,6 +10,7 @@ import {
 	Text,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import { USES_BROKER_AUTH } from "../../../config.ts";
 import type { ModelRuntime } from "../../../core/model-runtime.ts";
 import { refreshModelCatalogs } from "../model-catalog-refresh.ts";
 import { getDistinctModelName, getModelSelectorSearchText } from "../model-search.ts";
@@ -111,7 +112,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
 			this.addChild(this.scopeHintText);
 		} else {
-			const hintText = "Only showing models from configured providers. Use /login to add providers.";
+			const hintText = USES_BROKER_AUTH
+				? "Use /accounts to add provider accounts."
+				: "Only showing models from configured providers. Use /login to add providers.";
 			this.addChild(new Text(theme.fg("warning", hintText), 0, 0));
 		}
 		this.addChild(new Spacer(1));
