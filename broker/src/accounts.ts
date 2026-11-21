@@ -3,8 +3,9 @@ import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/
 import { join } from "node:path";
 import { type Api, type AuthCredential, AuthStorage, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import { loadBrokerConfig } from "./config.ts";
+import { accountProvider, brokerProvider, unsupportedEnrollment, validateProviderKey } from "./providers.ts";
 import { array, object, stringArray, text, type WireObject } from "./wire.ts";
 
 export class HttpError extends Error {
@@ -120,15 +121,21 @@ export function publicAccount(account: Account): Record<string, unknown> {
 	};
 }
 export function publicModels(account: Account): Record<string, unknown>[] {
-	return account.models.map((model) => ({
-		id: model.id,
-		displayName: model.name,
-		contextLength: model.contextWindow,
-		maxCompletionTokens: model.maxTokens,
-		thinking: !!model.thinking,
-		thinkingLevels: model.thinking?.efforts,
-		inputModalities: model.input,
-	}));
+	const knownChat = new Set(brokerProvider(account.provider)?.models.map((model) => model.id));
+	return account.models.map((model) => {
+		const { input, output, cacheRead, cacheWrite } = getEffectiveTokenCost(model.cost);
+		return {
+			id: model.id,
+			displayName: model.name,
+			kind: knownChat.has(model.id) ? "chat" : undefined,
+			contextLength: model.contextWindow,
+			maxCompletionTokens: model.maxTokens,
+			thinking: !!model.thinking,
+			thinkingLevels: model.thinking?.efforts,
+			inputModalities: model.input,
+			cost: { input, output, cacheRead, cacheWrite },
+		};
+	});
 }
 
 /** Each store contains exactly one account. Provider retries cannot cross this boundary. */
@@ -163,7 +170,7 @@ export class Accounts {
 			const record = parseRecord(value);
 			record.provider ??= record.kind === "oauth" ? "codex" : "claude-api";
 			const key = migrating && record.kind === "api-key" ? text(value.apiKey) : undefined;
-			await this.register(record, key ? { type: "api_key", key, source: "login" } : undefined);
+			await this.register(record, key ? { type: "api_key", key } : undefined);
 		}
 		if (migrating) {
 			await this.importLegacy();
@@ -174,7 +181,7 @@ export class Accounts {
 		for (const { key, ...record } of config.accounts) {
 			await this.register(
 				{ ...record, kind: "api-key", source: "config", createdAt: new Date().toISOString() },
-				{ type: "api_key", key, source: "login" },
+				{ type: "api_key", key },
 			);
 		}
 	}
@@ -216,29 +223,27 @@ export class Accounts {
 		}
 	}
 	async register(record: AccountRecord, credential?: AuthCredential): Promise<Account> {
-		const provider =
-			record.provider === "codex" && record.kind === "oauth"
-				? "openai-codex"
-				: record.provider === "codex" || record.provider?.startsWith("openai")
-					? "openai"
-					: "anthropic";
+		const { native: provider, family } = accountProvider(record.provider, record.kind);
+		const upstream = brokerProvider(provider);
+		if (!upstream?.[record.kind === "oauth" ? "oauth" : "key"])
+			throw new HttpError(400, unsupportedEnrollment(provider, record.kind));
 		const storage = await AuthStorage.create(join(this.options.home, "credentials", `${accountKey(record.id)}.db`), {
 			usageProviderResolver: () => undefined,
 			defaultReservePct: 0,
 		});
 		if (credential) await storage.credentials.set(provider, credential);
 		else await storage.credentials.reload();
-		// Static login keys rank above environment keys. Runtime overrides also prevent auth retry
-		// from ever resolving an inherited provider credential when this account is unavailable.
+		// A pasted key is a literal override, not an OMP login-issued subscription or environment reference.
 		const current = storage.credentials.get(provider);
 		if (current?.type === "api_key") storage.keys.setRuntime(provider, current.key);
-		const family = record.provider === "codex" ? "codex" : provider === "anthropic" ? "claude" : "openai";
-		const bundled = getBundledModels(provider);
-		const ids = record.models?.length
-			? record.models
-			: bundled.filter((model) => !model.kind || model.kind === "chat").map((model) => model.id);
-		const models = ids.map((id) => {
-			const base = bundled.find((model) => model.id === id);
+		const bundled = new Map(upstream.models.map((model) => [model.id, model]));
+		const ids = record.models?.length ? record.models : bundled.keys();
+		const legacy = provider === "anthropic" || provider === "openai" || provider === "openai-codex";
+		const known = legacy ? new Map(getBundledModels(provider).map((model) => [model.id, model])) : bundled;
+		const models = [...ids].flatMap((id) => {
+			const base = known.get(id);
+			// Only legacy configurable providers accept custom model IDs; keep known auxiliary APIs intact.
+			if (!base && !legacy) return [];
 			const model: Model<Api> = base
 				? { ...base }
 				: buildModel({
@@ -263,13 +268,13 @@ export class Accounts {
 			if (record.baseUrl && record.provider === "codex" && record.source === "config") {
 				// Legacy Codex API keys append /responses to the configured base, not /v1/responses.
 				model.baseUrl = record.baseUrl;
-			} else if (record.baseUrl || provider === "anthropic" || provider === "openai") {
+			} else if (legacy && (record.baseUrl || provider === "anthropic" || provider === "openai")) {
 				const baseUrl = (
 					record.baseUrl ?? (provider === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl)
 				).replace(/\/+$/, "");
 				model.baseUrl = `${baseUrl}${baseUrl.endsWith("/v1") ? "" : "/v1"}`;
 			}
-			return model;
+			return [model];
 		});
 		const account: Account = { record, storage, provider, family, models, cooldown: 0 };
 		this.accounts.get(record.id)?.storage.close();
@@ -367,15 +372,13 @@ export class Accounts {
 		return [...new Set(models)].sort();
 	}
 	async addKey(input: WireObject, signal: AbortSignal): Promise<Account> {
-		const provider =
-			input.provider === "openai"
-				? "openai-api"
-				: input.provider === undefined || ["", "claude", "anthropic"].includes(String(input.provider))
-					? "claude-api"
-					: undefined;
-		if (!provider) throw new HttpError(400, "API keys are supported for Anthropic or OpenAI");
+		const id = input.provider === undefined ? "anthropic" : text(input.provider)?.trim().toLowerCase();
+		if (id === undefined) throw new HttpError(400, "provider must be an OMP provider ID");
+		const { native, record: provider } = accountProvider(id, "api-key");
+		const upstream = provider === "codex" ? undefined : brokerProvider(native);
+		if (!upstream?.key) throw new HttpError(400, unsupportedEnrollment(id, "api-key"));
 		const name = normalizeName(input.name);
-		const key = typeof input.key === "string" ? input.key.trim() : "";
+		let key = text(input.key)?.trim() ?? "";
 		if (!key) throw new HttpError(400, "name and key are required");
 		const record: AccountRecord = {
 			id: `${provider}-key-${name}`,
@@ -385,10 +388,24 @@ export class Accounts {
 			createdAt: new Date().toISOString(),
 		};
 		this.duplicate(record, key);
-		record.models = await this.listModels(record, key, signal);
+		if (upstream.key.kind === "legacy") record.models = await this.listModels(record, key, signal);
+		else {
+			try {
+				const validated = await validateProviderKey(upstream, upstream.key, key, signal);
+				key = validated.key;
+				record.models = validated.ids;
+			} catch {
+				signal.throwIfAborted();
+				throw new HttpError(
+					400,
+					"Provider did not verify this key for chat. Check the key, access, and provider availability.",
+				);
+			}
+		}
 		return this.locked(async () => {
+			signal.throwIfAborted();
 			this.duplicate(record, key);
-			const account = await this.register(record, { type: "api_key", key, source: "login" });
+			const account = await this.register(record, { type: "api_key", key });
 			await this.save();
 			return account;
 		});

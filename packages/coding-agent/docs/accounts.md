@@ -20,7 +20,7 @@ With no accounts configured, the extension registers no providers. Open `/accoun
 
 ## Adding accounts
 
-Run `/accounts add` and choose `Claude account` or `ChatGPT account`. The next menu lists the available login methods. Choose by how you pay for the models:
+Run `/accounts add`. Choose `Claude account`, `ChatGPT account`, or `Other providers` to browse additional methods advertised by the installed broker. `/accounts add <provider-id> [api-key|oauth]` opens a provider directly. The list reflects OMP methods that Credne can actually enroll and route; it is not the full upstream OMP catalog. Choose by how you pay for the models:
 
 | Account | Way | What you do |
 | --- | --- | --- |
@@ -57,7 +57,9 @@ This needs no second login, bridge model or shared credentials. If you prefer a 
 
 ## Accounts and providers
 
-Each account appears as a provider named `acct:<id>`. For example, `--model acct:claude-api-work/claude-sonnet-4-5` starts a session on one account when that provider and model are registered. Accounts also appear in `/model`, where choosing one saves it as the default for new sessions.
+In Credne, `/model` normally shows the model rather than one copy per account. A bare model ID, or a recognized model-family alias such as `sonnet`, selects the available model and saves its routed ID, not the account that happens to answer. When unrelated providers use the same ID and the broker cannot establish that they are the same model, choose the provider pool explicitly.
+
+To choose the payer instead of using pooled routing, use `/accounts switch` or an explicit `acct:<id>/<model>` selection. For example, `--model acct:claude-api-work/claude-sonnet-4-5` pins the session when that account and model are registered. A deliberate account restriction is never widened to the global pool by an alias.
 
 The accounts list shows each account with its state and model count:
 
@@ -82,7 +84,9 @@ A pool is a provider that lets the broker route each request to an enabled accou
 
 A pool exists as soon as one enabled account belongs to its family, so `pool:claude` is listed even with a single Claude account. Pool models are the union of the models of its accounts. When a model is listed by more than one account, a request for it can be served by any of them.
 
-For Claude models, `pool:claude` and `pool:all` try eligible Claude subscriptions before API-key accounts. The broker balances eligible accounts and, when session affinity is enabled, prefers the account already serving the conversation within that billing group. If no eligible subscription is available, or the broker can retry a failed subscription request, the pool can fall back to an eligible API key and incur API charges. Use a pinned subscription if requests must stay on subscription billing. The footer shows which account served the last request.
+Pools try eligible subscription accounts before ordinary API keys. For example, if a ChatGPT subscription and an OpenAI API key both offer the selected GPT model, `pool:all` uses the subscription first. When the subscription is rate-limited, the pool can use the key and incur API charges. Once the subscription is eligible again, it takes priority even if the key served the previous turn. Claude subscriptions and Anthropic API keys follow the same rule. The configured routing strategy and session affinity choose between accounts within each group.
+
+Priority does not change the model or override a deliberate billing choice: `pool:openai` uses OpenAI API keys, and a pinned account never switches to a sibling. Pin a subscription if you want an error rather than API-key fallback. The footer shows which account served the last chat request.
 
 ## Pinned accounts
 

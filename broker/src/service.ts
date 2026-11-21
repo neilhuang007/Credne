@@ -6,6 +6,7 @@ import { Accounts, atomicJson, boundedText, HttpError, publicAccount, publicMode
 import { decisionsError } from "./decisions.ts";
 import { Gateway, protocolError } from "./gateway.ts";
 import { Logins } from "./logins.ts";
+import { publicProviders } from "./providers.ts";
 import { fetchAccountUsage } from "./usage.ts";
 import { object, text } from "./wire.ts";
 
@@ -208,7 +209,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 				) {
 					const stateParam = url.searchParams.get("state");
 					for (const login of loginApi.pending.values()) {
-						if (!login.url || login.status !== "wait") continue;
+						if (login.flow !== "browser" || !login.url || login.status !== "wait") continue;
 						const authorize = new URL(login.url);
 						if (!stateParam || authorize.searchParams.get("state") !== stateParam) continue;
 						const redirect = authorize.searchParams.get("redirect_uri");
@@ -246,7 +247,9 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 					else if (request.method === "POST" && path === "/shutdown") {
 						setTimeout(() => void close(), 10);
 						response = Response.json({ ok: true });
-					} else if (request.method === "GET" && path === "/accounts")
+					} else if (request.method === "GET" && path === "/providers")
+						response = Response.json({ providers: publicProviders() });
+					else if (request.method === "GET" && path === "/accounts")
 						response = Response.json({
 							accounts: [...store.accounts.values()]
 								.map(publicAccount)

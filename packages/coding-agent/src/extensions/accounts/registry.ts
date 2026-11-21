@@ -1,16 +1,26 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { getBuiltinClassifierModel, getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { getBuiltinClassifierModel, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
-import { type AccountCatalog, buildCatalog, readCatalog, writeCatalog } from "./catalog.ts";
+import {
+	type AccountCatalog,
+	ALL_POOL,
+	buildCatalog,
+	familyOf,
+	readCatalog,
+	sharedRouteFamily,
+	writeCatalog,
+} from "./catalog.ts";
 import type { BrokerAccount, BrokerClient } from "./client.ts";
 import { type AccountProviderSpec, createAccountProvider, providerSpecs, type ServedByListener } from "./provider.ts";
 
-const catalogSources = {
-	anthropic: getBuiltinModels("anthropic"),
-	"openai-codex": getBuiltinModels("openai-codex"),
-	openai: getBuiltinModels("openai"),
-};
+const catalogSources = new Map<string, ReadonlyMap<string, Model<Api>>>(
+	getBuiltinProviders().map((provider) => [
+		provider,
+		new Map(getBuiltinModels(provider).map((model) => [model.id, model])),
+	]),
+);
 
 /** Registers broker accounts and pools from the cached catalog before contacting the daemon. */
 export class AccountRegistry {
@@ -38,6 +48,21 @@ export class AccountRegistry {
 		return this.specs.find((spec) => spec.id === id);
 	}
 
+	/** The upstream model family of an advertised account or pool model, independent of its route scope. */
+	modelRouteFamily(providerId: string, modelId: string): string | undefined {
+		const spec = this.provider(providerId);
+		if (!spec?.models.some((model) => model.id === modelId)) return undefined;
+		const { target } = spec;
+		const account = this.catalog.accounts.find((account) =>
+			target.type === "account"
+				? account.key === target.key
+				: !account.disabled &&
+					(target.name === ALL_POOL || familyOf(account.provider) === target.name) &&
+					account.models.some((model) => model.id === modelId),
+		);
+		return account && sharedRouteFamily(familyOf(account.provider));
+	}
+
 	/** The pinned-account provider whose broker key is `key`. */
 	accountByKey(key: string): AccountProviderSpec | undefined {
 		return this.specs.find((spec) => spec.target.type === "account" && spec.target.key === key);
@@ -58,7 +83,7 @@ export class AccountRegistry {
 			this.catalog = buildCatalog(
 				accounts,
 				accountModels,
-				(provider, id) => catalogSources[provider].find((model) => model.id === id),
+				(provider, id) => catalogSources.get(provider)?.get(id),
 				() => getBuiltinClassifierModel("openai", "gpt-6-luna"),
 			);
 			writeCatalog(this.catalogPath, this.catalog);

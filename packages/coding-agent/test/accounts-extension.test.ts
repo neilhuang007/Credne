@@ -4,7 +4,13 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AssistantMessage, type ClassifierContext, createModels, type Model } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	type AssistantMessage,
+	type ClassifierContext,
+	createModels,
+	type Model,
+} from "@earendil-works/pi-ai";
 import { REASONING_SUMMARY_LABEL } from "@earendil-works/pi-ai/api/transform-messages";
 import { getBuiltinClassifierModel } from "@earendil-works/pi-ai/providers/all";
 import { TuiMainScreen } from "@earendil-works/pi-tui";
@@ -21,7 +27,12 @@ import {
 	readCatalog,
 	writeCatalog,
 } from "../src/extensions/accounts/catalog.ts";
-import { type BrokerAccount, BrokerClient, type BrokerModel } from "../src/extensions/accounts/client.ts";
+import {
+	type BrokerAccount,
+	BrokerClient,
+	type BrokerModel,
+	type BrokerProvider,
+} from "../src/extensions/accounts/client.ts";
 import accountsExtension from "../src/extensions/accounts/index.ts";
 import { type AccountProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
@@ -79,6 +90,11 @@ const claudeModel: BrokerModel = {
 const codexModel: BrokerModel = { id: "gpt-test", thinking: true, inputModalities: ["text", "image"] };
 const openaiKey = account({ id: "openai-api-key-luna", provider: "openai-api", kind: "api-key", label: "luna" });
 const lunaModel: BrokerModel = { id: "gpt-6-luna", thinking: false, inputModalities: ["text", "image"] };
+const familiarProviders: BrokerProvider[] = [
+	{ id: "anthropic", name: "Anthropic", authMethods: ["api-key", "oauth"] },
+	{ id: "openai", name: "OpenAI", authMethods: ["api-key"] },
+	{ id: "openai-codex", name: "ChatGPT Codex", authMethods: ["oauth"] },
+];
 /** Pi's built-in Decisions classifier, which accounts take their cost and limits from. */
 const builtinLuna = getBuiltinClassifierModel("openai", "gpt-6-luna");
 const lookupClassifier = (provider: string, id: string) =>
@@ -263,6 +279,7 @@ async function startFakeBroker(
 			response.end(JSON.stringify(value));
 		};
 		if (path === "/credne/v1/health") return json({ ok: true, backend: "oh-my-pi" });
+		if (path === "/credne/v1/providers") return json({ providers: familiarProviders });
 		if (path === "/credne/v1/accounts") return json({ accounts: [claudeA, claudeB, codexC, { id: 7 }] });
 		if (path.endsWith("/models")) {
 			return json({ models: [path.includes(codexC.key) ? codexModel : claudeModel, { name: "no id" }] });
@@ -352,6 +369,128 @@ describe("account catalog", () => {
 			compat: { supportsStrictTools: true, supportsMessageThreads: false },
 		});
 		expect(catalog.accounts[0]!.models[0]!.compat).not.toHaveProperty("supportsMidConvoSystemMessages");
+	});
+
+	it("omits incompatible exact IDs from the global pool without losing family and pinned models", () => {
+		const thirdParty = account({ id: "openrouter-a", provider: "openrouter" });
+		const directModel = { ...codexModel, id: "direct-model", displayName: "Same label" };
+		const routedModel = { ...codexModel, id: "routed-model", displayName: "Same label" };
+		const models = new Map([
+			[claudeA.key, [claudeModel]],
+			[codexC.key, [codexModel, directModel]],
+			[thirdParty.key, [codexModel, routedModel]],
+		]);
+		const catalog = buildCatalog([claudeA, codexC, thirdParty], models, () => undefined);
+		const byProvider = new Map(providerSpecs(catalog).map((spec) => [spec.id, spec.models.map((model) => model.id)]));
+		expect(byProvider.get("pool:all")).toEqual([claudeModel.id, directModel.id, routedModel.id]);
+		expect(byProvider.get("pool:codex")).toEqual([codexModel.id, directModel.id]);
+		expect(byProvider.get("pool:openrouter")).toEqual([codexModel.id, routedModel.id]);
+		expect(byProvider.get(ACCT_C)).toEqual([codexModel.id, directModel.id]);
+		expect(byProvider.get(`acct:${thirdParty.id}`)).toEqual([codexModel.id, routedModel.id]);
+
+		const disabled = buildCatalog([codexC, { ...thirdParty, disabled: true }], models, () => undefined);
+		expect(disabled.pools.find((entry) => entry.name === "all")?.models.map((model) => model.id)).toEqual([
+			codexModel.id,
+			directModel.id,
+		]);
+		const path = join(tempDir(), "catalog.json");
+		writeCatalog(path, catalog);
+		expect(readCatalog(path)).toEqual(catalog);
+	});
+
+	it.each([
+		{ name: "OpenAI", subscription: codexC, apiKey: openaiKey, api: "openai-responses" },
+		{
+			name: "xAI",
+			subscription: account({ id: "grok-sub", provider: "xai-oauth" }),
+			apiKey: account({ id: "grok-key", provider: "xai", kind: "api-key" }),
+			api: "openai-completions",
+		},
+	])("merges compatible routes for $name into a global model with shared limits", ({ subscription, apiKey, api }) => {
+		const premium: BrokerModel = {
+			id: "shared",
+			kind: "chat",
+			thinking: true,
+			thinkingLevels: ["low", "high", "xhigh"],
+			contextLength: 200_000,
+			maxCompletionTokens: 30_000,
+			inputModalities: ["text", "image"],
+		};
+		const base: BrokerModel = {
+			...premium,
+			thinkingLevels: ["low", "high"],
+			contextLength: 128_000,
+			maxCompletionTokens: 20_000,
+			inputModalities: ["text"],
+		};
+		const models = new Map([
+			[subscription.key, [premium]],
+			[apiKey.key, [base]],
+		]);
+		const catalog = buildCatalog([subscription, apiKey], models, () => undefined);
+		expect(catalog.pools.find((pool) => pool.name === "all")?.models).toEqual([
+			expect.objectContaining({
+				id: "shared",
+				api,
+				contextWindow: 128_000,
+				maxTokens: 20_000,
+				thinkingLevelMap: expect.objectContaining({ low: "low", high: "high", xhigh: null }),
+				input: ["text"],
+			}),
+		]);
+		expect(catalog.accounts[0]?.models[0]).toMatchObject({
+			contextWindow: 200_000,
+			maxTokens: 30_000,
+			thinkingLevelMap: { xhigh: "xhigh" },
+			input: ["text", "image"],
+		});
+	});
+
+	it("uses the exact source provider for Pi metadata, with broker metadata for new models", () => {
+		const grok = account({ id: "grok-work", provider: "xai" });
+		const cost = { input: 1, output: 5, cacheRead: 0.25, cacheWrite: 1 };
+		const known: Model<"openai-completions"> = {
+			id: "shared",
+			name: "Known Grok",
+			api: "openai-completions",
+			provider: "xai",
+			baseUrl: "https://test.example",
+			reasoning: false,
+			input: ["text"],
+			contextWindow: 50_000,
+			maxTokens: 4_000,
+			cost,
+			promptCache: { short: 300 },
+		};
+		const catalog = buildCatalog(
+			[grok],
+			new Map([
+				[
+					grok.key,
+					[
+						{ id: known.id, thinking: false },
+						{
+							id: "new",
+							displayName: "New Grok",
+							thinking: false,
+							contextLength: 96_000,
+							maxCompletionTokens: 8_000,
+							cost,
+						},
+					],
+				],
+			]),
+			(provider, id) => (provider === "xai" && id === known.id ? known : undefined),
+		);
+		expect(catalog.accounts[0]?.models).toEqual([
+			expect.objectContaining({
+				name: known.name,
+				contextWindow: known.contextWindow,
+				cost,
+				promptCache: { short: 300 },
+			}),
+			expect.objectContaining({ name: "New Grok", contextWindow: 96_000, maxTokens: 8_000, cost }),
+		]);
 	});
 
 	it("round-trips through the catalog file and ignores unreadable files", () => {
@@ -618,6 +757,67 @@ describe("broker client", () => {
 		expect(await client.connectExisting()).toMatchObject({ url: broker.url, token: TOKEN });
 		expect((await client.listAccounts()).map((entry) => entry.id)).toEqual([claudeA.id, claudeB.id, codexC.id]);
 		expect(await client.accountModels(claudeA.key)).toEqual([claudeModel]);
+	});
+
+	it("discovers only supported auth methods using the loopback broker token", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path === "/credne/v1/providers"
+					? {
+							status: 200,
+							body: {
+								providers: [
+									{
+										id: "custom",
+										name: "Custom",
+										authMethods: ["api-key", "oauth", "oauth", "external"],
+										secret: "hidden",
+									},
+									{ id: "external", name: "External only", authMethods: ["external"] },
+									{ id: "invalid", name: 1, authMethods: ["oauth"] },
+								],
+							},
+						}
+					: undefined,
+		});
+		expect(await clientFor(broker.home).listProviders()).toEqual([
+			{ id: "custom", name: "Custom", authMethods: ["api-key", "oauth"] },
+		]);
+		expect(broker.requests).toContainEqual(
+			expect.objectContaining({
+				method: "GET",
+				path: "/credne/v1/providers",
+				headers: expect.objectContaining({ authorization: `Bearer ${TOKEN}` }),
+			}),
+		);
+	});
+
+	it("preserves broker chat identification and cost rates from /models", async () => {
+		const cost = { input: 1, output: 5, cacheRead: 0.25, cacheWrite: 1 };
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path.endsWith("/models")
+					? {
+							status: 200,
+							body: {
+								models: [
+									{
+										id: "new",
+										kind: "chat",
+										thinking: true,
+										thinkingLevels: ["low", "high"],
+										cost: { ...cost, secret: "hidden" },
+									},
+									{ id: "not-chat", kind: "image", cost: { ...cost, output: -1 } },
+								],
+							},
+						}
+					: undefined,
+		});
+		expect(await clientFor(broker.home).accountModels(openaiKey.key)).toEqual([
+			{ id: "new", kind: "chat", thinking: true, thinkingLevels: ["low", "high"], cost },
+			{ id: "not-chat", thinking: false },
+		]);
 	});
 
 	it("parses normalized quota windows and credits without forwarding unknown provider fields", async () => {
@@ -968,9 +1168,22 @@ describe("account providers", () => {
 	});
 });
 
-describe("account add flow", () => {
+describe("account command flows", () => {
 	const claudeLabels = ["Subscription (Pro, Max, Team sign-in)", "API key (Anthropic Console key)"];
-	const addArguments = ["claude", "claude-subscription", "claude-api-key", "chatgpt", "openai-api-key", "codex"];
+	const addArguments = [
+		"claude",
+		"claude-subscription",
+		"claude-api-key",
+		"chatgpt",
+		"openai-api-key",
+		"codex",
+		"other",
+	];
+	const discoveryPaths = ["/credne/v1/health", "/credne/v1/providers"];
+	const deviceProvider: BrokerProvider = { id: "xai-oauth", name: "SuperGrok", authMethods: ["oauth"] };
+	const deviceAccount = account({ id: "xai-oauth-work", provider: "xai-oauth", label: "work" });
+	const deviceUrl = "https://auth.example/device";
+	const deviceInstructions = "Enter WXYZ at the verification page.";
 
 	beforeEach(() => {
 		vi.mocked(openBrowser).mockClear();
@@ -992,11 +1205,20 @@ describe("account add flow", () => {
 		};
 	}
 
-	function loadAccountsExtension(agentDir: string) {
+	function deviceRoutes(status: unknown): FakeBrokerOptions["respond"] {
+		return (request) => {
+			if (request.method === "POST" && request.path === "/credne/v1/logins") {
+				return {
+					status: 200,
+					body: { state: "login-1", flow: "device", url: deviceUrl, instructions: deviceInstructions },
+				};
+			}
+			return request.path === "/credne/v1/logins/login-1" ? { status: 200, body: status } : undefined;
+		};
+	}
+
+	function loadAccountsExtension(agentDir: string, runtime = createExtensionRuntime()) {
 		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
-		const runtime = createExtensionRuntime();
-		// A default provider is configured, so adding an account does not switch the session's model.
-		runtime.getSettings = () => ({ defaultProvider: "anthropic" });
 		return loadExtensionFromFactory(accountsExtension, process.cwd(), createEventBus(), runtime, "builtin:accounts");
 	}
 
@@ -1007,13 +1229,27 @@ describe("account add flow", () => {
 		answers?: string[];
 		confirm?: (title: string, warning: string) => boolean;
 		respond?: FakeBrokerOptions["respond"];
+		providers?: BrokerProvider[];
+		withoutDefault?: boolean;
+		model?: Model<Api>;
+		available?: Model<Api>[];
 	}
 
 	/** Runs `/accounts <args>` through the registered command against a fake broker and a scripted UI. */
 	async function runAccount(args: string, script: AddScript = {}) {
 		const agentDir = tempDir();
-		const broker = await startFakeBroker({ home: join(agentDir, "accounts"), respond: script.respond });
-		const extension = await loadAccountsExtension(agentDir);
+		const broker = await startFakeBroker({
+			home: join(agentDir, "accounts"),
+			respond: (request) =>
+				request.path === "/credne/v1/providers" && script.providers
+					? { status: 200, body: { providers: script.providers } }
+					: script.respond?.(request),
+		});
+		const runtime = createExtensionRuntime();
+		const setModel = vi.fn(async () => true);
+		runtime.setModel = setModel;
+		runtime.getSettings = () => ({ defaultProvider: script.withoutDefault ? undefined : "anthropic" });
+		const extension = await loadAccountsExtension(agentDir, runtime);
 		const menus: { title: string; options: string[] }[] = [];
 		const inputs: string[] = [];
 		const notifications: { message: string; type?: string }[] = [];
@@ -1021,13 +1257,21 @@ describe("account add flow", () => {
 		const answers = [...(script.answers ?? [])];
 		const ctx = {
 			hasUI: true,
-			model: undefined,
-			modelRegistry: { find: () => undefined, refresh: async () => {} },
+			model: script.model,
+			modelRegistry: {
+				find: () => undefined,
+				refresh: async () => {},
+				getAll: () => script.available ?? providerSpecs(testCatalog()).flatMap((entry) => entry.models),
+			},
 			ui: {
 				confirm: async (title: string, warning: string) => script.confirm?.(title, warning) ?? false,
-				select: async (title: string, options: string[]) => {
+				select: async (title: string, options: string[], opts?: { signal?: AbortSignal }) => {
 					menus.push({ title, options });
-					return choices.shift();
+					const signal = opts?.signal;
+					if (!signal || choices.length > 0) return choices.shift();
+					return new Promise<string | undefined>((resolve) =>
+						signal.addEventListener("abort", () => resolve(undefined), { once: true }),
+					);
 				},
 				input: (title: string, _placeholder?: string, opts?: { signal?: AbortSignal }) => {
 					inputs.push(title);
@@ -1043,7 +1287,7 @@ describe("account add flow", () => {
 			},
 		};
 		await extension.commands.get("accounts")!.handler(args, ctx as never);
-		return { menus, inputs, notifications, requests: broker.requests };
+		return { menus, inputs, notifications, requests: broker.requests, setModel };
 	}
 
 	function loginRequest(requests: RecordedRequest[]): { provider: string; name?: string } | undefined {
@@ -1061,7 +1305,7 @@ describe("account add flow", () => {
 			{ title: "Add account", options: ["Claude account", "ChatGPT account"] },
 		]);
 		expect(notifications).toEqual([]);
-		expect(requests).toEqual([]);
+		expect(requests.map((request) => request.path)).toEqual(discoveryPaths);
 	});
 
 	it("adds an API key chosen in the Claude menu", async () => {
@@ -1075,7 +1319,7 @@ describe("account add flow", () => {
 		expect(inputs).toEqual(["Name for this API key", "Anthropic API key (visible while typing)"]);
 		const added = requests.find((request) => request.path === "/credne/v1/api-keys")!;
 		expect(added.method).toBe("POST");
-		expect(JSON.parse(added.body)).toEqual({ provider: "claude", name: "work", key: "sk-ant-api03-test" });
+		expect(JSON.parse(added.body)).toEqual({ provider: "anthropic", name: "work", key: "sk-ant-api03-test" });
 		expect(notifications).toEqual([{ message: expect.stringContaining("Added Claude · a (API key)"), type: "info" }]);
 	});
 
@@ -1091,7 +1335,7 @@ describe("account add flow", () => {
 				options: ["API key (OpenAI API credits)", "Subscription (ChatGPT sign-in through Codex)"],
 			},
 		]);
-		expect(loginRequest(requests)?.provider).toBe("codex");
+		expect(loginRequest(requests)?.provider).toBe("openai-codex");
 		expect(inputs).toEqual(["Waiting for ChatGPT Codex sign-in"]);
 		expect(openBrowser).toHaveBeenCalledWith("https://auth.example/start");
 		expect(notifications.map((entry) => entry.message)).toEqual([
@@ -1105,13 +1349,13 @@ describe("account add flow", () => {
 			respond: loginRoutes({ status: "ok", account: codexC }),
 		});
 		expect(menus).toEqual([]);
-		expect(loginRequest(requests)?.provider).toBe("codex");
+		expect(loginRequest(requests)?.provider).toBe("openai-codex");
 	});
 
 	it("/accounts add claude opens the Claude menu directly", async () => {
 		const { menus, requests } = await runAccount("add claude", { choices: [undefined] });
 		expect(menus).toEqual([{ title: "Add Claude account", options: claudeLabels }]);
-		expect(requests).toEqual([]);
+		expect(requests.map((request) => request.path)).toEqual(discoveryPaths);
 	});
 
 	it.each(["no warning", "warning accepted", "warning declined"])(
@@ -1127,7 +1371,7 @@ describe("account add flow", () => {
 				respond: loginRoutes({ status: "ok", account: claudeB }, outcome === "no warning" ? undefined : warning),
 			});
 			expect(menus).toEqual([]);
-			expect(loginRequest(requests)).toEqual({ provider: "claude" });
+			expect(loginRequest(requests)).toEqual({ provider: "anthropic" });
 			if (outcome === "no warning") expect(confirm).not.toHaveBeenCalled();
 			else expect(confirm).toHaveBeenCalledExactlyOnceWith("Acknowledge subscription sign-in risk?", warning);
 
@@ -1157,6 +1401,128 @@ describe("account add flow", () => {
 		},
 	);
 
+	it("enrolls the exact other provider chosen from the broker catalog", async () => {
+		const custom = account({ id: "custom-two-work", provider: "custom-two", kind: "api-key", label: "work" });
+		const { menus, inputs, notifications, requests } = await runAccount("add", {
+			providers: [
+				...familiarProviders,
+				{ id: "custom-one", name: "Custom", authMethods: ["oauth"] },
+				{ id: "custom-two", name: "Custom", authMethods: ["api-key", "oauth"] },
+			],
+			choices: ["Other providers", "Custom (custom-two)", "API key"],
+			answers: ["work", "test-key"],
+			respond: (request) =>
+				request.path === "/credne/v1/api-keys" ? { status: 200, body: { account: custom } } : undefined,
+		});
+		expect(menus).toEqual([
+			{ title: "Add account", options: ["Claude account", "ChatGPT account", "Other providers"] },
+			{ title: "Other providers", options: ["Custom (custom-one)", "Custom (custom-two)"] },
+			{ title: "Add Custom (custom-two)", options: ["API key", "Sign in (OAuth)"] },
+		]);
+		expect(inputs).toEqual([
+			"Name for this API key",
+			"Custom API key (visible while typing; validation may incur a charge)",
+		]);
+		expect(JSON.parse(requests.find((request) => request.path === "/credne/v1/api-keys")!.body)).toEqual({
+			provider: "custom-two",
+			name: "work",
+			key: "test-key",
+		});
+		expect(loginRequest(requests)).toBeUndefined();
+		expect(notifications).toEqual([{ message: expect.stringContaining("Added Custom-two · work"), type: "info" }]);
+	});
+
+	it("offers only broker-enabled familiar methods and never prompts for an unavailable one", async () => {
+		const providers: BrokerProvider[] = [{ id: "anthropic", name: "Anthropic", authMethods: ["api-key"] }];
+		const menu = await runAccount("add", { providers, choices: ["Claude account"] });
+		expect(menu.menus).toEqual([{ title: "Add account", options: ["Claude account"] }]);
+		expect(menu.inputs).toEqual(["Name for this API key"]);
+		const unavailable = await runAccount("add claude-subscription", { providers });
+		expect(unavailable.inputs).toEqual([]);
+		expect(unavailable.requests.map((request) => request.path)).toEqual(discoveryPaths);
+		expect(unavailable.notifications).toContainEqual({
+			message: expect.stringContaining("does not offer"),
+			type: "warning",
+		});
+	});
+
+	it("shows no enrollment options when the broker has none", async () => {
+		const { menus, inputs, notifications, requests } = await runAccount("add", { providers: [] });
+		expect(menus).toEqual([]);
+		expect(inputs).toEqual([]);
+		expect(requests.map((request) => request.path)).toEqual(discoveryPaths);
+		expect(notifications).toEqual([
+			{ message: expect.stringContaining("does not offer any enrollment methods"), type: "warning" },
+		]);
+	});
+
+	it("uses an exact provider and method for device sign-in, with no redirect input", async () => {
+		const { menus, inputs, notifications, requests } = await runAccount("add xai-oauth oauth", {
+			providers: [deviceProvider],
+			respond: deviceRoutes({ status: "ok", account: deviceAccount }),
+		});
+		expect(menus).toEqual([{ title: "Waiting for SuperGrok sign-in", options: ["Cancel sign-in"] }]);
+		expect(inputs).toEqual([]);
+		expect(loginRequest(requests)).toEqual({ provider: "xai-oauth" });
+		expect(requests.some((request) => request.path.endsWith("/callback"))).toBe(false);
+		expect(openBrowser).toHaveBeenCalledExactlyOnceWith(deviceUrl);
+		expect(notifications.map((entry) => entry.message)).toEqual([
+			expect.stringContaining(`${deviceUrl}\n${deviceInstructions}`),
+			expect.stringContaining("Added Xai-oauth"),
+		]);
+	});
+
+	it("cancels a device flow without supplying any text or callback", async () => {
+		const { inputs, notifications, requests } = await runAccount("add xai-oauth", {
+			providers: [deviceProvider],
+			choices: ["Cancel sign-in"],
+			respond: deviceRoutes({ status: "wait" }),
+		});
+		expect(inputs).toEqual([]);
+		expect(requests.some((request) => request.path.endsWith("/callback"))).toBe(false);
+		expect(requests.at(-1)).toMatchObject({ method: "DELETE", path: "/credne/v1/logins/login-1" });
+		expect(notifications.at(-1)).toEqual({ message: "Sign-in cancelled.", type: "warning" });
+	});
+
+	it("does not replace a selected session model when enrolling an account with no default configured", async () => {
+		const { notifications, setModel } = await runAccount("add codex", {
+			respond: loginRoutes({ status: "ok", account: codexC }),
+			withoutDefault: true,
+			model: spec(ACCT_B).models[0],
+		});
+		expect(notifications).toContainEqual({ message: expect.stringContaining("Added ChatGPT Codex"), type: "info" });
+		expect(setModel).not.toHaveBeenCalled();
+	});
+
+	it("requires an explicit model choice when switching between unrelated accounts with the same model ID", async () => {
+		const xai = account({ id: "xai-work", provider: "xai", label: "work" });
+		const other = account({ id: "other-work", provider: "other", label: "work" });
+		const shared = { id: "shared", thinking: false };
+		const distinct = { id: "distinct", thinking: false };
+		const models = new Map([
+			[xai.key, [shared]],
+			[other.key, [shared, distinct]],
+		]);
+		const catalog = buildCatalog([xai, other], models, () => undefined);
+		const available = providerSpecs(catalog).flatMap((entry) => entry.models);
+		const { menus, setModel } = await runAccount("switch acct:other-work", {
+			model: available.find((model) => model.provider === "acct:xai-work"),
+			available,
+			choices: ["distinct"],
+			respond: (request) => {
+				if (request.path === "/credne/v1/accounts") return { status: 200, body: { accounts: [xai, other] } };
+				const key = request.path.split("/").at(-2) ?? "";
+				if (request.path.endsWith("/models")) return { status: 200, body: { models: models.get(key) } };
+				return undefined;
+			},
+		});
+		expect(menus).toEqual([{ title: "Model on Other · work (subscription)", options: ["shared", "distinct"] }]);
+		expect(setModel).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ id: "distinct", provider: "acct:other-work" }),
+			{ persist: true },
+		);
+	});
+
 	it("explains that Console credits are unsupported without starting the broker", async () => {
 		const { menus, inputs, notifications, requests } = await runAccount("add claude-api-credits");
 		expect(menus).toEqual([]);
@@ -1167,12 +1533,12 @@ describe("account add flow", () => {
 		]);
 	});
 
-	it("warns with the valid arguments instead of passing an unknown one to the broker", async () => {
+	it("warns about an unknown provider without sending an enrollment request", async () => {
 		const { menus, notifications, requests } = await runAccount("add gemini");
 		expect(menus).toEqual([]);
-		expect(requests).toEqual([]);
+		expect(requests.map((request) => request.path)).toEqual(discoveryPaths);
 		expect(notifications).toEqual([
-			{ message: `Unknown account type "gemini". Use one of: ${addArguments.join(", ")}.`, type: "warning" },
+			{ message: expect.stringContaining('Unknown account type "gemini".'), type: "warning" },
 		]);
 	});
 

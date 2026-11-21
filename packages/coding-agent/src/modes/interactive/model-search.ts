@@ -1,3 +1,25 @@
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { fuzzyFilter } from "@earendil-works/pi-tui";
+import { USES_BROKER_AUTH } from "../../config.ts";
+import { getExactModelSelectionMatches } from "../../core/model-resolver.ts";
+
+/** Rank exact IDs and served aliases above fuzzy search results without dropping ambiguous routes. */
+export function filterModelSelection<T>(
+	items: T[],
+	query: string,
+	getModel: (item: T) => Model<Api>,
+	getSearchText: (item: T) => string,
+): T[] {
+	const filtered = fuzzyFilter(items, query, getSearchText);
+	if (!USES_BROKER_AUTH) return filtered;
+	const matches = new Set(getExactModelSelectionMatches(query, items.map(getModel), "scoped"));
+	if (matches.size === 0) return filtered;
+	return [
+		...items.filter((item) => matches.has(getModel(item))),
+		...filtered.filter((item) => !matches.has(getModel(item))),
+	];
+}
+
 export interface ModelSearchItem {
 	id: string;
 	provider: string;

@@ -103,10 +103,11 @@ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.t
 import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
-	findExactModelReferenceMatch,
+	getExactModelSelectionMatches,
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
+import { getModelSelectionChoices } from "../../core/model-selection.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { compareProviders } from "../../core/preferred-providers.ts";
 import { PromptHistory } from "../../core/prompt-history.ts";
@@ -205,7 +206,7 @@ import { UserMessageSelectorComponent } from "./components/user-message-selector
 import { WarningGroupComponent } from "./components/warning-group.ts";
 import { editInExternalEditor } from "./external-editor.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
-import { getModelSearchText } from "./model-search.ts";
+import { filterModelSelection, getModelSearchText } from "./model-search.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
 import { SidePanelController } from "./side-panel-controller.ts";
@@ -794,23 +795,15 @@ export class InteractiveMode {
 				const models =
 					this.session.scopedModels.length > 0
 						? this.session.scopedModels.map((s) => s.model)
-						: this.session.modelRuntime.getAvailableSnapshot();
-
-				if (models.length === 0) return null;
-
-				// Create items with provider/id format
-				const items = models.map((m) => ({
-					id: m.id,
-					provider: m.provider,
-					name: m.name,
-					label: `${m.provider}/${m.id}`,
-				}));
-
-				return createFuzzyAutocompleteItems(items, prefix, getModelSearchText, (item) => ({
-					value: item.label,
-					label: item.id,
-					description: item.provider,
-				}));
+						: [...getModelSelectionChoices(this.session.modelRuntime.getAvailableSnapshot())];
+				const matches = filterModelSelection(models, prefix, (model) => model, getModelSearchText);
+				return matches.length > 0
+					? matches.map((model) => ({
+							value: `${model.provider}/${model.id}`,
+							label: model.id,
+							description: model.provider,
+						}))
+					: null;
 			};
 		}
 
@@ -5547,10 +5540,12 @@ export class InteractiveMode {
 			return;
 		}
 
+		const session = this.session;
 		const model = await this.findExactModelMatch(searchTerm);
+		if (this.session !== session) return;
 		if (model) {
 			try {
-				await this.session.setModel(model, { persist: true });
+				await session.setModel(model, { persist: true });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Model: ${model.id}`);
@@ -5565,12 +5560,18 @@ export class InteractiveMode {
 	}
 
 	private async findExactModelMatch(searchTerm: string): Promise<Model<any> | undefined> {
-		const cachedModels =
-			this.session.scopedModels.length > 0
-				? this.session.scopedModels.map((scoped) => scoped.model)
-				: [...this.session.modelRuntime.getAvailableSnapshot()];
-		const cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels);
-		if (cachedMatch || this.session.scopedModels.length > 0) return cachedMatch;
+		const session = this.session;
+		const findMatches = () =>
+			session.scopedModels.length > 0
+				? getExactModelSelectionMatches(
+						searchTerm,
+						session.scopedModels.map((scoped) => scoped.model),
+						"scoped",
+					)
+				: getExactModelSelectionMatches(searchTerm, session.modelRuntime.getAvailableSnapshot(), "all");
+		const cachedMatches = findMatches();
+		if (cachedMatches.length === 1) return cachedMatches[0];
+		if (session.scopedModels.length > 0 || (USES_BROKER_AUTH && cachedMatches.length > 1)) return undefined;
 
 		this.showStatus("Refreshing model catalogs…");
 		const controller = new AbortController();
@@ -5580,7 +5581,7 @@ export class InteractiveMode {
 			controller.abort();
 		}, 15_000);
 		try {
-			const result = await refreshModelCatalogs(this.session.modelRuntime, controller.signal);
+			const result = await refreshModelCatalogs(session.modelRuntime, controller.signal);
 			if (result.aborted && timedOut) {
 				this.showWarning("Model refresh timed out; searching cached models.");
 			} else if (result.errors.size > 0) {
@@ -5595,7 +5596,8 @@ export class InteractiveMode {
 		} finally {
 			clearTimeout(timeout);
 		}
-		return findExactModelReferenceMatch(searchTerm, [...this.session.modelRuntime.getAvailableSnapshot()]);
+		const refreshedMatches = findMatches();
+		return refreshedMatches.length === 1 ? refreshedMatches[0] : undefined;
 	}
 
 	/** Update the footer's available provider count from the current snapshot without refreshing catalogs. */

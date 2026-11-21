@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
+import type { ModelCostRates } from "@earendil-works/pi-ai";
 import { Agent, fetch as directFetch, type RequestInit, type Response } from "undici";
 
 /** Discovery record the broker writes to `<home>/broker.json` once it serves requests. */
@@ -11,7 +12,16 @@ export interface BrokerConnection {
 }
 
 /** How an account authenticates. `api-credits` is a retired kind that can appear in older catalogs. */
-export type BrokerAccountKind = "oauth" | "api-key" | "api-credits";
+export type BrokerAccountKind = BrokerAuthMethod | "api-credits";
+
+export type BrokerAuthMethod = "api-key" | "oauth";
+
+/** Enrollment methods the broker can complete for this upstream provider. */
+export interface BrokerProvider {
+	id: string;
+	name: string;
+	authMethods: BrokerAuthMethod[];
+}
 
 /** One account as the broker reports it. Never contains credentials. */
 export interface BrokerAccount {
@@ -56,19 +66,26 @@ export type BrokerUsage =
 /** A model an account or pool can serve, as reported by the broker. */
 export interface BrokerModel {
 	id: string;
+	/** The broker's bundled catalog confirms this is a chat model. */
+	kind?: "chat";
 	displayName?: string;
 	contextLength?: number;
 	maxCompletionTokens?: number;
 	thinking: boolean;
 	thinkingLevels?: string[];
 	inputModalities?: string[];
+	cost?: ModelCostRates;
 }
 
-export type BrokerLogin =
-	| { type: "browser"; state: string; url: string; userCode?: string }
-	| { type: "acknowledge-risk"; state: string; warning: string };
+export interface BrokerLoginAuthorization {
+	type: "browser" | "device";
+	state: string;
+	url: string;
+	userCode?: string;
+	instructions?: string;
+}
 
-export type BrokerLoginProvider = "claude" | "codex";
+export type BrokerLogin = BrokerLoginAuthorization | { type: "acknowledge-risk"; state: string; warning: string };
 
 export interface BrokerLoginStatus {
 	status: "wait" | "ok" | "error";
@@ -168,6 +185,10 @@ export class BrokerClient {
 		return `${connection.url}/credne/v1/route/${segment}`;
 	}
 
+	async listProviders(signal?: AbortSignal): Promise<BrokerProvider[]> {
+		return parseProviders(field(await this.request("GET", "/providers", undefined, signal), "providers"));
+	}
+
 	async listAccounts(signal?: AbortSignal): Promise<BrokerAccount[]> {
 		const data = await this.request("GET", "/accounts", undefined, signal);
 		return parseAccounts(field(data, "accounts"));
@@ -194,29 +215,30 @@ export class BrokerClient {
 	}
 
 	/** Add an API key on its official provider route after validating its model access. */
-	async addApiKey(
-		name: string,
-		key: string,
-		provider: "claude" | "openai" = "claude",
-	): Promise<BrokerAccount | undefined> {
+	async addApiKey(name: string, key: string, provider = "claude"): Promise<BrokerAccount | undefined> {
 		const account = field(await this.request("POST", "/api-keys", { provider, name, key }), "account");
 		return account === undefined ? undefined : parseAccounts([account])[0];
 	}
 
-	/** Start a subscription login; it may pause until the user accepts a provider warning. */
-	async startLogin(provider: BrokerLoginProvider): Promise<BrokerLogin> {
+	/** Start a broker login; it may pause until the user accepts a provider warning. */
+	async startLogin(provider: string): Promise<BrokerLogin> {
 		const data = await this.request("POST", "/logins", { provider });
 		const state = optionalString(data, "state");
 		if (!state) throw new BrokerError("Broker returned no login state");
 		const warning = optionalString(data, "riskWarning");
-		return warning ? { type: "acknowledge-risk", state, warning } : parseBrowserLogin(data, state);
+		try {
+			return warning ? { type: "acknowledge-risk", state, warning } : parseLoginAuthorization(data, state);
+		} catch (error) {
+			await this.cancelLogin(state).catch(() => {});
+			throw error;
+		}
 	}
 
 	/** Resume a pending login only after the user explicitly accepts the warning. */
-	async acknowledgeLoginRisk(state: string): Promise<Extract<BrokerLogin, { type: "browser" }>> {
+	async acknowledgeLoginRisk(state: string): Promise<BrokerLoginAuthorization> {
 		const data = await this.request("POST", `/logins/${encodeURIComponent(state)}/acknowledge`, { answer: "yes" });
 		if (field(data, "state") !== state) throw new BrokerError("Broker returned a mismatched login state");
-		return parseBrowserLogin(data, state);
+		return parseLoginAuthorization(data, state);
 	}
 
 	async loginStatus(state: string, signal?: AbortSignal): Promise<BrokerLoginStatus> {
@@ -439,10 +461,34 @@ function optionalStrings(data: unknown, name: string): string[] | undefined {
 	return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
 }
 
-function parseBrowserLogin(data: unknown, state: string): Extract<BrokerLogin, { type: "browser" }> {
+function parseLoginAuthorization(data: unknown, state: string): BrokerLoginAuthorization {
 	const url = optionalString(data, "url");
-	if (!url || optionalString(data, "riskWarning")) throw new BrokerError("Broker returned no login URL");
-	return { type: "browser", state, url, userCode: optionalString(data, "userCode") };
+	if (!url || URL.parse(url)?.protocol !== "https:" || optionalString(data, "riskWarning")) {
+		throw new BrokerError("Broker returned no valid login URL");
+	}
+	const flow = field(data, "flow");
+	if (flow !== undefined && flow !== "browser" && flow !== "device") {
+		throw new BrokerError("Broker returned an unknown login flow");
+	}
+	return {
+		type: flow ?? "browser",
+		state,
+		url,
+		userCode: optionalString(data, "userCode"),
+		instructions: optionalString(data, "instructions"),
+	};
+}
+
+function parseProviders(data: unknown): BrokerProvider[] {
+	if (!Array.isArray(data)) throw new BrokerError("Broker returned an invalid provider list");
+	return data.flatMap((entry): BrokerProvider[] => {
+		const id = optionalString(entry, "id");
+		const name = optionalString(entry, "name");
+		const authMethods = (optionalStrings(entry, "authMethods") ?? []).filter(
+			(method): method is BrokerAuthMethod => method === "api-key" || method === "oauth",
+		);
+		return id && name && authMethods.length > 0 ? [{ id, name, authMethods: [...new Set(authMethods)] }] : [];
+	});
 }
 
 function parseAccounts(data: unknown): BrokerAccount[] {
@@ -539,6 +585,16 @@ function parseKind(value: unknown): BrokerAccountKind {
 	return value === "api-key" || value === "api-credits" ? value : "oauth";
 }
 
+function parseModelCost(data: unknown): ModelCostRates | undefined {
+	const input = optionalNumber(data, "input");
+	const output = optionalNumber(data, "output");
+	const cacheRead = optionalNumber(data, "cacheRead");
+	const cacheWrite = optionalNumber(data, "cacheWrite");
+	if (input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined) return;
+	if (input < 0 || output < 0 || cacheRead < 0 || cacheWrite < 0) return;
+	return { input, output, cacheRead, cacheWrite };
+}
+
 function parseModels(data: unknown): BrokerModel[] {
 	if (!Array.isArray(data)) throw new BrokerError("Broker returned an invalid model list");
 	return data.flatMap((entry): BrokerModel[] => {
@@ -547,12 +603,14 @@ function parseModels(data: unknown): BrokerModel[] {
 		return [
 			{
 				id,
+				kind: field(entry, "kind") === "chat" ? "chat" : undefined,
 				displayName: optionalString(entry, "displayName"),
 				contextLength: optionalNumber(entry, "contextLength"),
 				maxCompletionTokens: optionalNumber(entry, "maxCompletionTokens"),
 				thinking: field(entry, "thinking") === true,
 				thinkingLevels: optionalStrings(entry, "thinkingLevels"),
 				inputModalities: optionalStrings(entry, "inputModalities"),
+				cost: parseModelCost(field(entry, "cost")),
 			},
 		];
 	});

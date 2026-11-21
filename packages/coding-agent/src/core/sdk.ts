@@ -265,7 +265,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// If still no model, use findInitialModel (checks settings default, then provider defaults)
 	if (!model) {
 		const result = await findInitialModel({
-			scopedModels: [],
+			scopedModels: USES_BROKER_AUTH ? (options.scopedModels ?? []) : [],
 			isContinuing: hasExistingSession,
 			defaultProvider: settingsManager.getDefaultProvider(),
 			defaultModelId: settingsManager.getDefaultModel(),
@@ -465,8 +465,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// This stream resolves auth through modelRuntime, so summaries must not pre-resolve it (#11520).
 	markRuntimeStreamFunction(agent.streamFunction, modelRuntime);
 
-	// Record selections for resume, including startup overrides and levels the current model clamps.
-	if (!hasExistingSession && model) {
+	// Record selections for resume, including an explicit Credne override of the branch selection.
+	const replacesBranchSelection =
+		USES_BROKER_AUTH &&
+		options.model &&
+		(model?.provider !== sessionModel?.provider || model?.id !== sessionModel?.modelId);
+	if (model && (!hasExistingSession || replacesBranchSelection)) {
 		sessionManager.appendModelChange(model.provider, model.id);
 	}
 	if (

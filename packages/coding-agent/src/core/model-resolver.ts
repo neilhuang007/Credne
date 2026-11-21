@@ -13,8 +13,12 @@ import {
 import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.ts";
+import { USES_BROKER_AUTH } from "../config.ts";
+import { isBrokerProvider } from "../extensions/accounts/catalog.ts";
+import { resolveModelAlias } from "../extensions/subagent/model-aliases.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
+import { GLOBAL_BROKER_PROVIDER, getAutomaticModelChoices, getModelSelectionChoices } from "./model-selection.ts";
 
 /** Default chat model IDs for providers with built-in chat models. */
 export const defaultModelPerProvider: Partial<Record<KnownProvider, string>> = {
@@ -68,6 +72,40 @@ export interface ScopedModel {
 	thinkingLevel?: ThinkingLevel;
 }
 
+type ModelSelectionScope = "all" | "scoped";
+
+/** Finds exact IDs and broker aliases for the model command and picker, without choosing between tied routes. */
+export function getExactModelSelectionMatches(
+	text: string,
+	models: readonly Model<Api>[],
+	scope: ModelSelectionScope,
+): readonly Model<Api>[] {
+	const result = resolveModelSelectionReference(
+		{ text, thinkingSuffix: "none", fuzzy: false },
+		models,
+		() => true,
+		scope,
+	);
+	if (result.status === "resolved") return [result.model];
+	return result.status === "ambiguous" ? result.candidates : [];
+}
+
+function resolveModelSelectionReference(
+	request: ModelReferenceRequest,
+	models: readonly Model<Api>[],
+	usable: (provider: string) => boolean,
+	scope: ModelSelectionScope,
+): ModelReferenceResult {
+	if (!USES_BROKER_AUTH) return resolveModelReference(request, models, usable);
+	const text = request.text.trim();
+	const named = splitProviderPrefix(text, models)?.provider;
+	const provider = request.provider ?? (named && isBrokerProvider(named) ? named : undefined);
+	// A broker qualifier outside the scope is not a bare model ID or a search on another route.
+	if (!provider && text.includes("/") && isBrokerProvider(text.toLowerCase())) return { status: "not-found" };
+	const choices = scope === "scoped" || provider ? models : getModelSelectionChoices(models);
+	return resolveModelReference({ ...request, provider, aliases: "broker" }, choices, usable);
+}
+
 /*
  * Model reference resolution. Candidates are collected before a provider is chosen, so catalog order
  * never decides the provider and an ambiguous match is reported instead of falling through to a
@@ -89,6 +127,8 @@ export interface ModelReferenceRequest {
 	thinkingSuffix: "none" | "strict" | "lenient";
 	/** Match id and name substrings when no exact match exists. */
 	fuzzy: boolean;
+	/** Resolve model family aliases on broker routes only, before fuzzy matching. */
+	aliases?: "broker";
 }
 
 export type ModelReferenceResult =
@@ -195,10 +235,25 @@ function resolveText(
 	pool: readonly Model<Api>[],
 	usable: (provider: string) => boolean,
 ): ModelReferenceResult {
-	const reference = selectReference(text, pool, request.fuzzy, usable);
+	const split = request.aliases === "broker" ? splitProviderPrefix(text, pool) : undefined;
+	const namedProvider = request.provider ?? split?.provider;
+	const brokerAliases = request.aliases === "broker" && (!namedProvider || isBrokerProvider(namedProvider));
+	const reference = selectReference(text, pool, request.fuzzy && !brokerAliases, usable);
 	if (reference) return reference;
 
+	if (brokerAliases) {
+		// Exact IDs win; only an alias target served on the selected route can come next.
+		const brokerModels = pool.filter((model) => isBrokerProvider(model.provider));
+		const alias = resolveModelAlias(split?.modelText ?? text, brokerModels);
+		const match = alias && selectReference(alias.id, brokerModels, false, usable);
+		if (match) return match;
+	}
+
 	if (request.fuzzy) {
+		if (brokerAliases && split) {
+			const named = selectReference(text, pool, true, usable);
+			if (named) return named;
+		}
 		const fuzzy = selectFuzzy(fuzzyMatches(text, pool), usable);
 		if (fuzzy) return fuzzy;
 	}
@@ -328,7 +383,7 @@ export interface ResolveModelScopeResult {
  * Resolve scope patterns (`--models`, `enabledModels`) to models with optional thinking levels.
  *
  * Every model in `models` is usable, so credentials cannot choose between providers offering the same
- * id. All of them are added, with a warning so the user can pick one with `provider/id`.
+ * id. Pi adds them all with a warning. Credne requires a qualifier to scope an ambiguous ID.
  */
 export function resolveModelScopeFromModels(
 	patterns: string[],
@@ -353,7 +408,13 @@ export function resolveModelScopeFromModels(
 		});
 	};
 
+	const choices = getModelSelectionChoices(models);
 	for (const pattern of patterns) {
+		// A qualified glob can intentionally restrict a billing route (e.g. acct:claude-*/*).
+		const providerPattern = pattern.slice(0, Math.max(0, pattern.lastIndexOf("/")));
+		const modelFirst =
+			USES_BROKER_AUTH && !/[*?[]/.test(providerPattern) && !splitProviderPrefix(pattern.trim(), models);
+		const scopeModels = modelFirst ? choices : models;
 		// Check if pattern contains glob characters
 		if (pattern.includes("*") || pattern.includes("?") || pattern.includes("[")) {
 			// Extract optional thinking level suffix (e.g., "provider/*:high")
@@ -364,22 +425,25 @@ export function resolveModelScopeFromModels(
 			// Ids such as `bracketed-model[1m]` are not globs
 			const exact = resolveModelReference(
 				{ text: globPattern, thinkingSuffix: "none", fuzzy: false },
-				models,
+				scopeModels,
 				() => true,
 			);
 			let matches: readonly Model<Api>[] = [];
 			if (exact.status === "resolved") matches = [exact.model];
 			else if (exact.status === "ambiguous") {
+				ambiguous(pattern, exact.candidates);
+				if (modelFirst) continue;
 				matches = exact.candidates;
-				ambiguous(pattern, matches);
 			} else {
 				// Match against "provider/modelId" format OR just model ID
 				// This allows "*sonnet*" to match without requiring "anthropic/*sonnet*"
-				matches = models.filter(
+				matches = scopeModels.filter(
 					(m) =>
 						minimatch(`${m.provider}/${m.id}`, globPattern, { nocase: true }) ||
 						minimatch(m.id, globPattern, { nocase: true }),
 				);
+				// A bare glob must not make an ambiguous family route the startup selection.
+				if (modelFirst) matches = getAutomaticModelChoices(matches);
 			}
 			if (matches.length === 0) noMatch(pattern);
 			for (const model of matches) add(model, thinkingLevel);
@@ -388,7 +452,7 @@ export function resolveModelScopeFromModels(
 
 		const result = resolveModelReference(
 			{ text: pattern, thinkingSuffix: "lenient", fuzzy: true },
-			models,
+			scopeModels,
 			() => true,
 		);
 		if (result.status === "not-found") {
@@ -398,7 +462,10 @@ export function resolveModelScopeFromModels(
 		if (result.warning) {
 			diagnostics.push({ type: "warning", code: "invalid-thinking-level", message: result.warning, pattern });
 		}
-		if (result.status === "ambiguous") ambiguous(pattern, result.candidates);
+		if (result.status === "ambiguous") {
+			ambiguous(pattern, result.candidates);
+			if (modelFirst) continue;
+		}
 		const matches = result.status === "resolved" ? [result.model] : result.candidates;
 		for (const model of matches) add(model, result.thinkingLevel);
 	}
@@ -442,9 +509,11 @@ export function resolveCliModel(options: {
 	cliThinking?: ThinkingLevel;
 	/** `--api-key` was supplied for the selected provider. */
 	inlineApiKey?: boolean;
+	/** In Credne, a bare reference must not broaden a configured scope to all accounts. */
+	scopedModels?: readonly ScopedModel[];
 	modelRuntime: ModelRuntime;
 }): ResolveCliModelResult {
-	const { cliProvider, cliModel, cliThinking, inlineApiKey, modelRuntime } = options;
+	const { cliProvider, cliModel, cliThinking, inlineApiKey, scopedModels, modelRuntime } = options;
 
 	if (!cliModel) {
 		return { model: undefined, warning: undefined, error: undefined };
@@ -472,11 +541,16 @@ export function resolveCliModel(options: {
 		};
 	}
 
-	const result = resolveModelReference(
+	const scope =
+		USES_BROKER_AUTH && !provider && !splitProviderPrefix(cliModel.trim(), models) && scopedModels?.length
+			? scopedModels.map((scoped) => scoped.model)
+			: undefined;
+	const result = resolveModelSelectionReference(
 		{ text: cliModel, provider, thinkingSuffix: "strict", fuzzy: true },
-		models,
+		scope ?? models,
 		// An inline key goes to whichever provider is selected, so stored credentials must not choose it
 		inlineApiKey ? () => false : (providerId) => modelRuntime.hasConfiguredAuth(providerId),
+		scope ? "scoped" : "all",
 	);
 	if (result.status === "resolved") {
 		return { model: result.model, thinkingLevel: result.thinkingLevel, warning: result.warning, error: undefined };
@@ -499,7 +573,7 @@ export function resolveCliModel(options: {
 	}
 
 	const { target } = result;
-	if (!target) {
+	if (!target || (USES_BROKER_AUTH && target.provider === GLOBAL_BROKER_PROVIDER)) {
 		return {
 			model: undefined,
 			warning: undefined,
@@ -556,8 +630,8 @@ export async function findInitialModel(options: {
 	let model: Model<Api> | undefined;
 	let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
 
-	// 1. Use first model from scoped models (skip if continuing/resuming)
-	if (scopedModels.length > 0 && !isContinuing) {
+	// In Credne even a resume fallback must stay inside an existing billing scope.
+	if (scopedModels.length > 0 && (!isContinuing || USES_BROKER_AUTH)) {
 		const scopedModel = scopedModels[0];
 		const perModel = modelThinkingLevels?.[`${scopedModel.model.provider}/${scopedModel.model.id}`];
 		return {
@@ -582,8 +656,8 @@ export async function findInitialModel(options: {
 		}
 	}
 
-	// 3. Try first available model with valid API key
-	const availableModels = [...modelRuntime.getAvailableSnapshot()];
+	// 3. Try first available model with valid credentials
+	const availableModels = getAutomaticModelChoices(modelRuntime.getAvailableSnapshot());
 
 	if (availableModels.length > 0) {
 		// Try to find a default model from known providers
@@ -644,7 +718,7 @@ export async function restoreModelFromSession(
 	}
 
 	// Try to find any available model
-	const availableModels = [...modelRuntime.getAvailableSnapshot()];
+	const availableModels = getAutomaticModelChoices(modelRuntime.getAvailableSnapshot());
 
 	if (availableModels.length > 0) {
 		// Try to find a default model from known providers

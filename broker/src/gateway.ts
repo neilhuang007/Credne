@@ -175,6 +175,10 @@ async function providerBody(request: Request, attempt: Attempt): Promise<BodyIni
 	return JSON.stringify(body);
 }
 
+function usesNativeBridge(account: Account): boolean {
+	return account.provider === "anthropic" || account.provider === "openai" || account.provider === "openai-codex";
+}
+
 export class Gateway {
 	private readonly decisions: Decisions;
 	private readonly routers = new Map<string, { account: Account; router: AuthGatewayRouter }>();
@@ -198,53 +202,61 @@ export class Gateway {
 			if (!attempt || attempt.account !== account) throw new Error("Missing account request context.");
 			try {
 				const request = new Request(input, init);
-				const headers = new Headers(request.headers);
-				for (const name of ["cookie", "cookie2", "proxy-authorization", "x-api-key", "authorization"])
-					headers.delete(name);
-				for (const [name, value] of Object.entries(account.record.headers ?? {})) headers.set(name, value);
-				// Legacy Claude accounts treated an explicit base as the path before /v1/messages.
-				const url =
-					account.record.source === "config" &&
-					account.record.id.startsWith("claude:apikey:") &&
-					account.record.baseUrl
-						? `${account.record.baseUrl}/v1/messages?beta=true`
-						: request.url;
-				let credential = await this.accounts.credential(account, attempt.signal);
-				const body = await providerBody(request, attempt);
-				if (typeof body === "string") {
-					headers.delete("content-encoding");
-					headers.delete("content-length");
-				}
-				const send = account.provider === "anthropic" && account.record.kind === "oauth" ? attest : fetch;
 				let response: Response;
-				for (let authAttempt = 0; ; authAttempt++) {
-					if (account.provider === "anthropic" && account.record.kind === "api-key")
-						headers.set("x-api-key", credential.token);
-					else headers.set("authorization", `Bearer ${credential.token}`);
-					if (account.provider === "openai-codex" && credential.accountId)
-						headers.set("chatgpt-account-id", credential.accountId);
-					response = await send(url, {
-						...init,
-						method: request.method,
-						headers,
-						body,
-						signal: request.signal,
-						redirect: "error",
-					});
-					if (response.status !== 401 || authAttempt > 0 || account.record.kind === "api-key") break;
-					try {
-						const refreshed = await account.storage.oauth.access(account.provider, undefined, {
-							signal: attempt.signal,
-							forceRefresh: true,
-							refreshReason: "auth-recovery",
-							rejectedAccessToken: credential.token,
+				if (!usesNativeBridge(account)) {
+					const model = account.models.find((model) => model.id === attempt.body.model);
+					if (!model || new URL(request.url).origin !== new URL(model.baseUrl).origin) {
+						throw new Error("Unexpected provider endpoint.");
+					}
+					response = await fetch(request, { redirect: "error" });
+				} else {
+					const headers = new Headers(request.headers);
+					for (const name of ["cookie", "cookie2", "proxy-authorization", "x-api-key", "authorization"])
+						headers.delete(name);
+					for (const [name, value] of Object.entries(account.record.headers ?? {})) headers.set(name, value);
+					// Legacy Claude accounts treated an explicit base as the path before /v1/messages.
+					const url =
+						account.record.source === "config" &&
+						account.record.id.startsWith("claude:apikey:") &&
+						account.record.baseUrl
+							? `${account.record.baseUrl}/v1/messages?beta=true`
+							: request.url;
+					let credential = await this.accounts.credential(account, attempt.signal);
+					const body = await providerBody(request, attempt);
+					if (typeof body === "string") {
+						headers.delete("content-encoding");
+						headers.delete("content-length");
+					}
+					const send = account.provider === "anthropic" && account.record.kind === "oauth" ? attest : fetch;
+					for (let authAttempt = 0; ; authAttempt++) {
+						if (account.provider === "anthropic" && account.record.kind === "api-key")
+							headers.set("x-api-key", credential.token);
+						else headers.set("authorization", `Bearer ${credential.token}`);
+						if (account.provider === "openai-codex" && credential.accountId)
+							headers.set("chatgpt-account-id", credential.accountId);
+						response = await send(url, {
+							...init,
+							method: request.method,
+							headers,
+							body,
+							signal: request.signal,
+							redirect: "error",
 						});
-						if (!refreshed) break;
-						await response.body?.cancel();
-						credential = { token: refreshed.accessToken, accountId: refreshed.accountId };
-					} catch {
-						// Failed recovery must report the original rejection, not a different account.
-						break;
+						if (response.status !== 401 || authAttempt > 0 || account.record.kind === "api-key") break;
+						try {
+							const refreshed = await account.storage.oauth.access(account.provider, undefined, {
+								signal: attempt.signal,
+								forceRefresh: true,
+								refreshReason: "auth-recovery",
+								rejectedAccessToken: credential.token,
+							});
+							if (!refreshed) break;
+							await response.body?.cancel();
+							credential = { token: refreshed.accessToken, accountId: refreshed.accountId };
+						} catch {
+							// Failed recovery must report the original rejection, not a different account.
+							break;
+						}
 					}
 				}
 				attempt.status = response.status;
@@ -323,7 +335,7 @@ export class Gateway {
 			for (const wake of this.queues.get(id) ?? []) wake();
 		};
 	}
-	private orderPool(candidates: Account[], pool: string, previous?: string): Account[] {
+	private orderPool(candidates: Account[], previous?: string): Account[] {
 		const enabled = candidates.filter((account) => !account.record.disabled);
 		const index = enabled.length && this.accounts.routing.strategy !== "fill-first" ? this.cursor++ : 0;
 		const order = (accounts: Account[]): Account[] => {
@@ -334,14 +346,11 @@ export class Gateway {
 				ordered.sort((a, b) => Number(b.record.id === previous) - Number(a.record.id === previous));
 			return ordered;
 		};
-		if (pool !== "claude" && pool !== "all") return order(enabled);
 
-		// Affinity may pick a sibling with a warm cache, but must not keep billing an API key
-		// once a Claude subscription can serve the model again. Cooldown and retry still apply.
 		const subscriptions: Account[] = [];
 		const remaining: Account[] = [];
 		for (const account of enabled) {
-			const group = account.family === "claude" && account.record.kind === "oauth" ? subscriptions : remaining;
+			const group = account.storage.credentials.hasSubscription(account.provider) ? subscriptions : remaining;
 			group.push(account);
 		}
 		return [...order(subscriptions), ...order(remaining)];
@@ -370,7 +379,18 @@ export class Gateway {
 			.find(Boolean);
 		const sessionKey = session ? `${target}\0${session}` : undefined;
 		const previous = sessionKey ? this.sessions.get(sessionKey) : undefined;
-		if (!pin) candidates = this.orderPool(candidates, pool, previous);
+		if (!pin) {
+			candidates = this.orderPool(candidates, previous);
+			if (pool === "all") {
+				const families = new Set(
+					candidates.map(({ family }) =>
+						family === "codex" ? "openai" : family === "xai-oauth" ? "xai" : family,
+					),
+				);
+				if (families.size > 1)
+					return protocolError(409, "Different providers use this model ID. Select a provider pool.", protocol);
+			}
+		}
 		if (!candidates.length)
 			return protocolError(
 				404,
@@ -397,6 +417,20 @@ export class Gateway {
 					continue;
 				}
 				attempted = true;
+				const credential = account.storage.credentials.get(account.provider);
+				if (!credential) {
+					last = protocolError(401, "The selected account has no saved credential.", protocol, key);
+					if (pin) return last;
+					continue;
+				}
+				if (!usesNativeBridge(account) && hostedTools(body)) {
+					return protocolError(
+						400,
+						"Hosted search is not available for this provider through Credne.",
+						protocol,
+						key,
+					);
+				}
 				let payload = !pin && previous && previous !== account.record.id ? rewriteReasoning(body, protocol) : body;
 				for (let reasoningRetry = 0; reasoningRetry < 2; reasoningRetry++) {
 					const release = await this.acquire(account, request.signal);
@@ -415,8 +449,7 @@ export class Gateway {
 					])
 						headers.delete(name);
 					if (session) headers.set("x-prompt-cache-key", session);
-					const credential = account.storage.credentials.get(account.provider);
-					if (credential?.type === "oauth") {
+					if (credential.type === "oauth") {
 						const identity = resolveCredentialIdentityKey(account.provider, credential);
 						lease = account.storage.sessions.restrict(account.provider, scope, identity ? [identity] : []);
 					}
@@ -431,15 +464,16 @@ export class Gateway {
 						headersReady: false,
 						controller,
 					};
-					const client = lease
-						? {
-								name: key,
-								limitsModels: false,
-								allows: (_model: Model<Api>) => true,
-								credentialSessionId: () => scope,
-								retain: () => () => {},
-							}
-						: undefined;
+					const client =
+						lease || !usesNativeBridge(account)
+							? {
+									name: key,
+									limitsModels: false,
+									allows: (_model: Model<Api>) => true,
+									credentialSessionId: () => scope,
+									retain: () => () => {},
+								}
+							: undefined;
 					// Hosted definitions have no generic JSON-schema tool equivalent. Keep them out of the codec;
 					// the provider transport restores the original native definitions before the real request.
 					const gatewayBody = attempt.hosted

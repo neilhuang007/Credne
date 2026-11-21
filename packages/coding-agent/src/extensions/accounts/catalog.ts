@@ -1,6 +1,13 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Api, ClassifierApi, ClassifierModel, Model } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	ClassifierApi,
+	ClassifierModel,
+	Model,
+	ModelThinkingLevel,
+	ThinkingLevelMap,
+} from "@earendil-works/pi-ai";
 import type { BrokerAccount, BrokerAccountKind, BrokerModel } from "./client.ts";
 
 /** Prefix of providers that pin one broker account. */
@@ -131,7 +138,14 @@ export function poolProviderId(name: string): string {
  */
 export function familyOf(provider: string): string {
 	if (provider === OPENAI_API_PROVIDER) return "openai";
-	return provider === "claude-api" ? "claude" : provider;
+	if (provider === "claude-api" || provider === "anthropic") return "claude";
+	return provider === "openai-codex" ? "codex" : provider;
+}
+
+/** Families whose same-id models can share one route in the global pool. */
+export function sharedRouteFamily(family: string): string {
+	if (family === "codex") return "openai";
+	return family === "xai-oauth" ? "xai" : family;
 }
 
 /** Pi API adapter used for a model family. */
@@ -143,14 +157,13 @@ export function apiForFamily(family: string): Api {
 }
 
 /** Pi's built-in providers whose catalog describes the same upstream models. */
-const CATALOG_SOURCES: Record<string, readonly CatalogSource[]> = {
-	claude: ["anthropic"],
-	codex: ["openai-codex", "openai"],
-	openai: ["openai"],
-};
+const CATALOG_SOURCES = new Map<string, readonly string[]>([
+	["claude", ["anthropic"]],
+	["codex", ["openai-codex", "openai"]],
+	["xai-oauth", ["xai-oauth", "xai"]],
+]);
 
-type CatalogSource = "anthropic" | "openai-codex" | "openai";
-export type CatalogLookup = (provider: CatalogSource, modelId: string) => Model<Api> | undefined;
+export type CatalogLookup = (provider: string, modelId: string) => Model<Api> | undefined;
 
 /** Finds a classifier model of Pi's catalog. */
 export type ClassifierLookup = (provider: string, modelId: string) => ClassifierModel<ClassifierApi> | undefined;
@@ -222,21 +235,63 @@ function buildPools(accounts: readonly CachedAccount[]): CachedPool[] {
 	return [ALL_POOL, ...families].map((name) => {
 		const members = name === ALL_POOL ? enabled : enabled.filter((account) => familyOf(account.provider) === name);
 		const provider = poolProviderId(name);
-		const models = new Map<string, Model<Api>>();
-		for (const account of members) {
-			for (const model of account.models) {
-				if (!models.has(model.id)) models.set(model.id, { ...model, provider });
-			}
-		}
 		// The broker's Decisions route is restricted to pinned OpenAI API keys and their family pool.
 		const classifiers = name === "openai" ? members.find((account) => account.classifiers)?.classifiers : undefined;
 		return {
 			name,
 			accountCount: members.length,
-			models: [...models.values()],
+			models: poolModels(provider, members),
 			classifiers: classifiers?.map((model) => ({ ...model, provider })),
 		};
 	});
+}
+
+function poolModels(provider: string, members: readonly CachedAccount[]): Model<Api>[] {
+	const byId = new Map<string, { family: string; models: [Model<Api>, ...Model<Api>[]] } | undefined>();
+	for (const account of members) {
+		const family = sharedRouteFamily(familyOf(account.provider));
+		for (const model of account.models) {
+			const existing = byId.get(model.id);
+			if (existing) {
+				if (existing.family === family && existing.models[0].api === model.api) existing.models.push(model);
+				else byId.set(model.id, undefined);
+			} else if (!byId.has(model.id)) {
+				byId.set(model.id, { family, models: [model] });
+			}
+		}
+	}
+	// One bare ID can only address one identity over this route. Ambiguous IDs remain in their family pools.
+	return [...byId.values()].flatMap((entry) =>
+		entry ? [mergePoolModel(provider, entry.models[0], entry.models)] : [],
+	);
+}
+
+function mergePoolModel(provider: string, first: Model<Api>, models: readonly Model<Api>[]): Model<Api> {
+	if (models.length === 1) return { ...first, provider };
+	// Failover can use any member. Advertise only the limits and capabilities shared by the route.
+	return {
+		...first,
+		provider,
+		contextWindow: Math.min(...models.map((model) => model.contextWindow)),
+		maxTokens: Math.min(...models.map((model) => model.maxTokens)),
+		input: first.input.filter((input) => models.every((model) => model.input.includes(input))),
+		reasoning: models.every((model) => model.reasoning),
+		thinkingLevelMap: sharedThinkingLevelMap(first, models),
+	};
+}
+
+const THINKING_LEVELS: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+function sharedThinkingLevelMap(first: Model<Api>, models: readonly Model<Api>[]): ThinkingLevelMap | undefined {
+	let result: ThinkingLevelMap | undefined;
+	for (const level of THINKING_LEVELS) {
+		const firstValue = first.thinkingLevelMap?.[level];
+		const value = models.every((model) => model.thinkingLevelMap?.[level] === firstValue) ? firstValue : null;
+		if (value === undefined) continue;
+		result ??= {};
+		result[level] = value;
+	}
+	return result;
 }
 
 function chatModels(
@@ -245,8 +300,10 @@ function chatModels(
 	lookup: CatalogLookup,
 ): readonly BrokerModel[] {
 	const models = accountModels.get(account.key) ?? [];
-	// OpenAI lists image, audio and embedding models too; only registered chat models belong here.
-	return account.provider === OPENAI_API_PROVIDER ? models.filter((model) => lookup("openai", model.id)) : models;
+	// OpenAI lists image, audio and embedding IDs too. Either catalog can positively identify a chat model.
+	return account.provider === OPENAI_API_PROVIDER
+		? models.filter((model) => model.kind === "chat" || lookup("openai", model.id))
+		: models;
 }
 
 /**
@@ -272,7 +329,7 @@ function decisionsClassifiers(
 
 function toPiModel(providerId: string, family: string, model: BrokerModel, lookup: CatalogLookup): Model<Api> {
 	const api = apiForFamily(family);
-	const known = (CATALOG_SOURCES[family] ?? []).map((source) => lookup(source, model.id)).find(Boolean);
+	const known = (CATALOG_SOURCES.get(family) ?? [family]).map((source) => lookup(source, model.id)).find(Boolean);
 	const input: Model<Api>["input"] =
 		known?.input ?? (model.inputModalities?.includes("image") ? ["text", "image"] : ["text"]);
 	const piModel: Model<Api> = {
@@ -283,16 +340,32 @@ function toPiModel(providerId: string, family: string, model: BrokerModel, looku
 		baseUrl: BROKER_PLACEHOLDER_URL,
 		reasoning: known?.reasoning ?? model.thinking,
 		input,
-		cost: known?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		cost: known?.cost ?? model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: known?.contextWindow ?? model.contextLength ?? 128_000,
 		maxTokens: known?.maxTokens ?? model.maxCompletionTokens ?? 16_384,
 	};
-	if (known?.thinkingLevelMap) piModel.thinkingLevelMap = known.thinkingLevelMap;
+	const thinkingLevelMap = known?.thinkingLevelMap ?? brokerThinkingLevelMap(model);
+	if (thinkingLevelMap) piModel.thinkingLevelMap = thinkingLevelMap;
 	if (known?.inputLimits) piModel.inputLimits = known.inputLimits;
 	if (known?.promptCache) piModel.promptCache = known.promptCache;
+	if (known?.samplingParams) piModel.samplingParams = known.samplingParams;
+	if (known?.samplingParamsByThinkingLevel)
+		piModel.samplingParamsByThinkingLevel = known.samplingParamsByThinkingLevel;
 	const compat = brokerCompat(api, known?.compat);
 	if (compat) piModel.compat = compat;
 	return piModel;
+}
+
+function brokerThinkingLevelMap(model: BrokerModel): ThinkingLevelMap | undefined {
+	const levels = model.thinkingLevels;
+	if (!model.thinking || !levels?.some((level) => THINKING_LEVELS.some((supported) => supported === level))) {
+		return undefined;
+	}
+	const map: ThinkingLevelMap = {};
+	for (const level of THINKING_LEVELS) {
+		if (level !== "off") map[level] = levels.includes(level) ? level : null;
+	}
+	return map;
 }
 
 /**

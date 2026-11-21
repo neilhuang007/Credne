@@ -127,6 +127,7 @@ import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
+import { getAutomaticModelChoices } from "./model-selection.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
@@ -2947,7 +2948,7 @@ export class AgentSession {
 		direction: "forward" | "backward",
 		options: ModelMutationOptions,
 	): Promise<ModelCycleResult | undefined> {
-		const availableModels = this._modelRuntime.getAvailableSnapshot();
+		const availableModels = getAutomaticModelChoices(this._modelRuntime.getAvailableSnapshot());
 		const currentModel = this.model;
 		const currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
 		const nextIndex = getNextCycleIndex(currentIndex, availableModels.length, direction);

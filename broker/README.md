@@ -58,7 +58,7 @@ Each account has its own pi-ai SQLite auth store and gateway router inside the s
 
 `pool:all` addresses `p.all`. Family pools are `p.claude`, `p.codex`, and `p.openai`. Pools use only enabled accounts that list the model. Claude keys and subscriptions share a family. OpenAI API billing and ChatGPT subscriptions remain separate families.
 
-For a Claude model, `p.claude` and `p.all` prefer an available subscription over an API key, even if a key served the previous turn. The broker uses the configured strategy and session affinity within each group. A pool can fall back to a paid API key; pin a subscription to rule out that charge. The default strategy is round-robin. The broker recognizes `X-Session-Affinity`, `Session-Id`, and `X-Session-Id`. Pools can select another eligible account on a pre-emission failure. Rate limits, insufficient credits, and temporary unavailability create cooldowns. `X-Credne-Account` identifies the selected account with its base64url key.
+For pooled chat, the broker asks OMP whether each candidate's stored credential is subscription-backed. It tries eligible subscription accounts before ordinary API keys, even if a key served the previous turn. For example, `p.all` prefers a ChatGPT subscription over an OpenAI API key for a GPT model offered by both. The configured strategy and session affinity apply within each group. A pool can fall back to a paid API key; pin a subscription to rule out that charge. The default strategy is round-robin. The broker recognizes `X-Session-Affinity`, `Session-Id`, and `X-Session-Id`. Pools can select another eligible account on a pre-emission failure. Rate limits, insufficient credits, and temporary unavailability create cooldowns. `X-Credne-Account` identifies the selected account with its base64url key.
 
 On pool account changes, signed Anthropic thinking and encrypted OpenAI reasoning become bounded, labeled summaries. Redacted reasoning is removed. Visible text, tool calls, and results remain. A thinking-signature rejection receives one rewritten retry. Anthropic thinking is disabled for an in-flight tool-result turn if its required thinking block was removed.
 
@@ -66,7 +66,7 @@ Requests use pi-ai's gateway and providers. A transport bridge restores native h
 
 ### Account management
 
-API keys are validated through the provider model endpoint before storage. Duplicate names and keys return 409. Final duplicate checks and writes are serialized.
+Beyond the legacy account IDs above, `/providers` lists supported OMP provider IDs and authentication methods. The broker uses OMP's key validator or authenticated catalog descriptor before storing a key. Some validators send a small inference request that may incur a charge. For descriptor-based enrollment the broker intersects the returned model IDs with supported chat models in the bundled catalog. A validated key is not proof of access to every model. Cloud credential chains, native CLI adapters and sign-ins that need unsupported prompts or host state are not advertised. Duplicate names and keys return 409. Final duplicate checks and writes are serialized.
 
 Subscription login supports browser redirects, manual callback submission, status, and cancellation. Callbacks must match the pending redirect destination and state. Signing in to an existing identity renews its credential but reports that no account was added. Its disabled setting remains.
 
@@ -108,8 +108,9 @@ Read URL, token, and PID from `<home>/broker.json`. Supply `Authorization: Beare
 | `POST /accounts/{key}/disable`, `/enable` | Change account state |
 | `POST /accounts/{key}/reset` | Clear cooldown |
 | `DELETE /accounts/{key}` | Remove account and credential |
-| `POST /api-keys` `{provider,name,key}` | Validate/add key; provider is `claude`, `anthropic`, or `openai` |
-| `POST /logins` `{provider}` | Start `codex` or `claude` login. If OMP returns `riskWarning` instead of a browser URL, display it and wait for the user's decision. |
+| `GET /providers` | List supported provider IDs, names, and enrollment methods. |
+| `POST /api-keys` `{provider,name,key}` | Validate and add a key for an advertised API-key provider. |
+| `POST /logins` `{provider}` | Start an advertised OAuth flow. Show any `riskWarning` before continuing. Device-code flows supply a verification URL and user code. |
 | `POST /logins/{state}/acknowledge` `{"answer":"yes"}` | Continue only after the user accepts the displayed warning. If they decline, cancel with `DELETE /logins/{state}`. |
 | `GET /logins/{state}` | `wait`, `ok`, or `error`; optional account/error |
 | `POST /logins/{state}/callback` `{redirectUrl}` | Submit complete browser redirect |

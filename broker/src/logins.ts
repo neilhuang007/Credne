@@ -1,8 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { rm } from "node:fs/promises";
-import { join } from "node:path";
 import { AuthStorage, isSameOAuthAccount, resolveCredentialIdentityKey } from "@oh-my-pi/pi-ai";
 import { type Account, type Accounts, HttpError, publicAccount } from "./accounts.ts";
+import { accountProvider, brokerProvider, unsupportedEnrollment } from "./providers.ts";
 import { text, type WireObject } from "./wire.ts";
 
 type StartResult = { kind: "ready" } | { kind: "warning"; warning: string } | { kind: "failed" };
@@ -10,6 +9,8 @@ type StartResult = { kind: "ready" } | { kind: "warning"; warning: string } | { 
 interface Login {
 	state: string;
 	url: string;
+	flow: "browser" | "device";
+	instructions?: string;
 	status: "wait" | "ok" | "error";
 	error?: string;
 	account?: Account;
@@ -25,15 +26,17 @@ export class Logins {
 	constructor(private readonly accounts: Accounts) {}
 
 	async start(input: WireObject, signal: AbortSignal): Promise<WireObject> {
-		const provider = text(input.provider)?.trim().toLowerCase();
-		if (provider === "claude-api-credits")
+		const id = text(input.provider)?.trim().toLowerCase();
+		if (id === "claude-api-credits")
 			throw new HttpError(400, "Claude Console sign-in is not supported. Add a Claude API key instead.");
-		if (provider !== "codex" && provider !== "claude") throw new HttpError(400, "provider must be claude or codex");
-		const nativeProvider = provider === "codex" ? "openai-codex" : "anthropic";
+		if (!id) throw new HttpError(400, "provider must be an OMP provider ID");
+		const { native: nativeProvider, record: provider } = accountProvider(id, "oauth");
+		const method = brokerProvider(nativeProvider)?.oauth;
+		if (!method) throw new HttpError(400, unsupportedEnrollment(id, "oauth"));
 		const state = randomBytes(24).toString("hex");
 		const abort = new AbortController();
-		const path = join(this.accounts.options.home, "credentials", `login-${state}.db`);
-		const storage = await AuthStorage.create(path, { usageProviderResolver: () => undefined });
+		// The grant belongs on disk only once it has passed identity and duplicate checks.
+		const storage = await AuthStorage.create(":memory:", { usageProviderResolver: () => undefined });
 		const initial = Promise.withResolvers<StartResult>(),
 			authorization = Promise.withResolvers<StartResult>(),
 			manual = Promise.withResolvers<string>();
@@ -51,10 +54,12 @@ export class Logins {
 		const login: Login = {
 			state,
 			url: "",
+			flow: method.flow,
 			status: "wait",
 			authorization: authorization.promise,
 			cancel: () => abort.abort(),
 			callback: (value) => {
+				if (login.flow !== "browser") throw new HttpError(409, "Complete this device sign-in in the browser.");
 				if (login.status !== "wait" || abort.signal.aborted || !login.url)
 					throw new HttpError(409, "Login callback is not pending.");
 				validateCallback(value, login.url);
@@ -65,13 +70,21 @@ export class Logins {
 		login.done = storage.oauth
 			.login(nativeProvider, {
 				signal: abort.signal,
+				fetch: (input, init) => fetch(input, { ...init, redirect: "error" }),
 				onAuth: (info) => {
-					login.url = info.url;
+					const url = new URL(info.url);
+					if (url.protocol !== "https:" || url.username || url.password)
+						throw new Error("Unexpected authorization URL.");
+					login.url = url.href;
+					if (method.flow === "device") login.instructions = info.instructions;
 					initial.resolve({ kind: "ready" });
 					authorization.resolve({ kind: "ready" });
 				},
 				onPrompt: (prompt) => {
-					if (!prompt.riskAcknowledgement) return manual.promise;
+					if (!prompt.riskAcknowledgement) {
+						if (method.flow === "browser" && !prompt.secret && login.url) return manual.promise;
+						throw new HttpError(400, "This sign-in requires a prompt that the broker does not support.");
+					}
 					abort.signal.throwIfAborted();
 					const consent = Promise.withResolvers<string>();
 					login.acceptRisk = consent.resolve;
@@ -79,12 +92,12 @@ export class Logins {
 					abort.signal.addEventListener("abort", () => consent.resolve("no"), { once: true });
 					return consent.promise;
 				},
-				onManualCodeInput: () => manual.promise,
+				onManualCodeInput: method.flow === "browser" ? () => manual.promise : undefined,
 			})
 			.then(async (identity) => {
 				abort.signal.throwIfAborted();
 				const credential = storage.credentials.get(nativeProvider);
-				if (!identity || !credential || credential.type !== "oauth") throw new Error("No subscription credential.");
+				if (!identity || !credential || credential.type !== "oauth") throw new Error("No OAuth credential.");
 				await this.accounts.locked(async () => {
 					abort.signal.throwIfAborted();
 					const existing = [...this.accounts.accounts.values()].find((account) => {
@@ -99,19 +112,20 @@ export class Logins {
 						await existing.storage.credentials.set(nativeProvider, credential);
 						throw new HttpError(
 							409,
-							`${existing.record.email ?? existing.record.id} is already added as a ${provider === "codex" ? "ChatGPT" : "Claude"} subscription. Its sign-in was renewed; no account was added.`,
+							`${existing.record.email ?? existing.record.id} is already added. Its sign-in was renewed; no account was added.`,
 						);
 					}
 					const identityId =
-						provider === "claude"
-							? resolveCredentialIdentityKey(nativeProvider, credential)
-							: (credential.accountId ?? credential.email);
-					if (!identityId) throw new Error("No subscription identity.");
+						provider === "codex"
+							? (credential.accountId ?? credential.email)
+							: resolveCredentialIdentityKey(nativeProvider, credential);
+					if (!identityId)
+						throw new HttpError(400, "The provider did not return an account identity. No account was added.");
 					login.account = await this.accounts.register(
 						{
 							id: `${provider}-${Buffer.from(identityId).toString("base64url")}.json`,
 							provider,
-							name: credential.email ?? credential.accountId ?? identityId,
+							name: credential.email ?? credential.accountId ?? method.name,
 							kind: "oauth",
 							email: credential.email,
 							plan: credential.orgName,
@@ -130,15 +144,16 @@ export class Logins {
 						? error.message
 						: abort.signal.aborted
 							? "Sign-in cancelled or expired."
-							: "Subscription sign-in failed. Try again.";
+							: "Provider sign-in failed. Try again.";
 				initial.resolve({ kind: "failed" });
 				authorization.resolve({ kind: "failed" });
 			})
-			.finally(async () => {
+			.finally(() => {
 				clearTimeout(deadline);
 				login.acceptRisk = undefined;
+				login.url = "";
+				login.instructions = undefined;
 				storage.close();
-				for (const suffix of ["", "-wal", "-shm"]) await rm(`${path}${suffix}`, { force: true });
 			});
 		try {
 			return startResponse(login, await waitForLogin(login, initial.promise, signal));
@@ -197,11 +212,12 @@ async function waitForLogin(login: Login, next: Promise<StartResult>, signal: Ab
 }
 
 function startResponse(login: Login, result: StartResult): WireObject {
-	if (result.kind === "failed") throw new HttpError(502, "Subscription sign-in could not start.");
+	if (result.kind === "failed") throw new HttpError(502, login.error ?? "Provider sign-in could not start.");
 	return {
 		state: login.state,
 		url: login.url,
-		flow: "browser",
+		flow: login.flow,
+		instructions: login.instructions,
 		riskWarning: result.kind === "warning" ? result.warning : undefined,
 	};
 }

@@ -1,16 +1,18 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../core/extensions/types.ts";
-import { openBrowser } from "../../utils/open-browser.ts";
 import {
 	ALL_POOL,
 	accountDisplayName,
 	accountProviderId,
-	familyTitle,
+	familyOf,
+	isBrokerProvider,
 	isLocalClaudeProvider,
 	poolProviderId,
+	sharedRouteFamily,
 } from "./catalog.ts";
-import type { BrokerAccount, BrokerClient, BrokerLogin, BrokerLoginProvider, BrokerUsage } from "./client.ts";
+import type { BrokerAccount, BrokerClient, BrokerUsage } from "./client.ts";
 import { sessionAccountCosts } from "./costs.ts";
+import { enrollAccount } from "./enrollment.ts";
 import { type AccountPanelResult, AccountsPanel } from "./panel.ts";
 import type { AccountProviderSpec } from "./provider.ts";
 import type { AccountRegistry } from "./registry.ts";
@@ -34,92 +36,6 @@ export const ACCOUNT_SUBCOMMANDS = [
 	"reset",
 ] as const;
 
-/** A subscription browser sign-in through the broker. */
-interface LoginWay {
-	id: string;
-	label: string;
-	kind: "login";
-	/** Broker login provider. */
-	provider: BrokerLoginProvider;
-	/** What the user signs in to, for messages. */
-	title: string;
-}
-
-/** A provider API key typed in; the broker validates it. */
-interface ApiKeyWay {
-	id: string;
-	label: string;
-	kind: "api-key";
-	provider: "claude" | "openai";
-	title: string;
-	placeholder: string;
-}
-
-type AddWay = LoginWay | ApiKeyWay;
-
-interface AddFamily {
-	id: string;
-	label: string;
-	ways: readonly AddWay[];
-}
-
-/**
- * What `/accounts add` offers: the first menu lists the families, the second the ways of one family;
- * a family with a single way skips the second menu. The ids are the arguments of `/accounts add <id>`.
- */
-const ADD_FAMILIES: readonly AddFamily[] = [
-	{
-		id: "claude",
-		label: "Claude account",
-		ways: [
-			{
-				id: "claude-subscription",
-				label: "Subscription (Pro, Max, Team sign-in)",
-				kind: "login",
-				provider: "claude",
-				title: "Claude",
-			},
-			{
-				id: "claude-api-key",
-				label: "API key (Anthropic Console key)",
-				kind: "api-key",
-				provider: "claude",
-				title: "Anthropic",
-				placeholder: "sk-ant-api03-...",
-			},
-		],
-	},
-	{
-		id: "chatgpt",
-		label: "ChatGPT account",
-		ways: [
-			{
-				id: "openai-api-key",
-				label: "API key (OpenAI API credits)",
-				kind: "api-key",
-				provider: "openai",
-				title: "OpenAI",
-				placeholder: "sk-...",
-			},
-			{
-				id: "codex",
-				label: "Subscription (ChatGPT sign-in through Codex)",
-				kind: "login",
-				provider: "codex",
-				title: familyTitle("codex"),
-			},
-		],
-	},
-];
-
-/** Arguments of `/accounts add`, in menu order, for argument completion and the usage warning. */
-export const ADD_ARGUMENTS: readonly { id: string; label: string }[] = ADD_FAMILIES.flatMap((family) => [
-	family,
-	...family.ways,
-]);
-
-const LOGIN_TIMEOUT_MS = 5 * 60_000;
-const LOGIN_POLL_MS = 1_000;
 const LEGACY_CLAUDE_MESSAGE =
 	"Local Claude subscriptions are no longer supported. Sign in again with /accounts add claude-subscription, then select the broker account with /accounts switch. Existing credentials were left untouched.";
 
@@ -168,7 +84,7 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 			if (!spec) continue;
 			if (result.action === "use") {
 				const models = providerModels(ctx, spec);
-				const model = models.find((entry) => entry.id === ctx.model?.id) ?? models[0];
+				const model = matchingCurrentModel(deps, ctx, spec, models) ?? models[0];
 				if (model) await useModel(deps, ctx, spec, model);
 				else ctx.ui.notify(`${spec.name} reports no models.`, "warning");
 				return;
@@ -331,7 +247,7 @@ async function switchAccount(
 	if (spec) await switchTo(deps, ctx, spec, persist);
 }
 
-/** Switch to an account, keeping the current model id when the account offers it. */
+/** Switch to an account, keeping the current model when the new route has the same identity. */
 async function switchTo(
 	deps: AccountCommandDeps,
 	ctx: ExtensionCommandContext,
@@ -339,7 +255,7 @@ async function switchTo(
 	persist: boolean,
 ): Promise<void> {
 	const models = providerModels(ctx, spec);
-	const sameModel = models.find((model) => model.id === ctx.model?.id);
+	const sameModel = matchingCurrentModel(deps, ctx, spec, models);
 	const model = sameModel ?? (models.length === 1 ? models[0] : await chooseModel(ctx, spec, models));
 	if (model) await useModel(deps, ctx, spec, model, persist);
 }
@@ -365,196 +281,42 @@ async function useModel(
 }
 
 /**
- * After the first account is added, make the combined pool the default when no default model is
- * configured, so new sessions draw on every account.
+ * After the first account is added, adopt the combined pool only when no model is selected or configured.
  */
 async function adoptPoolAsDefault(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
-	if (deps.pi.getSettings().defaultProvider) return;
+	if (ctx.model || deps.pi.getSettings().defaultProvider) return;
 	const pool = deps.registry.provider(poolProviderId(ALL_POOL));
 	if (pool) await switchTo(deps, ctx, pool, true);
 }
 
 async function addAccount(deps: AccountCommandDeps, ctx: ExtensionCommandContext, requested: string): Promise<void> {
-	const argument = requested.trim().toLowerCase();
-	if (argument === "claude-api-credits") {
-		ctx.ui.notify(
-			"Claude Console credits sign-in is not supported by the account broker. Use /accounts add claude-api-key with an Anthropic Console API key, or /accounts add claude-subscription.",
-			"warning",
-		);
-		return;
-	}
-	if (!ctx.hasUI) {
-		ctx.ui.notify("Adding an account needs interactive mode.", "warning");
-		return;
-	}
-	const way = await chooseAddWay(ctx, argument);
-	if (!way) return;
 	const hadAccounts = deps.registry.providers().length > 0;
-	const added = await runAddWay(deps, ctx, way);
-	if (added) await finishAdding(deps, ctx, added, hadAccounts);
-}
-
-/** Add an account the chosen way; the message to show once it is registered, or undefined when cancelled. */
-async function runAddWay(
-	deps: AccountCommandDeps,
-	ctx: ExtensionCommandContext,
-	way: AddWay,
-): Promise<string | undefined> {
-	const account =
-		way.kind === "api-key" ? await addApiKeyAccount(deps, ctx, way) : await signInAccount(deps, ctx, way);
-	return account && `Added ${accountDisplayName(account)}. It funds the matching pools; /accounts switch pins it.`;
-}
-
-/** The way to add an account, from the argument of `/accounts add` or from the menus; undefined when cancelled. */
-async function chooseAddWay(ctx: ExtensionCommandContext, argument: string): Promise<AddWay | undefined> {
-	if (!argument) return chooseFromMenus(ctx);
-	const family = ADD_FAMILIES.find((entry) => entry.id === argument);
-	if (family) return chooseWay(ctx, family);
-	const way = ADD_FAMILIES.flatMap((entry) => entry.ways).find((entry) => entry.id === argument);
-	if (!way) {
-		const valid = ADD_ARGUMENTS.map((entry) => entry.id).join(", ");
-		ctx.ui.notify(`Unknown account type "${argument}". Use one of: ${valid}.`, "warning");
-	}
-	return way;
-}
-
-/** First menu (families), then the family's ways; Escape at the second menu returns to the first. */
-async function chooseFromMenus(ctx: ExtensionCommandContext): Promise<AddWay | undefined> {
-	for (;;) {
-		const family = await selectEntry(ctx, "Add account", ADD_FAMILIES);
-		if (!family) return undefined;
-		const way = await chooseWay(ctx, family);
-		if (way) return way;
-	}
-}
-
-async function chooseWay(ctx: ExtensionCommandContext, family: AddFamily): Promise<AddWay | undefined> {
-	if (family.ways.length === 1) return family.ways[0];
-	return selectEntry(ctx, `Add ${family.label}`, family.ways);
-}
-
-async function selectEntry<T extends { label: string }>(
-	ctx: ExtensionCommandContext,
-	title: string,
-	entries: readonly T[],
-): Promise<T | undefined> {
-	const choice = await ctx.ui.select(
-		title,
-		entries.map((entry) => entry.label),
-	);
-	return entries.find((entry) => entry.label === choice);
-}
-
-/** Sign in through the broker's browser login; undefined when the user cancels or it times out. */
-async function signInAccount(
-	deps: AccountCommandDeps,
-	ctx: ExtensionCommandContext,
-	way: LoginWay,
-): Promise<BrokerAccount | undefined> {
-	const started = await deps.client.startLogin(way.provider);
-	const login = started.type === "browser" ? started : await acknowledgeLoginRisk(deps, ctx, started);
-	if (!login) return undefined;
-	openBrowser(login.url);
-	ctx.ui.notify(
-		`Sign in to ${way.title} in your browser. If it did not open, visit:\n${login.url}${login.userCode ? `\nCode: ${login.userCode}` : ""}`,
-		"info",
-	);
-	return waitForLogin(deps, ctx, login, way.title);
-}
-
-async function acknowledgeLoginRisk(
-	deps: AccountCommandDeps,
-	ctx: ExtensionCommandContext,
-	login: Extract<BrokerLogin, { type: "acknowledge-risk" }>,
-): Promise<Extract<BrokerLogin, { type: "browser" }> | undefined> {
-	try {
-		if (await ctx.ui.confirm("Acknowledge subscription sign-in risk?", login.warning)) {
-			return await deps.client.acknowledgeLoginRisk(login.state);
-		}
-	} catch (error) {
-		await deps.client.cancelLogin(login.state).catch(() => {});
-		throw error;
-	}
-	await deps.client.cancelLogin(login.state).catch(() => {});
-	ctx.ui.notify("Sign-in cancelled.", "warning");
-	return undefined;
-}
-
-async function waitForLogin(
-	deps: AccountCommandDeps,
-	ctx: ExtensionCommandContext,
-	login: Extract<BrokerLogin, { type: "browser" }>,
-	title: string,
-): Promise<BrokerAccount | undefined> {
-	// The broker's callback listener normally completes the login. The input lets the user paste the
-	// redirect URL when the browser cannot reach it (remote or headless sessions).
-	const dismiss = new AbortController();
-	let finished = false;
-	let cancelled = false;
-	void ctx.ui
-		.input(`Waiting for ${title} sign-in`, "Paste the redirect URL only if the browser shows an error", {
-			signal: dismiss.signal,
-		})
-		.then(async (value) => {
-			if (finished) return;
-			if (value?.trim()) await deps.client.submitLoginCallback(login.state, value.trim());
-			else cancelled = true;
-		})
-		.catch((error: unknown) => {
-			cancelled = true;
-			ctx.ui.notify(`Callback rejected: ${error instanceof Error ? error.message : String(error)}`, "error");
-		});
-
-	let account: BrokerAccount | undefined;
-	try {
-		const deadline = Date.now() + LOGIN_TIMEOUT_MS;
-		while (!cancelled && Date.now() < deadline) {
-			const status = await deps.client.loginStatus(login.state);
-			if (status.status === "error") throw new Error(status.error ?? "Sign-in failed");
-			if (status.status === "ok") {
-				account = status.account;
-				break;
-			}
-			await new Promise((resolve) => setTimeout(resolve, LOGIN_POLL_MS));
-		}
-	} finally {
-		finished = true;
-		dismiss.abort();
-		if (!account) await deps.client.cancelLogin(login.state).catch(() => {});
-	}
-	if (!account) ctx.ui.notify(cancelled ? "Sign-in cancelled." : "Sign-in timed out.", "warning");
-	return account;
-}
-
-async function finishAdding(
-	deps: AccountCommandDeps,
-	ctx: ExtensionCommandContext,
-	message: string,
-	hadAccounts: boolean,
-): Promise<void> {
+	const added = await enrollAccount(deps.client, ctx, requested);
+	if (!added) return;
 	await deps.registry.sync(ctx);
-	ctx.ui.notify(message, "info");
+	ctx.ui.notify(`Added ${accountDisplayName(added)}. It funds the matching pools; /accounts switch pins it.`, "info");
 	if (!hadAccounts) await adoptPoolAsDefault(deps, ctx);
-}
-
-/** Ask for a provider API key and add it after the broker validates it. */
-async function addApiKeyAccount(
-	deps: AccountCommandDeps,
-	ctx: ExtensionCommandContext,
-	way: ApiKeyWay,
-): Promise<BrokerAccount | undefined> {
-	const name = (await ctx.ui.input("Name for this API key", "for example: work"))?.trim();
-	if (!name) return undefined;
-	// Extension dialogs have no masked input, so the key is visible while typed.
-	const key = (await ctx.ui.input(`${way.title} API key (visible while typing)`, way.placeholder))?.trim();
-	if (!key) return undefined;
-	const account = await deps.client.addApiKey(name, key, way.provider);
-	if (!account) ctx.ui.notify("The broker did not return the new account.", "warning");
-	return account;
 }
 
 function providerModels(ctx: ExtensionContext, spec: AccountProviderSpec): Model<Api>[] {
 	return ctx.modelRegistry.getAll().filter((model) => model.provider === spec.id);
+}
+
+function matchingCurrentModel(
+	deps: AccountCommandDeps,
+	ctx: ExtensionContext,
+	spec: AccountProviderSpec,
+	models: readonly Model<Api>[],
+): Model<Api> | undefined {
+	const current = ctx.model;
+	if (!current) return undefined;
+	const candidate = models.find((model) => model.id === current.id && model.api === current.api);
+	if (!candidate) return undefined;
+	const currentFamily = isBrokerProvider(current.provider)
+		? deps.registry.modelRouteFamily(current.provider, current.id)
+		: sharedRouteFamily(familyOf(current.provider));
+	const targetFamily = deps.registry.modelRouteFamily(spec.id, candidate.id);
+	return currentFamily && targetFamily === currentFamily ? candidate : undefined;
 }
 
 async function chooseModel(

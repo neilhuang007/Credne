@@ -1,10 +1,10 @@
-// Maps short model family aliases such as "sol" to the newest model of that family for subagent dispatch.
+// Shared model family aliases such as "sol" for normal selection and subagent dispatch.
 import type { Api, Model } from "@earendil-works/pi-ai";
 import aliases from "./model-aliases.json" with { type: "json" };
 
 type AliasRow = (typeof aliases)[number];
 
-/** Returns the pool model that the first matching alias row names, matching on model ID only. */
+/** Returns the model that the first supported alias row names, matching on model ID only. */
 export function resolveModelAlias(alias: string, models: readonly Model<Api>[]): Model<Api> | undefined {
 	const query = alias.toLowerCase();
 	return findAliasTarget((row) => row.alias === query, models);

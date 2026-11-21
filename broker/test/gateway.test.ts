@@ -108,6 +108,126 @@ for (const kind of ["api-key", "oauth"] as const) {
 	}, 10000);
 }
 
+test("the global GPT pool returns to ChatGPT before charging a previously used API key", async () => {
+	const home = await mkdtemp(join(tmpdir(), "credne-gpt-pool-"));
+	const calls: string[] = [];
+	const model = "gpt-5.4";
+	let subscriptionRateLimited = false;
+	const access = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64url")}.test`;
+	const upstream = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			await request.arrayBuffer();
+			const authorization = request.headers.get("authorization") ?? "";
+			calls.push(authorization);
+			if (subscriptionRateLimited && authorization === `Bearer ${access}`) {
+				return Response.json(
+					{ error: { message: "Usage limit" } },
+					{ status: 429, headers: { "retry-after": "60" } },
+				);
+			}
+			const part = { type: "output_text", text: "Done", annotations: [] };
+			const item = { id: "msg_1", type: "message", role: "assistant", status: "completed", content: [part] };
+			const frames = [
+				{ type: "response.created", response: { id: "resp_1", model, status: "in_progress", output: [] } },
+				{
+					type: "response.output_item.added",
+					output_index: 0,
+					item: { ...item, content: [], status: "in_progress" },
+				},
+				{
+					type: "response.content_part.added",
+					output_index: 0,
+					content_index: 0,
+					item_id: item.id,
+					part: { ...part, text: "" },
+				},
+				{
+					type: "response.output_text.delta",
+					output_index: 0,
+					content_index: 0,
+					item_id: item.id,
+					delta: part.text,
+				},
+				{ type: "response.output_item.done", output_index: 0, item },
+				{
+					type: "response.completed",
+					response: {
+						id: "resp_1",
+						model,
+						status: "completed",
+						output: [item],
+						usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+					},
+				},
+			];
+			return new Response(
+				frames.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(""),
+				{
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		},
+	});
+	const accounts = new Accounts({ home, anthropicBaseUrl: upstream.url.origin, openaiBaseUrl: upstream.url.origin });
+	const gateway = new Gateway(accounts, 0);
+	const record = { models: [model], createdAt: "", baseUrl: upstream.url.origin };
+	const send = async (target = "p.all", expectedStatus = 200) => {
+		const response = await gateway.execute(
+			new Request("http://gateway-test", {
+				method: "POST",
+				headers: { "content-type": "application/json", "session-id": "same-chat" },
+				body: JSON.stringify({ model, input: "hello", stream: false }),
+			}),
+			target,
+			"/responses",
+		);
+		await response.text();
+		expect(response.status).toBe(expectedStatus);
+		return response.headers.get("x-credne-account");
+	};
+	try {
+		await accounts.load();
+		await accounts.register(
+			{ ...record, id: "paid", name: "paid", provider: "openai-api", kind: "api-key" },
+			{ type: "api_key", key: "test-key", source: "login" },
+		);
+		expect(await send()).toBe(accountKey("paid"));
+		const subscription = await accounts.register(
+			{ ...record, id: "subscription", name: "subscription", provider: "codex", kind: "oauth" },
+			{ type: "oauth", access, refresh: "fixture", accountId: "test", expires: Date.now() + 3600000 },
+		);
+		expect(await send()).toBe(accountKey("subscription"));
+		subscriptionRateLimited = true;
+		expect(await send()).toBe(accountKey("paid"));
+		subscriptionRateLimited = false;
+		await accounts.mutate(subscription, "reset");
+		expect(await send()).toBe(accountKey("subscription"));
+		expect(await send(`a.${accountKey("paid")}`)).toBe(accountKey("paid"));
+		await accounts.register(
+			{ ...record, id: "unrelated", name: "unrelated", provider: "claude-api", kind: "api-key" },
+			{ type: "api_key", key: "other-fixture" },
+		);
+		await send("p.all", 409);
+		expect(await send("p.codex")).toBe(accountKey("subscription"));
+		expect(calls).toEqual([
+			"Bearer test-key",
+			`Bearer ${access}`,
+			`Bearer ${access}`,
+			"Bearer test-key",
+			`Bearer ${access}`,
+			"Bearer test-key",
+			`Bearer ${access}`,
+		]);
+	} finally {
+		gateway.close();
+		accounts.close();
+		await upstream.stop(true);
+		await rm(home, { recursive: true, force: true });
+	}
+}, 10000);
+
 test("Claude pools favor subscriptions over API keys even after an API key served the session", async () => {
 	const home = await mkdtemp(join(tmpdir(), "credne-claude-pool-"));
 	const model = "claude-test";

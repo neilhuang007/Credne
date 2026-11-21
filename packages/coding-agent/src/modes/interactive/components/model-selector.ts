@@ -2,7 +2,6 @@ import { type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import {
 	Container,
 	type Focusable,
-	fuzzyFilter,
 	getKeybindings,
 	getSelectPageIndex,
 	Input,
@@ -12,8 +11,9 @@ import {
 } from "@earendil-works/pi-tui";
 import { USES_BROKER_AUTH } from "../../../config.ts";
 import type { ModelRuntime } from "../../../core/model-runtime.ts";
+import { getModelSelectionChoices } from "../../../core/model-selection.ts";
 import { refreshModelCatalogs } from "../model-catalog-refresh.ts";
-import { getDistinctModelName, getModelSelectorSearchText } from "../model-search.ts";
+import { filterModelSelection, getDistinctModelName, getModelSelectorSearchText } from "../model-search.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyDisplayText, keyHint } from "./keybinding-hints.ts";
@@ -166,7 +166,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private loadModelsFromSnapshot(): void {
-		const models = this.modelRuntime.getAvailableSnapshot().map((model: Model<any>) => ({
+		const models = getModelSelectionChoices(this.modelRuntime.getAvailableSnapshot()).map((model) => ({
 			provider: model.provider,
 			id: model.id,
 			model,
@@ -287,10 +287,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private filterModels(query: string, preferredModel?: Model<any>): void {
 		if (query) {
-			const filtered = fuzzyFilter(this.activeModels, query, (item) => {
-				const defaultText = this.isDefaultModel(item.model) ? " default" : "";
-				return `${getModelSelectorSearchText({ id: item.id, provider: item.provider, name: item.model.name })}${defaultText}`;
-			});
+			const filtered = filterModelSelection(
+				this.activeModels,
+				query,
+				(item) => item.model,
+				(item) => {
+					const defaultText = this.isDefaultModel(item.model) ? " default" : "";
+					return `${getModelSelectorSearchText({ id: item.id, provider: item.provider, name: item.model.name })}${defaultText}`;
+				},
+			);
 			if (this.isDefaultSearch(query)) {
 				const defaultItems = this.activeModels.filter((item) => this.isDefaultModel(item.model));
 				const defaultKeys = new Set(defaultItems.map((item) => `${item.provider}\0${item.id}`));

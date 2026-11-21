@@ -5,13 +5,8 @@ import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types
 import { isToolCallEventType } from "../../core/extensions/types.ts";
 import { resolveToCwd } from "../../core/tools/path-utils.ts";
 import { BrokerClient, locateBrokerBinary } from "./client.ts";
-import {
-	ACCOUNT_SUBCOMMANDS,
-	type AccountCommandDeps,
-	ADD_ARGUMENTS,
-	runAccountCommand,
-	showModels,
-} from "./commands.ts";
+import { ACCOUNT_SUBCOMMANDS, type AccountCommandDeps, runAccountCommand, showModels } from "./commands.ts";
+import { ADD_ARGUMENTS } from "./enrollment.ts";
 import { AccountRegistry } from "./registry.ts";
 
 export function createAccountBrokerClient(agentDir = getAgentDir()): BrokerClient {

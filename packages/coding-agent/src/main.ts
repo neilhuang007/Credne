@@ -539,6 +539,7 @@ function buildSessionOptions(
 			cliModel: parsed.model,
 			cliThinking: parsed.thinking,
 			inlineApiKey: Boolean(parsed.apiKey),
+			scopedModels,
 			modelRuntime,
 		});
 		if (resolved.warning) {
