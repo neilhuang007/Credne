@@ -2,6 +2,8 @@
 
 Credne is a Pi-based coding agent with account switching, planning, and subagents. Install [Node.js](https://nodejs.org/) 22.19 or newer first.
 
+## Install the released version (0.1.3)
+
 **Windows x64:** Run these commands in PowerShell or Command Prompt. The release includes the account broker and runtime dependencies; no source checkout or Go compiler is needed.
 
 ```shell
@@ -13,7 +15,7 @@ credne.cmd
 
 For the default Bash tool and `!` shell commands, install [Git for Windows](https://git-scm.com/download/win) if you don't already have Bash.
 
-**macOS and Linux:** Build the tagged release with Git, Node.js and Go 1.26.10 or newer:
+**macOS and Linux (0.1.3 only):** The tagged release uses the previous Go broker. Build it with Git, Node.js and Go 1.26.10 or newer:
 
 ```sh
 git clone --branch 0.1.3 --depth 1 https://github.com/neilhuang007/Credne.git
@@ -30,6 +32,33 @@ credne --version
 ```
 
 Run `credne` in the directory you want to work on. Use `/accounts add` to connect an account. See the [0.1.3 release notes](https://github.com/neilhuang007/Credne/releases/tag/0.1.3) for changes.
+
+## Build the current source
+
+Current source replaces the Go broker with a Bun-compiled service built on `@oh-my-pi/pi-ai`. The Credne CLI still runs on Node.js.
+
+Install Git, Node.js 22.19 or newer, and [Bun](https://bun.sh/) 1.4.4 or newer. Build on the platform and architecture where you will install Credne:
+
+```sh
+git clone https://github.com/neilhuang007/Credne.git
+cd Credne
+npm ci --ignore-scripts
+npm run build
+node credne/scripts/build.mjs
+npm pack ./credne --ignore-scripts
+npm install --global --ignore-scripts ./neilhuang007-credne-0.1.3.tgz
+credne --version
+```
+
+On Windows, use `npm.cmd` and `credne.cmd` if PowerShell blocks the npm command wrappers.
+
+The package includes the compiled `credne-broker` executable and its runtime assets. Keep the `pi_natives.*.node` files beside the executable in `bin/`; the broker needs them for native locking and credential storage. SQLite and the provider catalog are included in the compiled runtime. Installed users need Node.js, but not Bun or Go.
+
+`--skip-broker` is only for rebuilding CLI assets when an existing broker package is already available. Normal releases must include the broker and its native assets.
+
+To build only the broker, run `npm --prefix broker run build`. Copy every file from `broker/dist/` together, not only the executable. Both build commands use `scripts/build-account-broker.mjs`.
+
+These source instructions do not describe the existing 0.1.3 release archive. That archive retains its original Go broker.
 
 ## About upstream Pi
 

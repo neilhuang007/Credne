@@ -1,3 +1,4 @@
+import { USES_BROKER_AUTH } from "../../config.ts";
 import type { ExtensionAPI, ExtensionCommandContext } from "../../core/extensions/types.ts";
 import { formatBytes, LlamaClient, type LlamaModelInfo, normalizeLlamaServerUrl } from "./client.ts";
 import { findHuggingFaceToken, HuggingFaceClient } from "./huggingface.ts";
@@ -29,14 +30,19 @@ function parseHuggingFaceModel(value: string): { repository: string; quantizatio
 async function configuredClient(ctx: ExtensionCommandContext): Promise<LlamaClient | undefined> {
 	const result = await ctx.modelRegistry.getProviderAuth(LLAMA_PROVIDER_ID);
 	if (!result) {
-		ctx.ui.notify(`Configure llama.cpp with /login ${LLAMA_PROVIDER_ID}`, "warning");
+		ctx.ui.notify(
+			USES_BROKER_AUTH
+				? "Set LLAMA_BASE_URL to an unauthenticated loopback llama.cpp server."
+				: `Configure llama.cpp with /login ${LLAMA_PROVIDER_ID}`,
+			"warning",
+		);
 		return undefined;
 	}
 	const configuredUrl = result.env?.LLAMA_BASE_URL;
 	const serverUrl = normalizeLlamaServerUrl(
 		typeof configuredUrl === "string" && configuredUrl ? configuredUrl : (result.auth.baseUrl ?? ""),
 	);
-	return new LlamaClient(serverUrl, result.auth.apiKey);
+	return new LlamaClient(serverUrl, USES_BROKER_AUTH ? undefined : result.auth.apiKey);
 }
 
 export default function llamaExtension(pi: ExtensionAPI): void {

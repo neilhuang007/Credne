@@ -1,18 +1,22 @@
 # Multiple Accounts
 
-The built-in `accounts` extension connects several accounts per provider, for example two Claude subscriptions, a Claude API key and a ChatGPT subscription. Each session chooses which account it uses, and two terminals can use two different accounts at the same time. Claude Pro, Max and Team subscriptions are signed in and served by Credne itself: it keeps their tokens and sends their requests straight to Anthropic. Every other account (ChatGPT subscriptions, Claude API credits and API keys, OpenAI API keys) is held by a separate shared process, the account broker (`credne-broker`), which embeds [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). Pi keeps sessions, prompts, tools and the agent loop. The broker design is described in `broker/README.md` in the repository.
+The built-in `accounts` extension connects several accounts per provider, for example two Claude subscriptions, a Claude API key and a ChatGPT subscription. Two terminals can use different accounts at the same time. Claude and ChatGPT subscriptions, Anthropic API keys and OpenAI API keys all authenticate and send requests through `credne-broker`, a shared Bun daemon backed by [oh-my-pi AI](https://github.com/can1357/oh-my-pi/tree/main/packages/ai). Credne keeps sessions, prompts, tools and the agent loop. The daemon design is described in `broker/README.md` in the repository.
 
 ## Setup
 
-Build the broker once and put it in Pi's bin directory or on `PATH`:
+Build the daemon with Bun 1.4.4 or newer and put it in Pi's bin directory or on `PATH`:
 
 ```bash
-cd broker && go build -o ~/.pi/agent/bin/credne-broker ./cmd/credne-broker
+npm --prefix broker run build
+mkdir -p ~/.pi/agent/bin
+cp broker/dist/* ~/.pi/agent/bin/
 ```
 
-Pi starts the broker on demand, and every Pi process shares it. The broker stops after 30 minutes without requests and starts again on the next one. Set `PI_ACCOUNTS_BROKER` to use a binary elsewhere. A setup with only Claude subscriptions never starts the broker.
+Pi discovers the daemon through `broker.json` in the accounts directory. If none is running, Pi starts it detached. Concurrent starts share one daemon, and it outlives the Pi process that started it. The daemon stops after 30 minutes without requests and starts again on the next one. Set `PI_ACCOUNTS_BROKER` to use a binary elsewhere. Installed Credne distributions include the executable and do not need Bun installed. Claude subscriptions also need the daemon.
 
-With no accounts configured, the extension registers no providers. Open `/accounts` to add one, or run `/accounts add`.
+Stop a previous-version broker before starting this version. If the previous backend is incompatible, Credne reports its process ID instead of reusing it or starting a second daemon beside it.
+
+With no accounts configured, the extension registers no providers. Open `/accounts` to add one, or run `/accounts add`. If managed accounts already exist but the local model catalog is missing, opening `/accounts` starts the broker and rebuilds the catalog.
 
 ## Adding accounts
 
@@ -20,47 +24,40 @@ Run `/accounts add` and choose `Claude account` or `ChatGPT account`. The next m
 
 | Account | Way | What you do |
 | --- | --- | --- |
-| Claude | `Subscription (Pro, Max, Team sign-in)` | Sign in with your claude.ai account in the browser. Credne stores and refreshes the sign-in itself; see [Claude subscriptions](#claude-subscriptions). |
-| Claude | `API credits (monthly credits of Max, Ultra, Team plans, Claude Console sign-in)` | Name the account, then sign in to a Claude Console organization in the browser. Usage draws on that organization's API credits. |
+| Claude | `Subscription (Pro, Max, Team sign-in)` | Sign in with your claude.ai account in the browser. The broker stores and refreshes the sign-in. |
 | Claude | `API key (Anthropic Console key)` | Name the account, then paste an Anthropic API key. |
 | ChatGPT | Subscription | Sign in with your ChatGPT account in the browser. |
 | ChatGPT | `API key (OpenAI API credits)` | Name the account, then paste an OpenAI API key. Requests use the official OpenAI API with that project's API billing. |
 
-Escape in the method menu returns to the family menu; Escape there cancels. `/accounts add claude` and `/accounts add chatgpt` open their respective menus. Use `/accounts add openai-api-key` for an OpenAI API key, `/accounts add codex` for a ChatGPT subscription, or `/accounts add claude-subscription`, `claude-api-credits`, or `claude-api-key` for a Claude method.
+Escape in the method menu returns to the family menu; Escape there cancels. `/accounts add claude` and `/accounts add chatgpt` open their respective menus. Skip the menu with `/accounts add claude-subscription`, `/accounts add claude-api-key`, `/accounts add codex`, or `/accounts add openai-api-key`.
 
 OpenAI API keys are registered as `openai-api` accounts with kind `api-key`. They use the official OpenAI API and never authenticate through Codex. Their family pool is `pool:openai`; ChatGPT subscription accounts stay in `pool:codex`.
 
-The same account cannot be added twice the same way. The broker rejects a second account with the same API key (including keys in `config.yaml`) or the same name, and an API-credit sign-in to a Console organization that is already added; the new `ant` sign-in is then signed out. Signing in again to a Claude subscription that is already added (the same Claude account and organization) renews its sign-in, keeps its `disabled` setting and reports that no account was added; the same login in two organizations is two accounts. Signing in again to a ChatGPT subscription does the same. Adding the same person in two different ways, for example a subscription and API credits, is allowed: they are separate accounts with separate limits.
+The broker rejects a second account with the same API key (including keys in `config.yaml`) or the same name. Signing in again to a subscription that is already in the broker renews its sign-in, keeps its `disabled` setting and reports that no account was added. A subscription and an API key are separate accounts with separate limits.
 
-For browser sign-in, Pi opens the page and also shows the link, so you can open it yourself. The redirect is normally received automatically. If the browser shows an error after sign-in, or Pi runs on another machine than the browser, copy the full redirect URL (or the code the page shows) from the browser and paste it into the prompt that Pi shows. For a Claude subscription the first prompt offers the browser login or pasting a code. Sign-in times out after five minutes.
+For browser sign-in, Credne opens the page and also shows the link, so you can open it yourself. If oh-my-pi asks you to acknowledge a subscription sign-in risk, Credne shows its warning and waits for explicit confirmation before opening the browser. Declining cancels sign-in. The redirect is normally received automatically. If the browser shows an error after sign-in, or Credne runs on another machine than the browser, copy the full redirect URL from the browser and paste it into the prompt. Sign-in times out after five minutes.
 
 The API-key prompt shows the key while you type, because extension dialogs have no masked input. The broker checks the key by listing its models before it stores the account, so an invalid key is rejected and nothing is saved.
 
 The first account you add also becomes the default for new sessions, unless a default model is already configured. The default is the combined pool `pool:all`, described below.
 
-## Claude subscriptions
+## Upgrading from local Claude subscriptions or Console credits
 
-A Claude subscription is a local account. `/accounts add claude-subscription` runs Anthropic's OAuth login in Credne and stores the result in `~/.pi/agent/accounts/claude-subscriptions.json`, one entry per account. Credne refreshes an access token shortly before it expires, under a lock on that file, so several Credne processes never use the same rotating refresh token twice. Requests go straight to `api.anthropic.com` with the account's token, shaped like Claude Code requests. The broker never sees these tokens.
+If you used a `claude-sub:<id>` provider, sign in again with `/accounts add claude-subscription`, then use `/accounts switch` to choose the broker account or `pool:claude`. Credne does not read, migrate or delete the old `~/.pi/agent/accounts/claude-subscriptions.json` file. Broker-managed Claude subscriptions are listed as `acct:<id>`, like other accounts.
 
-Each account is a provider named `claude-sub:<id>`, where `<id>` is eight hex digits of a hash of the Claude account and organization, followed by the local part of the email address when known, for example `claude-sub:1a2b3c4d-you`. The models are the built-in Anthropic models. `/accounts` lists, enables, disables and removes these accounts like any other; removing one deletes its stored sign-in.
-
-The panel's usage view asks Anthropic's usage endpoint for the account's windows and shows the `5-hour` and `7-day` windows, the model-scoped weekly caps that are reported (for example `7-day Sonnet`) and the extra-usage credits. It also asks the profile endpoint for the plan, which becomes part of the account's name (for example `Max 5x`). Every response's rate-limit headers update the same windows while you work, and pools use them to choose an account (see Pools).
-
-### Moving subscriptions from the broker
-
-Earlier versions kept Claude subscriptions in the broker. When a session starts, Credne moves every `claude-*.json` file in `~/.pi/agent/accounts/auths` to the local store: it first writes the account (tokens, organization, device id, `disabled`) into `claude-subscriptions.json`, and only then removes the broker's copy, through the broker when one is running and by deleting the file otherwise. The two sides therefore never refresh the same refresh token. The move is repeatable: an account the local store already has is not overwritten, and a removal that failed is retried at the next start. No token is printed.
+Claude Console browser sign-in (`/accounts add claude-api-credits`) is no longer supported. Existing Console credentials are left untouched and are not used by the broker. To use Anthropic's API, add a Console API key with `/accounts add claude-api-key`.
 
 ## Subscription web search
 
 Ask Credne to “search the web for the current Node.js LTS release and cite the release page.” The built-in `web_search` tool sends only its query to hosted web search. It follows Claude Code's WebSearch design: a separate request on the subscription's light-tier model runs the provider's hosted search (up to 8 searches on Claude) and briefly summarizes the results. The tool returns each search's links and that summary, and the main model cites the links it uses. Pass `allowed_domains` or `blocked_domains` to restrict results; Claude filters them at the provider, while ChatGPT search is told the restriction and its links are filtered locally. Add a subscription once with `/accounts add codex` or `/accounts add claude-subscription`. Searches consume provider usage and require a model and plan with hosted search enabled.
 
-A session on a Claude subscription (`claude-sub:<id>`) searches with that account. A session on `pool:claude` or `pool:all` with a Claude model searches on the local Claude subscriptions that offer the session's model, the one that answered last first. Whatever model the session uses, a search runs on the light-tier model of the subscription that serves it (see [Model tiers](subagents.md#model-tiers)); a subscription that serves no light-tier model searches on the session's model instead. A subscription at its usage limit passes the search to the next one; when all are at their limit, Credne reports it. From a non-Claude model, or when no Claude subscription is available, search uses a broker subscription (ChatGPT first). If the search provider rejects the request for another reason, Credne reports the error rather than retrying it on a different billing route. API-key accounts, Claude Console credits, and public search engines are never automatic fallbacks.
+Both Claude and ChatGPT hosted searches use a broker subscription. A session pinned to a subscription searches with that account only. A pool searches with a compatible subscription that offers the session's model and can try the next eligible subscription after a rate limit. Searches use the account's light-tier model when available (see [Model tiers](subagents.md#model-tiers)). API keys and public search engines are not automatic fallbacks.
 
-On Claude, the search is a request on the subscription's light-tier model through Credne's model registry, so it goes out like any other request of that account, with Anthropic's hosted `web_search_20250305` tool added. ChatGPT searches call the provider's hosted tool through the account broker. This avoids a second login, a Claude bridge model, or sharing credentials with an external plugin. If you prefer a community extension, one that registers `web_search` replaces the built-in. For a separate keyless service, configure it explicitly using [MCP](mcp.md). The bundled explorer and deep-research (`crazy`) profiles include `web_search`; add the tool to `tools:` in a custom profile to enable it there.
+This needs no second login, bridge model or shared credentials. If you prefer a community extension, one that registers `web_search` replaces the built-in. For a separate keyless service, configure it explicitly using [MCP](mcp.md). The bundled explorer and deep-research (`crazy`) profiles include `web_search`; add the tool to `tools:` in a custom profile to enable it there.
 
 ## Accounts and providers
 
-Each account appears as its own provider: `claude-sub:<id>` for a Claude subscription and `acct:<id>` for a broker account. For example, `--model claude-sub:1a2b3c4d-you/claude-opus-4-8` or `--model acct:claude-api-1a2b3c4d-you@example.com/claude-sonnet-4-5` starts a session on one account. Accounts also appear in `/model`, where choosing one saves it as the default for new sessions, as any other model does.
+Each account appears as a provider named `acct:<id>`. For example, `--model acct:claude-api-work/claude-sonnet-4-5` starts a session on one account when that provider and model are registered. Accounts also appear in `/model`, where choosing one saves it as the default for new sessions.
 
 The accounts list shows each account with its state and model count:
 
@@ -70,39 +67,30 @@ Claude · work key (API key)        cooling down until 14:05   12 models
 ChatGPT Codex · you@example.com (Plus)   disabled   7 models
 ```
 
-Each account name shows its family (Claude or ChatGPT Codex), its label or email, and its plan or kind. The state line of a broker account is one of `ready`, `cooling down until ...`, `quota exceeded`, `unavailable`, `error`, or `disabled`. A Claude subscription shows `ready`, `limit reached until ...` while a usage window that applies is used up or a request reported a limit, or `disabled`.
+Each account name shows its family, its label or email, and its plan or kind. Its state can be `ready`, `cooling down until ...`, `quota exceeded`, `unavailable`, `error`, or `disabled`.
 
 ## Pools
 
-A pool is a provider that spreads requests over several accounts, choosing which enabled account that offers the requested model serves each request. There is one pool per model family and one combined pool. `pool:claude` and `pool:all` are routed by Credne itself, in the process, and their requests go to the local Claude subscriptions or to the broker's accounts directly. `pool:codex` and `pool:openai` are provided by the broker:
+A pool is a provider that lets the broker route each request to an enabled account that offers the requested model. There is one pool per model family and one combined pool:
 
 | Pool | Provider | Contents |
 | --- | --- | --- |
-| All accounts | `pool:all` | Every enabled account, of any family: Claude subscriptions first, then the broker's accounts. This is the default for new sessions after the first account is added. |
-| Claude | `pool:claude` | Enabled Claude subscriptions, then Claude API-credit accounts and Claude API keys. |
+| All accounts | `pool:all` | Every enabled account, of any family. This is the default for new sessions after the first account is added, unless a default model is already configured. |
+| Claude | `pool:claude` | Enabled Claude subscriptions and Anthropic API keys. |
 | ChatGPT Codex | `pool:codex` | Enabled ChatGPT subscriptions. |
 | OpenAI API | `pool:openai` | Enabled OpenAI API key accounts. |
 
 A pool exists as soon as one enabled account belongs to its family, so `pool:claude` is listed even with a single Claude account. Pool models are the union of the models of its accounts. When a model is listed by more than one account, a request for it can be served by any of them.
 
-`pool:claude` and `pool:all` pick the account for each request in this order: Claude subscriptions, then the broker's Claude API accounts; in `pool:all` the broker's other accounts serve the models only they offer. Among subscriptions the pool follows how oh-my-pi ranks OAuth accounts:
-
-- A conversation stays on the account that answered last while that account can serve the request and its prompt cache can still be warm (the last answer is less than an hour old), so provider-side caches and reasoning state stay valid. An API account that has the conversation yields as soon as a subscription can serve again.
-- Otherwise Credne asks Anthropic's usage endpoint for the windows of accounts whose usage is unknown or older than five minutes (waiting at most five seconds), and ranks the subscriptions. An account whose allowance for the model is spent ranks last. An account whose 5-hour window is at least 85% used ranks behind cooler ones. Accounts with known usage rank before accounts without. Then the account whose remaining weekly quota must be used fastest to avoid expiring at its reset comes first, which also means the account with the most remaining capacity when resets coincide, then the 5-hour window the same way. The listing order breaks ties.
-- An account is blocked while a window that applies to the request is used up, until its reset, and after a request reported a limit. A limit reported without a reset time blocks for a minute. A Fable or Mythos limit blocks only those models, other limits block the whole account. A successful response lifts a block, and so does a usage report that shows the account healthy.
-- A retry after a rate limit (HTTP 429) or a usage-limit failure blocks the failed account and moves the request to the next one. Per-minute token throttles are not usage limits and stay on the account. When every account is blocked, a retry waits up to five seconds for the account that frees up first; otherwise that account gets the request and reports its own limit.
-
-The pool's state is kept in memory by each Credne process. A worker started by the subagent tool is pinned to the account its parent last used and does not rotate. The footer shows which account served the last request (see below).
-
-A broker pool (`pool:codex`, `pool:openai`) keeps a conversation on one account while that account is usable. If the account hits a limit, the broker moves the next request to another account in the pool.
+For Claude models, `pool:claude` and `pool:all` try eligible Claude subscriptions before API-key accounts. The broker balances eligible accounts and, when session affinity is enabled, prefers the account already serving the conversation within that billing group. If no eligible subscription is available, or the broker can retry a failed subscription request, the pool can fall back to an eligible API key and incur API charges. Use a pinned subscription if requests must stay on subscription billing. The footer shows which account served the last request.
 
 ## Pinned accounts
 
-A session on `claude-sub:<id>` or `acct:<id>` is pinned to one account. Every request uses that account. When it is rate-limited, out of quota or rejected, Pi reports the error with the account name and the provider's retry time, and it never moves the session to another account. Use a pool when you want failover, and a pinned account when you need a specific account.
+A session on `acct:<id>` is pinned to one account. Every request uses that account. When it is rate-limited, out of quota or rejected, Pi reports the error with the account name and the provider's retry time, and it never moves the session to another account. Use a pool when you want failover, and a pinned account when you need a specific account.
 
 ## Decision model through an OpenAI API key
 
-OpenAI's Decisions API classifies a state with structured questions, which Credne uses for cheap rating and routing decisions. It accepts only an OpenAI API key: Sign in with ChatGPT tokens are rejected, so a ChatGPT subscription cannot serve it. The built-in `openai` provider declares the `gpt-6-luna` classifier but hides it while you sign in with ChatGPT, and when the key lives in the broker instead of `OPENAI_API_KEY`, Pi has no key for it. The accounts extension closes that gap: an OpenAI API-key account in the broker provides its own `gpt-6-luna` classifier whose requests go through the broker.
+OpenAI's Decisions API classifies a state with structured questions, which Credne uses for rating and routing decisions. It accepts only an OpenAI API key, not a ChatGPT sign-in. An OpenAI API-key account in the broker can provide a `gpt-6-luna` classifier without exposing its key to Credne.
 
 Each of these appears in `ctx.modelRegistry.getAvailableOfType("classifier")` and works with `classify()`:
 
@@ -111,7 +99,7 @@ Each of these appears in `ctx.modelRegistry.getAvailableOfType("classifier")` an
 | `acct:<id>` of an OpenAI API key | `gpt-6-luna` | That key, never another account. |
 | `pool:openai` | `gpt-6-luna` | An enabled OpenAI API key that lists `gpt-6-luna`. |
 
-An account or pool gets the classifier only when an enabled OpenAI API key lists `gpt-6-luna` in its models. ChatGPT subscriptions, Claude accounts, `pool:codex`, `pool:claude` and `pool:all` have none: the last two are routed by Credne itself and are not broker routes. The classifier copies its cost and limits from the built-in `openai` entry, so session costs use the same Decisions rate (input tokens only). The key's own OpenAI project is billed.
+An account or pool offers the classifier only when an enabled OpenAI API key lists `gpt-6-luna` in its models. ChatGPT subscriptions, Claude accounts, `pool:codex`, `pool:claude` and `pool:all` do not offer it. The classifier copies its cost and limits from the built-in `openai` entry, so session costs use the same Decisions rate (input tokens only). The key's own OpenAI project is billed.
 
 Requests use the same loopback connection and per-run token as chat. Pi posts to `/credne/v1/route/<target>/decisions`, and the broker sends the body to `/v1/decisions` with the account's key and returns OpenAI's status and body unchanged. A target that is not an OpenAI API key is refused with HTTP 400 and nothing is sent. The footer is not updated by a classification, because `pool:openai` may serve it with another key than the chat.
 
@@ -127,9 +115,9 @@ The classifier is registered with the other models of the account from the catal
 | `/accounts switch [account]` | Switch this session and remember the account or pool for new sessions. The current model stays if the account offers it. Other running sessions are not affected. |
 | `/accounts default [account]` | Same as `/accounts switch`. |
 | `/accounts add [kind]` | Add an account. See "Adding accounts". |
-| `/accounts remove [account]` | Remove an account and delete its stored credential after confirmation. For a Claude subscription this deletes its entry in `claude-subscriptions.json`. |
+| `/accounts remove [account]` | Remove a broker-managed account and delete its stored credential. Interactive mode asks for confirmation. |
 | `/accounts enable\|disable [account]` | Turn an account on or off without removing it. |
-| `/accounts reset [account]` | Clear an account's cooldown and quota state, for example after you know its usage window has reset. For a Claude subscription this forgets the blocks and windows Credne holds for it. |
+| `/accounts reset [account]` | Clear the broker's cooldown for an account, for example after its usage window has reset. |
 | `/models [account]` | List the models of this session's provider. With an account name, list that account's models instead, and choose one to switch this session to it. |
 
 Selections in `/accounts`, `/models`, and `/model`, including model cycling, remember the model and account for the next new session across projects. Resuming an existing session restores that session's recorded selection; an explicit CLI model or project configuration can override the saved default.
@@ -149,13 +137,13 @@ These controls use `tui.select.*`, `app.accounts.manage`, `app.accounts.model`, 
 
 ### Usage and session costs
 
-Claude and ChatGPT Codex subscriptions show each provider-reported quota window (for example `5-hour` or `7-day`) as a bold label, a solid bar filled to the used share with its percent used, and the time until reset with the reset time in your local timezone. API-key, API-credit, and other unsupported account kinds show an explicit unsupported reason. Missing quota data or a failed provider request is unavailable, never 0% used. Clear cooldown only resets broker routing state; it does not reset your subscription allowance.
+Claude and ChatGPT Codex subscriptions show each provider-reported quota window (for example `5-hour` or `7-day`) as a bold label, a solid bar filled to the used share with its percent used, and the time until reset with the reset time in your local timezone. API keys and other accounts without reported usage show an explicit reason. Missing quota data or a failed provider request is unavailable, never 0% used. Clear cooldown only resets broker routing state; it does not reset your subscription allowance.
 
 Provider-reported credits are separate from session cost estimates. Claude extra-usage values retain the provider's credit units; Codex credit balances retain provider credits. They are not converted into subscription charges.
 
 The panel sums the current session's recorded assistant-message costs for the selected pinned account: input, output, cache read, cache write, and total. These dollar values are **API-rate estimates, not billed subscription charges**, and do not measure subscription quota. Missing catalog prices can produce zero recorded estimates; this does not imply free usage. The figures cover recorded assistant responses in this session, including its branches, not all-time usage or background requests.
 
-A response that `pool:claude` or `pool:all` routed is recorded with the account that served it, so it counts in that account's total. Broker pool responses (`pool:codex`, `pool:openai`) are shown separately as **unattributed pool totals**, excluded from every individual account total. The footer's last-serving-account header does not reliably identify each persisted session response, so it is not used to assign broker pool costs to an account.
+Responses on any pool are shown separately as **unattributed pool totals**, excluded from every individual account total. The footer's last-serving-account header is not stored with each reply, so it is not used to assign pool costs to an account.
 
 An account can be named by part of its label, email or id. If exactly one account matches, the command uses it. If several match, Pi shows a list to choose from. Without interactive prompts, name the account exactly.
 
@@ -166,7 +154,7 @@ Restart broker, found in `/accounts`, stops the shared broker. This reloads `con
 The footer shows the account of the current session:
 
 - On a pinned account: `account: Claude · you@example.com (Max)`.
-- On a pool: `account: All accounts pool (3 accounts) -> Claude · work key (API key)`. The name after the arrow is the account that served the last request, so it changes as the pool moves a conversation. For `pool:claude` and `pool:all` it comes from the latest answer in the session. Before the first request the arrow is not shown.
+- On a pool: `account: All accounts pool (3 accounts) -> Claude · work key (API key)`. The name after the arrow is the account that served the last request, so it changes as the pool moves a conversation. Before the broker identifies a serving account for the pool in this session, the arrow is not shown.
 
 ## Switching accounts mid-session
 
@@ -178,14 +166,14 @@ The conversation history is kept when you switch accounts, and the next request 
 
 The label marks the summary as earlier private reasoning, so the model does not treat it as part of its visible reply. Each summary is limited to about 1500 characters. Visible text, tool calls and tool results are kept unchanged. Reasoning the provider marks as redacted is dropped, because it has no readable text.
 
-This applies in two places. Switching a session between accounts, and moving a conversation between accounts inside `pool:claude` or `pool:all`, is handled by Pi. Inside a broker pool, the broker makes the same replacement when the account that served the previous request can no longer serve the conversation, and when an account rejects reasoning from another account. In the second case the broker retries the request once, so the conversation continues without an error.
+Credne handles this when you switch a session to another provider. Inside a pool, the broker handles it when the conversation moves to another account or an account rejects reasoning from another account.
 
 ## Configuration file
 
-Accounts defined in `~/.pi/agent/accounts/config.yaml`, using the CLIProxyAPI v8 `api-keys` layout, appear in the list as API-key accounts. The extension cannot disable, enable or remove them, because the file is their source of truth. Edit the file and choose `Restart broker` in `/accounts` to apply changes. The broker reads the file only at startup. Routing options such as the account selection strategy can also be set there.
+Accounts defined in `~/.pi/agent/accounts/config.yaml`, under `api-keys`, appear in the list as API-key accounts. The extension cannot disable, enable or remove them, because the file is their source of truth. Edit the file and choose `Restart broker` in `/accounts` to apply changes. The daemon reads the file only at startup. See `broker/README.md` for the configuration format and supported routing options.
 
 ## Security
 
-Credentials stay in `~/.pi/agent/accounts`: Claude subscription logins in `claude-subscriptions.json`, ChatGPT subscription logins in `auths`, Anthropic and OpenAI API keys in `api-accounts.json`, and Claude Console sign-in state in `ant`. They are readable only by your user. The broker process holds its credentials in memory while it runs; Credne holds the Claude subscription tokens in memory only as long as a request needs them. For the broker, Pi holds only a per-run token for the loopback connection, which stops working when the broker restarts.
+The daemon keeps account credentials beneath `~/.pi/agent/accounts` and writes its managed account metadata to `omp-accounts.json`. On upgrade it can import accounts from `api-accounts.json` without rewriting that file. See `broker/README.md` for the storage layout. Credne authenticates to the daemon with a per-run loopback token, which stops working when the daemon restarts. It does not use provider credentials directly.
 
 Pi's `read`, `edit` and `write` tools cannot access the accounts directory. Shell commands run as your user and can read it, as they can read [`auth.json`](configuration.md#agent-directory). Treat the accounts directory the same way you treat `auth.json`.

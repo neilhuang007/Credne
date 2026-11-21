@@ -1,9 +1,15 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../core/extensions/types.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
-import { ALL_POOL, accountDisplayName, accountProviderId, familyTitle, poolProviderId } from "./catalog.ts";
-import type { LocalClaude, LocalClaudeAccount } from "./claude-local.ts";
-import type { BrokerAccount, BrokerClient, BrokerLogin, BrokerUsage } from "./client.ts";
+import {
+	ALL_POOL,
+	accountDisplayName,
+	accountProviderId,
+	familyTitle,
+	isLocalClaudeProvider,
+	poolProviderId,
+} from "./catalog.ts";
+import type { BrokerAccount, BrokerClient, BrokerLogin, BrokerLoginProvider, BrokerUsage } from "./client.ts";
 import { sessionAccountCosts } from "./costs.ts";
 import { type AccountPanelResult, AccountsPanel } from "./panel.ts";
 import type { AccountProviderSpec } from "./provider.ts";
@@ -13,7 +19,6 @@ export interface AccountCommandDeps {
 	pi: ExtensionAPI;
 	client: BrokerClient;
 	registry: AccountRegistry;
-	local: LocalClaude;
 }
 
 /** `/accounts` subcommands, also used for argument completion. */
@@ -29,16 +34,15 @@ export const ACCOUNT_SUBCOMMANDS = [
 	"reset",
 ] as const;
 
-/** A browser sign-in through the broker. `namePrompt` is set when the account needs a name first. */
+/** A subscription browser sign-in through the broker. */
 interface LoginWay {
 	id: string;
 	label: string;
 	kind: "login";
 	/** Broker login provider. */
-	provider: string;
+	provider: BrokerLoginProvider;
 	/** What the user signs in to, for messages. */
 	title: string;
-	namePrompt?: string;
 }
 
 /** A provider API key typed in; the broker validates it. */
@@ -51,14 +55,7 @@ interface ApiKeyWay {
 	placeholder: string;
 }
 
-/** A Claude subscription sign-in that this process runs itself: tokens are stored and refreshed locally. */
-interface LocalClaudeWay {
-	id: string;
-	label: string;
-	kind: "claude-local";
-}
-
-type AddWay = LoginWay | ApiKeyWay | LocalClaudeWay;
+type AddWay = LoginWay | ApiKeyWay;
 
 interface AddFamily {
 	id: string;
@@ -68,9 +65,7 @@ interface AddFamily {
 
 /**
  * What `/accounts add` offers: the first menu lists the families, the second the ways of one family;
- * a family with a single way skips the second menu. `claude-subscription` signs in here; the other
- * sign-ins go through the broker. `claude-api-credits` signs in to a Claude Console organization through
- * `ant`. The ids are the arguments of `/accounts add <id>`.
+ * a family with a single way skips the second menu. The ids are the arguments of `/accounts add <id>`.
  */
 const ADD_FAMILIES: readonly AddFamily[] = [
 	{
@@ -80,15 +75,9 @@ const ADD_FAMILIES: readonly AddFamily[] = [
 			{
 				id: "claude-subscription",
 				label: "Subscription (Pro, Max, Team sign-in)",
-				kind: "claude-local",
-			},
-			{
-				id: "claude-api-credits",
-				label: "API credits (monthly credits of Max, Ultra, Team plans, Claude Console sign-in)",
 				kind: "login",
-				provider: "claude-api-credits",
-				title: "the Claude Console",
-				namePrompt: "Name for this API-credit account",
+				provider: "claude",
+				title: "Claude",
 			},
 			{
 				id: "claude-api-key",
@@ -131,12 +120,14 @@ export const ADD_ARGUMENTS: readonly { id: string; label: string }[] = ADD_FAMIL
 
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 const LOGIN_POLL_MS = 1_000;
+const LEGACY_CLAUDE_MESSAGE =
+	"Local Claude subscriptions are no longer supported. Sign in again with /accounts add claude-subscription, then select the broker account with /accounts switch. Existing credentials were left untouched.";
 
 /** `/accounts`: browse accounts, pools, quotas and session estimates in one panel. */
 export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
 	let selectedId: string | undefined;
 	for (;;) {
-		const accounts = managedAccounts(deps, await deps.registry.sync(ctx));
+		const accounts = managedAccounts(await deps.registry.sync(ctx));
 		if (!ctx.hasUI) {
 			ctx.ui.notify(formatAccountList(accounts, ctx), "info");
 			return;
@@ -154,7 +145,9 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 							name: spec.name,
 							state: account
 								? `${account.state} · ${account.modelCount} models`
-								: `${spec.models.length} models · ${poolRouting(spec)}`,
+								: spec.target.type === "pool"
+									? `${spec.models.length} models · balanced pool`
+									: `${spec.models.length} models · cached account`,
 							account: account !== undefined,
 							disabled: spec.disabled,
 							costs: sessionAccountCosts(entries, spec.id),
@@ -200,6 +193,10 @@ export async function runAccountCommand(
 	if (!args.trim()) return showAccounts(deps, ctx);
 	const [subcommand, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 	const query = rest.join(" ");
+	if (isLocalClaudeProvider(query)) {
+		ctx.ui.notify(LEGACY_CLAUDE_MESSAGE, "warning");
+		return;
+	}
 	switch (subcommand) {
 		case "status":
 			showStatus(deps, ctx);
@@ -220,7 +217,7 @@ export async function runAccountCommand(
 		case "enable":
 		case "disable":
 		case "reset": {
-			const accounts = managedAccounts(deps, await deps.registry.sync(ctx));
+			const accounts = managedAccounts(await deps.registry.sync(ctx));
 			const account = await chooseAccount(ctx, accounts, `${subcommand} account`, query);
 			if (account) await applyAccountAction(deps, ctx, account, subcommand);
 			return;
@@ -231,6 +228,10 @@ export async function runAccountCommand(
 
 /** `/models [account]`: list the models of the session's account, or of another one, and switch. */
 export async function showModels(deps: AccountCommandDeps, query: string, ctx: ExtensionCommandContext): Promise<void> {
+	if (isLocalClaudeProvider(query || ctx.model?.provider || "")) {
+		ctx.ui.notify(LEGACY_CLAUDE_MESSAGE, "warning");
+		return;
+	}
 	await deps.registry.sync(ctx);
 	const providers = deps.registry.providers().filter((spec) => !spec.disabled);
 	const candidates = query ? matchProviders(providers, query) : providers;
@@ -252,16 +253,18 @@ function showStatus(deps: AccountCommandDeps, ctx: ExtensionContext): void {
 	const model = ctx.model;
 	const spec = deps.registry.provider(model?.provider ?? "");
 	if (!model || !spec) {
+		if (model && isLocalClaudeProvider(model.provider)) {
+			ctx.ui.notify(LEGACY_CLAUDE_MESSAGE, "warning");
+			return;
+		}
 		const current = model ? `${model.provider}/${model.id}` : "no model";
 		ctx.ui.notify(`This session uses ${current}, not one of the accounts. Use /accounts switch.`, "info");
 		return;
 	}
-	const routing = {
-		account: "pinned; failures are reported, never rerouted",
-		local: "pinned; failures are reported, never rerouted",
-		pool: "pool; the broker balances and fails over",
-		"virtual-pool": "pool; subscriptions first, then API accounts, and a limit hands the session to the next account",
-	}[spec.target.type];
+	const routing =
+		spec.target.type === "account"
+			? "pinned; failures are reported, never rerouted"
+			: "pool; the broker balances and fails over";
 	ctx.ui.notify(`This session uses ${model.id} on ${spec.name} (${routing}).`, "info");
 }
 
@@ -301,28 +304,12 @@ async function applyAccountAction(
 	if (action === "remove" && ctx.hasUI) {
 		if (!(await ctx.ui.confirm("Remove account?", `${name}\nIts stored credential is deleted.`))) return;
 	}
-	await changeAccount(deps, account, action);
+	if (action === "remove") await deps.client.removeAccount(account.key);
+	else if (action === "reset") await deps.client.resetCooldown(account.key);
+	else await deps.client.setDisabled(account.key, action === "disable");
 	await deps.registry.sync(ctx);
 	const done = { remove: "Removed", enable: "Enabled", disable: "Disabled", reset: "Cleared cooldown for" }[action];
 	ctx.ui.notify(`${done} ${name}`, "info");
-}
-
-/** Apply an action to a local subscription in the credential store, or to a broker account through the broker. */
-async function changeAccount(deps: AccountCommandDeps, account: ManagedAccount, action: AccountAction): Promise<void> {
-	if (account.source === "local") {
-		const { providerId } = account.local;
-		if (action === "remove") await deps.local.store.remove(providerId);
-		else if (action === "enable" || action === "disable") {
-			await deps.local.store.setDisabled(providerId, action === "disable");
-		}
-		// A removed account keeps nothing; a cleared one is tried again at once.
-		if (action === "remove" || action === "reset") deps.local.limits.clear(providerId);
-		return;
-	}
-	const { key } = account.broker;
-	if (action === "remove") await deps.client.removeAccount(key);
-	else if (action === "reset") await deps.client.resetCooldown(key);
-	else await deps.client.setDisabled(key, action === "disable");
 }
 
 /** Switch this session to an account or pool; with `persist` it also becomes the default for new sessions. */
@@ -388,11 +375,19 @@ async function adoptPoolAsDefault(deps: AccountCommandDeps, ctx: ExtensionComman
 }
 
 async function addAccount(deps: AccountCommandDeps, ctx: ExtensionCommandContext, requested: string): Promise<void> {
+	const argument = requested.trim().toLowerCase();
+	if (argument === "claude-api-credits") {
+		ctx.ui.notify(
+			"Claude Console credits sign-in is not supported by the account broker. Use /accounts add claude-api-key with an Anthropic Console API key, or /accounts add claude-subscription.",
+			"warning",
+		);
+		return;
+	}
 	if (!ctx.hasUI) {
 		ctx.ui.notify("Adding an account needs interactive mode.", "warning");
 		return;
 	}
-	const way = await chooseAddWay(ctx, requested.trim().toLowerCase());
+	const way = await chooseAddWay(ctx, argument);
 	if (!way) return;
 	const hadAccounts = deps.registry.providers().length > 0;
 	const added = await runAddWay(deps, ctx, way);
@@ -405,23 +400,9 @@ async function runAddWay(
 	ctx: ExtensionCommandContext,
 	way: AddWay,
 ): Promise<string | undefined> {
-	if (way.kind === "claude-local") return addLocalClaude(deps, ctx);
 	const account =
 		way.kind === "api-key" ? await addApiKeyAccount(deps, ctx, way) : await signInAccount(deps, ctx, way);
 	return account && `Added ${accountDisplayName(account)}. It funds the matching pools; /accounts switch pins it.`;
-}
-
-/** Sign in to a Claude subscription in the browser and store it locally; the broker is not involved. */
-async function addLocalClaude(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<string | undefined> {
-	// The login derives the account's Claude Code device id from the installation's id.
-	const installId = deps.local.store.installationId(deps.pi.getSettings().deviceId);
-	const result = await deps.local.signIn(ctx.ui, installId);
-	if (result.type === "cancelled" || result.type === "timed-out") {
-		ctx.ui.notify(result.type === "cancelled" ? "Sign-in cancelled." : "Sign-in timed out.", "warning");
-		return undefined;
-	}
-	if (!result.added) return `Signed in again to ${result.account.name}.`;
-	return `Added ${result.account.name}. It funds pool:claude and pool:all; /accounts switch pins it.`;
 }
 
 /** The way to add an account, from the argument of `/accounts add` or from the menus; undefined when cancelled. */
@@ -470,12 +451,9 @@ async function signInAccount(
 	ctx: ExtensionCommandContext,
 	way: LoginWay,
 ): Promise<BrokerAccount | undefined> {
-	let name: string | undefined;
-	if (way.namePrompt) {
-		name = (await ctx.ui.input(way.namePrompt, "for example: work"))?.trim();
-		if (!name) return undefined;
-	}
-	const login = await deps.client.startLogin(way.provider, name);
+	const started = await deps.client.startLogin(way.provider);
+	const login = started.type === "browser" ? started : await acknowledgeLoginRisk(deps, ctx, started);
+	if (!login) return undefined;
 	openBrowser(login.url);
 	ctx.ui.notify(
 		`Sign in to ${way.title} in your browser. If it did not open, visit:\n${login.url}${login.userCode ? `\nCode: ${login.userCode}` : ""}`,
@@ -484,10 +462,28 @@ async function signInAccount(
 	return waitForLogin(deps, ctx, login, way.title);
 }
 
+async function acknowledgeLoginRisk(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	login: Extract<BrokerLogin, { type: "acknowledge-risk" }>,
+): Promise<Extract<BrokerLogin, { type: "browser" }> | undefined> {
+	try {
+		if (await ctx.ui.confirm("Acknowledge subscription sign-in risk?", login.warning)) {
+			return await deps.client.acknowledgeLoginRisk(login.state);
+		}
+	} catch (error) {
+		await deps.client.cancelLogin(login.state).catch(() => {});
+		throw error;
+	}
+	await deps.client.cancelLogin(login.state).catch(() => {});
+	ctx.ui.notify("Sign-in cancelled.", "warning");
+	return undefined;
+}
+
 async function waitForLogin(
 	deps: AccountCommandDeps,
 	ctx: ExtensionCommandContext,
-	login: BrokerLogin,
+	login: Extract<BrokerLogin, { type: "browser" }>,
 	title: string,
 ): Promise<BrokerAccount | undefined> {
 	// The broker's callback listener normally completes the login. The input lets the user paste the
@@ -632,8 +628,9 @@ function formatAccountList(accounts: readonly ManagedAccount[], ctx: ExtensionCo
 	return accounts.map((account) => accountLine(account, ctx)).join("\n");
 }
 
-/** An account `/accounts` lists and manages: a local Claude subscription or a broker account. */
-type ManagedAccount = {
+/** A broker account in the list and selectors. */
+interface ManagedAccount {
+	key: string;
 	providerId: string;
 	name: string;
 	state: string;
@@ -641,35 +638,21 @@ type ManagedAccount = {
 	modelCount: number;
 	/** Texts a query may match: ids, email, label. */
 	aliases: readonly (string | undefined)[];
-} & ({ source: "local"; local: LocalClaudeAccount } | { source: "broker"; broker: BrokerAccount });
+}
 
-/** Local subscriptions first, then the broker's accounts. */
-function managedAccounts(deps: AccountCommandDeps, brokerAccounts: readonly BrokerAccount[]): ManagedAccount[] {
-	const locals = deps.local.accounts().map(
-		(account): ManagedAccount => ({
-			providerId: account.providerId,
-			name: account.name,
-			state: deps.local.state(account),
-			disabled: account.disabled,
-			modelCount: deps.registry.provider(account.providerId)?.models.length ?? 0,
-			aliases: [account.id, account.providerId, account.email, account.orgName],
-			source: "local",
-			local: account,
-		}),
-	);
-	const brokered = brokerAccounts.map(
-		(account): ManagedAccount => ({
-			providerId: accountProviderId(account.id),
+function managedAccounts(accounts: readonly BrokerAccount[]): ManagedAccount[] {
+	return accounts.map((account) => {
+		const providerId = accountProviderId(account.id);
+		return {
+			key: account.key,
+			providerId,
 			name: accountDisplayName(account),
 			state: accountState(account),
 			disabled: account.disabled,
 			modelCount: account.modelCount,
-			aliases: [account.id, accountProviderId(account.id), account.email, account.label],
-			source: "broker",
-			broker: account,
-		}),
-	);
-	return [...locals, ...brokered];
+			aliases: [account.id, providerId, account.email, account.label],
+		};
+	});
 }
 
 function accountUsage(
@@ -679,18 +662,13 @@ function accountUsage(
 	signal: AbortSignal,
 ): Promise<BrokerUsage> {
 	const account = accounts.find((entry) => entry.providerId === providerId);
-	if (account?.source === "local") return deps.local.usage(providerId, signal);
-	if (account?.source === "broker") return deps.client.accountUsage(account.broker.key, signal);
+	if (account) return deps.client.accountUsage(account.key, signal);
 	return Promise.resolve({
 		status: "unavailable",
 		reason: "Select an account to see its usage.",
 		windows: [],
 		credits: [],
 	});
-}
-
-function poolRouting(spec: AccountProviderSpec): string {
-	return spec.target.type === "virtual-pool" ? "subscriptions first, then API accounts" : "balanced pool";
 }
 
 /** Short availability summary from broker state. */

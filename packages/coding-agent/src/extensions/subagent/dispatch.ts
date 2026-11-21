@@ -5,15 +5,8 @@ import { type Api, clampThinkingLevel, getSupportedThinkingLevels, type Model } 
 import { Type } from "typebox";
 import { getAgentDir } from "../../config.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
-import {
-	ACCOUNT_PROVIDER_PREFIX,
-	accountProviderId,
-	isVirtualPoolProvider,
-	POOL_PROVIDER_PREFIX,
-	readCatalog,
-} from "../accounts/catalog.ts";
-import { ACCOUNT_HEADER } from "../accounts/provider.ts";
-import { isAccountProvider, latestServingProvider } from "../accounts/served.ts";
+import { ACCOUNT_PROVIDER_PREFIX, accountProviderId, POOL_PROVIDER_PREFIX, readCatalog } from "../accounts/catalog.ts";
+import { matchesServingAccount, observeServingAccount } from "../serving-account.ts";
 import { resolveModelAlias } from "./model-aliases.ts";
 import { type ModelTier, resolveModelTier, type TierSelection } from "./model-tiers.ts";
 
@@ -55,59 +48,9 @@ export interface SubagentDispatch {
 
 /** Installs session scoped account observation and resolves child dispatch defaults. */
 export function createSubagentDispatch(pi: ExtensionAPI): SubagentDispatch {
-	let scope: string | undefined;
-	let pendingScope: string | undefined;
-	let accountKey: string | undefined;
-	let responseAccountKey: string | undefined;
-	let isAmbiguous = false;
-	const clear = () => {
-		scope = undefined;
-		pendingScope = undefined;
-		accountKey = undefined;
-		responseAccountKey = undefined;
-		isAmbiguous = false;
-	};
-	pi.on("session_start", clear);
-	pi.on("session_before_switch", clear);
-	pi.on("session_before_fork", clear);
-	pi.on("session_before_tree", clear);
-	pi.on("session_shutdown", clear);
-	pi.on("model_select", clear);
-	pi.on("agent_end", () => {
-		pendingScope = undefined;
-		isAmbiguous = false;
-	});
-	pi.on("before_provider_request", (_event, ctx) => {
-		const nextScope = dispatchScope(ctx);
-		if (scope !== nextScope) clear();
-		// Responses have no request identity, so overlapping requests cannot establish affinity.
-		isAmbiguous ||= pendingScope !== undefined;
-		scope = nextScope;
-		pendingScope = nextScope;
-		accountKey = undefined;
-		responseAccountKey = undefined;
-	});
-	pi.on("after_provider_response", (event, ctx) => {
-		const matches = pendingScope !== undefined && pendingScope === dispatchScope(ctx);
-		if (!matches || isAmbiguous) {
-			accountKey = undefined;
-			return;
-		}
-		responseAccountKey = event.status >= 200 && event.status < 300 ? event.headers[ACCOUNT_HEADER] : undefined;
-		pendingScope = undefined;
-	});
-	pi.on("provider_stream_event", (event, ctx) => {
-		// The HTTP hook lacks model identity; only the parent stream may establish affinity.
-		if (event.provider !== ctx.model?.provider || event.model !== ctx.model?.id || isAmbiguous) {
-			accountKey = undefined;
-			responseAccountKey = undefined;
-			return;
-		}
-		if (scope === dispatchScope(ctx)) accountKey = responseAccountKey;
-	});
+	const servingAccount = observeServingAccount(pi);
 	const models: SubagentDispatch["models"] = (ctx, provider) => {
-		if (scope !== dispatchScope(ctx)) clear();
-		const target = provider && provider !== ctx.model?.provider ? provider : currentProvider(accountKey, ctx);
+		const target = provider && provider !== ctx.model?.provider ? provider : currentProvider(servingAccount, ctx);
 		return {
 			provider: target,
 			models: ctx.modelRegistry.getAvailable().filter((model) => model.provider === target),
@@ -129,7 +72,7 @@ export function createSubagentDispatch(pi: ExtensionAPI): SubagentDispatch {
 		tier === undefined ? undefined : resolveModelTier(tier, models(ctx).models);
 	const inheritedModel = (ctx: ExtensionContext): Model<Api> => {
 		if (!ctx.model) throw new Error("A parent model or explicit subagent model is required.");
-		const provider = currentProvider(accountKey, ctx);
+		const provider = currentProvider(servingAccount, ctx);
 		const inherited = ctx.modelRegistry.find(provider, ctx.model.id);
 		if (!inherited) throw new Error(`Current account ${provider} cannot serve ${ctx.model.id}. Use search_models.`);
 		return inherited;
@@ -152,7 +95,6 @@ export function createSubagentDispatch(pi: ExtensionAPI): SubagentDispatch {
 	return {
 		models,
 		resolve(selection, ctx, profile) {
-			if (scope !== dispatchScope(ctx)) clear();
 			const { model, effort } = pickModel(selection, ctx, profile);
 			const requested = selection.reasoningEffort ?? effort ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
 			if (selection.reasoningEffort !== undefined && !getSupportedThinkingLevels(model).includes(requested)) {
@@ -161,10 +103,6 @@ export function createSubagentDispatch(pi: ExtensionAPI): SubagentDispatch {
 			return { model: `${model.provider}/${model.id}`, thinkingLevel: clampThinkingLevel(model, requested) };
 		},
 	};
-}
-
-function dispatchScope(ctx: ExtensionContext): string {
-	return JSON.stringify([ctx.sessionManager.getSessionId(), ctx.model?.provider, ctx.model?.id]);
 }
 
 function selectModel(text: string, pool: { provider: string; models: Model<Api>[] }): Model<Api> {
@@ -186,24 +124,17 @@ function selectModel(text: string, pool: { provider: string; models: Model<Api>[
 	);
 }
 
-/** A virtual pool picks its account per request, so a worker inherits the account that answered last. */
-function servingAccount(ctx: ExtensionContext): string {
-	const served = latestServingProvider(ctx.sessionManager.getBranch());
-	if (served && isAccountProvider(served)) return served;
-	throw new Error(
-		"The parent pool's serving account is unknown. Wait for a parent response or choose an explicit provider/model ID.",
-	);
-}
-
-function currentProvider(accountKey: string | undefined, ctx: ExtensionContext): string {
+function currentProvider(servingAccount: ReturnType<typeof observeServingAccount>, ctx: ExtensionContext): string {
 	const parent = ctx.model;
 	if (!parent) throw new Error("A parent model or explicit provider is required. Use search_models with a provider.");
 	if (parent.provider.startsWith(ACCOUNT_PROVIDER_PREFIX)) return parent.provider;
-	if (isVirtualPoolProvider(parent.provider)) return servingAccount(ctx);
 	if (parent.provider.startsWith(POOL_PROVIDER_PREFIX)) {
-		const account = readCatalog(join(getAgentDir(), "accounts", "catalog.json")).accounts.find(
-			(candidate) => candidate.key === accountKey && !candidate.disabled,
-		);
+		const serving = servingAccount(ctx);
+		const account =
+			serving &&
+			readCatalog(join(getAgentDir(), "accounts", "catalog.json")).accounts.find(
+				(candidate) => matchesServingAccount(candidate, serving) && !candidate.disabled,
+			);
 		if (!account) {
 			throw new Error(
 				"The parent pool's serving account is unknown. Wait for a parent response or choose an explicit provider/model ID.",

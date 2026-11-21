@@ -7,12 +7,13 @@ import {
 	isModelType,
 	type Model,
 	type Provider,
-	type ProviderStreamOptions,
+	type ProviderAuth,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { llamaCppClassifyApi } from "@earendil-works/pi-ai/api/llama-cpp-classify.lazy";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
-import { stream, streamSimple } from "@earendil-works/pi-ai/compat";
+import { USES_BROKER_AUTH } from "../../config.ts";
 import {
 	LlamaClient,
 	type LlamaModelInfo,
@@ -23,6 +24,20 @@ import {
 
 export const LLAMA_PROVIDER_ID = "llama.cpp";
 export const DEFAULT_LLAMA_SERVER_URL = "http://127.0.0.1:9931";
+
+function getUnauthenticatedServerUrl(): string | undefined {
+	const url = URL.parse(process.env.LLAMA_BASE_URL || DEFAULT_LLAMA_SERVER_URL);
+	if (
+		!url ||
+		url.username ||
+		url.password ||
+		(url.protocol !== "http:" && url.protocol !== "https:") ||
+		!["127.0.0.1", "[::1]", "localhost"].includes(url.hostname)
+	)
+		return undefined;
+	return normalizeLlamaServerUrl(url.href);
+}
+
 function credentialServerUrl(credential: ApiKeyCredential | undefined): string | undefined {
 	const value = credential?.env?.LLAMA_BASE_URL;
 	return typeof value === "string" && value.trim() ? normalizeLlamaServerUrl(value) : undefined;
@@ -166,8 +181,10 @@ export interface LlamaProviderController {
 export function createLlamaProvider(): LlamaProviderController {
 	let models: readonly Model<"openai-completions">[] = [];
 	let classifiers: readonly ClassifierModel<LlamaClassifierApi>[] = [];
+	const chat = openAICompletionsApi();
 	const fallbackClassifier = llamaCppClassifyApi();
 	const decisionClassifier = typesafeSystemOneApi();
+	const localServerUrl = USES_BROKER_AUTH ? getUnauthenticatedServerUrl() : undefined;
 
 	const setCatalog = (
 		catalog: readonly LlamaModelInfo[],
@@ -182,50 +199,52 @@ export function createLlamaProvider(): LlamaProviderController {
 	const provider: Provider<"openai-completions"> = {
 		id: LLAMA_PROVIDER_ID,
 		name: "llama.cpp",
-		baseUrl: llamaInferenceUrl(DEFAULT_LLAMA_SERVER_URL),
-		auth: {
-			apiKey: {
-				name: "llama.cpp server",
-				login: async (interaction): Promise<ApiKeyCredential> => {
-					const enteredUrl = await interaction.prompt({
-						type: "text",
-						message: "llama.cpp server URL",
-						placeholder: process.env.LLAMA_BASE_URL ?? DEFAULT_LLAMA_SERVER_URL,
-					});
-					const serverUrl = normalizeLlamaServerUrl(
-						enteredUrl.trim() || process.env.LLAMA_BASE_URL || DEFAULT_LLAMA_SERVER_URL,
-					);
-					const apiKey = (
-						await interaction.prompt({
-							type: "secret",
-							message: "API key (optional)",
-						})
-					).trim();
-					await new LlamaClient(serverUrl, apiKey || undefined).list({ signal: interaction.signal });
-					return {
-						type: "api_key",
-						key: apiKey || undefined,
-						env: { LLAMA_BASE_URL: serverUrl },
-					};
+		baseUrl: llamaInferenceUrl(localServerUrl ?? DEFAULT_LLAMA_SERVER_URL),
+		auth: USES_BROKER_AUTH
+			? localLlamaAuth(localServerUrl)
+			: {
+					apiKey: {
+						name: "llama.cpp server",
+						login: async (interaction): Promise<ApiKeyCredential> => {
+							const enteredUrl = await interaction.prompt({
+								type: "text",
+								message: "llama.cpp server URL",
+								placeholder: process.env.LLAMA_BASE_URL ?? DEFAULT_LLAMA_SERVER_URL,
+							});
+							const serverUrl = normalizeLlamaServerUrl(
+								enteredUrl.trim() || process.env.LLAMA_BASE_URL || DEFAULT_LLAMA_SERVER_URL,
+							);
+							const apiKey = (
+								await interaction.prompt({
+									type: "secret",
+									message: "API key (optional)",
+								})
+							).trim();
+							await new LlamaClient(serverUrl, apiKey || undefined).list({ signal: interaction.signal });
+							return {
+								type: "api_key",
+								key: apiKey || undefined,
+								env: { LLAMA_BASE_URL: serverUrl },
+							};
+						},
+						check: async ({ ctx, credential }) => {
+							const serverUrl = await resolveServerUrl(ctx, credential);
+							return serverUrl
+								? { type: "api_key", source: credential ? "stored credential" : "LLAMA_BASE_URL" }
+								: undefined;
+						},
+						resolve: async ({ ctx, credential }): Promise<AuthResult | undefined> => {
+							const serverUrl = await resolveServerUrl(ctx, credential);
+							if (!serverUrl) return undefined;
+							const apiKey = credential?.key ?? (await ctx.env("LLAMA_API_KEY")) ?? "local";
+							return {
+								auth: { apiKey, baseUrl: llamaInferenceUrl(serverUrl) },
+								env: { ...credential?.env, LLAMA_BASE_URL: serverUrl },
+								source: credential ? "stored credential" : "LLAMA_BASE_URL",
+							};
+						},
+					},
 				},
-				check: async ({ ctx, credential }) => {
-					const serverUrl = await resolveServerUrl(ctx, credential);
-					return serverUrl
-						? { type: "api_key", source: credential ? "stored credential" : "LLAMA_BASE_URL" }
-						: undefined;
-				},
-				resolve: async ({ ctx, credential }): Promise<AuthResult | undefined> => {
-					const serverUrl = await resolveServerUrl(ctx, credential);
-					if (!serverUrl) return undefined;
-					const apiKey = credential?.key ?? (await ctx.env("LLAMA_API_KEY")) ?? "local";
-					return {
-						auth: { apiKey, baseUrl: llamaInferenceUrl(serverUrl) },
-						env: { ...credential?.env, LLAMA_BASE_URL: serverUrl },
-						source: credential ? "stored credential" : "LLAMA_BASE_URL",
-					};
-				},
-			},
-		},
 		getModels: () => models,
 		getAllModels: () => [...models, ...classifiers],
 		refreshModels: async (context: RefreshModelsContext): Promise<void> => {
@@ -252,10 +271,11 @@ export function createLlamaProvider(): LlamaProviderController {
 				}
 			}
 
-			if (!context.allowNetwork || context.signal.aborted || context.credential?.type !== "api_key") return;
-			const serverUrl = credentialServerUrl(context.credential);
+			if (!context.allowNetwork || context.signal.aborted) return;
+			const credential = context.credential?.type === "api_key" ? context.credential : undefined;
+			const serverUrl = USES_BROKER_AUTH ? localServerUrl : credentialServerUrl(credential);
 			if (!serverUrl) return;
-			const client = new LlamaClient(serverUrl, context.credential.key);
+			const client = new LlamaClient(serverUrl, USES_BROKER_AUTH ? undefined : credential?.key);
 			const catalog = await client.list({ signal: context.signal });
 			if (context.signal.aborted) return;
 			const routerAutoload = await routerAutoloadEnabled(client, catalog, context.signal);
@@ -285,15 +305,31 @@ export function createLlamaProvider(): LlamaProviderController {
 				},
 			});
 		},
-		stream: (model, context, options) => stream(model, context, options as ProviderStreamOptions | undefined),
-		streamSimple: (model, context, options) => streamSimple(model, context, options),
-		classify: (model, context, options) =>
-			(model.api === "typesafe-system-one" ? decisionClassifier : fallbackClassifier).classify(
-				model,
-				context,
-				options,
-			),
+		stream: (model, context, options) => chat.stream(model, context, options),
+		streamSimple: (model, context, options) => chat.streamSimple(model, context, options),
+		classify: (model, context, options) => {
+			const classifier = model.api === "typesafe-system-one" ? decisionClassifier : fallbackClassifier;
+			return classifier.classify(model, context, USES_BROKER_AUTH ? { ...options, apiKey: undefined } : options);
+		},
 	};
 
 	return { provider, setCatalog };
+}
+
+function localLlamaAuth(serverUrl: string | undefined): ProviderAuth {
+	return {
+		apiKey: {
+			name: "Unauthenticated local llama.cpp server",
+			check: async () => (serverUrl ? { type: "api_key", source: "local llama.cpp" } : undefined),
+			resolve: async () =>
+				serverUrl
+					? {
+							// The OpenAI adapter requires a nonempty value; remove its Authorization header on the wire.
+							auth: { apiKey: "local", headers: { authorization: null }, baseUrl: llamaInferenceUrl(serverUrl) },
+							env: { LLAMA_BASE_URL: serverUrl },
+							source: "local llama.cpp",
+						}
+					: undefined,
+		},
+	};
 }

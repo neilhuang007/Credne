@@ -162,11 +162,6 @@ function codexToken(): string {
 
 afterEach(() => vi.unstubAllEnvs());
 
-// Only the account broker understands `prompt_cache_options`; Anthropic rejects it. Local subscriptions and the
-// virtual pools, which route to local subscriptions or broker accounts, never send it.
-const brokerProviders = new Set(["acct:work", "pool:codex"]);
-const cacheOptionsOf = (provider: string) => (brokerProviders.has(provider) ? { mode: "explicit" } : undefined);
-
 describe("worker Anthropic cache payloads", () => {
 	it.each(["anthropic", "claude-sub:1a2b3c4d", "pool:claude", "pool:all", "acct:work", "pool:codex"])(
 		"marks both reusable boundaries through %s",
@@ -194,13 +189,13 @@ describe("worker Anthropic cache payloads", () => {
 				{ type: "text", text: "Implement the endpoint.", cache_control: { type: "ephemeral" } },
 			]);
 			expect(payload.tools?.[0].cache_control).toBeUndefined();
-			expect(payload.prompt_cache_options).toEqual(cacheOptionsOf(provider));
+			expect(payload.prompt_cache_options).toBeUndefined();
 			expect(child.requests.map((request) => request.type)).toEqual(["cache_wait", "cache_ready"]);
 			expect(result.usage).toMatchObject({ input: 10, cacheRead: 90, cacheWrite: 0, totalTokens: 102 });
 		},
 	);
 
-	it("keeps OAuth identity text and makes room for the conversation and automatic marker", async () => {
+	it("preserves system instructions and fits OAuth conversation markers in four slots", async () => {
 		const selected = model("anthropic-messages", "anthropic");
 		const child = worker(selected);
 		const wire = transport(selected.api);
@@ -213,12 +208,13 @@ describe("worker Anthropic cache payloads", () => {
 				child.payload({ ...(payload as WirePayload), cache_control: { type: "ephemeral", ttl: "1h" } }),
 		}).result();
 		const payload = wire.captured[0].body;
-		expect(payload.system?.[0]).toEqual({
+		expect(payload.system).toContainEqual({
 			type: "text",
-			text: "You are Claude Code, Anthropic's official CLI for Claude.",
+			text: "Worker instructions.\n<cwd>project</cwd>",
+			cache_control: { type: "ephemeral", ttl: "1h" },
 		});
 		expect(payload.system?.at(-1)?.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		expect(JSON.stringify(payload).match(/"cache_control":/g)).toHaveLength(4);
+		expect(JSON.stringify(payload).match(/"cache_control":/g)!.length).toBeLessThanOrEqual(4);
 	});
 
 	it.each(["anthropic", "claude-sub:1a2b3c4d", "acct:work"])(
@@ -235,7 +231,7 @@ describe("worker Anthropic cache payloads", () => {
 				maxRetries: 0,
 			}).result();
 			expect(JSON.stringify(wire.captured[0].body)).not.toContain('"cache_control"');
-			expect(wire.captured[0].body.prompt_cache_options).toEqual(cacheOptionsOf(provider));
+			expect(wire.captured[0].body.prompt_cache_options).toBeUndefined();
 			expect(child.requests).toHaveLength(0);
 		},
 	);

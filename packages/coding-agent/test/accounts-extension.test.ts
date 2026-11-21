@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -23,7 +23,7 @@ import {
 } from "../src/extensions/accounts/catalog.ts";
 import { type BrokerAccount, BrokerClient, type BrokerModel } from "../src/extensions/accounts/client.ts";
 import accountsExtension from "../src/extensions/accounts/index.ts";
-import { type BrokerProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
+import { type AccountProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { openBrowser } from "../src/utils/open-browser.ts";
 
@@ -68,7 +68,7 @@ function account(overrides: Partial<BrokerAccount> & Pick<BrokerAccount, "id" | 
 }
 
 const claudeA = account({ id: "claude-api-aaaa-a.json", provider: "claude-api", kind: "api-key", label: "a" });
-const claudeB = account({ id: "claude-api-bbbb-b.json", provider: "claude-api", kind: "api-credits", label: "b" });
+const claudeB = account({ id: "claude-bbbb-b.json", provider: "claude", email: "b@example.com" });
 const codexC = account({ id: "codex-cccc-c@example.com-plus.json", provider: "codex", email: "c@example.com" });
 const claudeModel: BrokerModel = {
 	id: "claude-test-1",
@@ -84,14 +84,14 @@ const builtinLuna = getBuiltinClassifierModel("openai", "gpt-6-luna");
 const lookupClassifier = (provider: string, id: string) =>
 	provider === "openai" && id === builtinLuna.id ? builtinLuna : undefined;
 
-function spec(id: string): BrokerProviderSpec {
+function spec(id: string): AccountProviderSpec {
 	const found = providerSpecs(testCatalog()).find((entry) => entry.id === id);
 	if (!found) throw new Error(`no provider ${id}`);
 	return found;
 }
 
 const ACCT_A = "acct:claude-api-aaaa-a";
-const ACCT_B = "acct:claude-api-bbbb-b";
+const ACCT_B = "acct:claude-bbbb-b";
 const ACCT_C = "acct:codex-cccc-c@example.com-plus";
 
 function testCatalog(): AccountCatalog {
@@ -226,6 +226,7 @@ const RESPONSES_EVENTS: [string, unknown][] = [
 interface FakeResponse {
 	status: number;
 	body: unknown;
+	headers?: Record<string, string>;
 }
 
 interface FakeBrokerOptions {
@@ -253,7 +254,7 @@ async function startFakeBroker(
 		}
 		const custom = options.respond?.(recorded);
 		if (custom) {
-			response.writeHead(custom.status, { "Content-Type": "application/json" });
+			response.writeHead(custom.status, { "Content-Type": "application/json", ...custom.headers });
 			response.end(JSON.stringify(custom.body));
 			return;
 		}
@@ -261,9 +262,11 @@ async function startFakeBroker(
 			response.writeHead(200, { "Content-Type": "application/json" });
 			response.end(JSON.stringify(value));
 		};
-		if (path === "/credne/v1/health") return json({ ok: true });
+		if (path === "/credne/v1/health") return json({ ok: true, backend: "oh-my-pi" });
 		if (path === "/credne/v1/accounts") return json({ accounts: [claudeA, claudeB, codexC, { id: 7 }] });
-		if (path.endsWith("/models")) return json({ models: [claudeModel, { name: "no id" }] });
+		if (path.endsWith("/models")) {
+			return json({ models: [path.includes(codexC.key) ? codexModel : claudeModel, { name: "no id" }] });
+		}
 		const target = /^\/credne\/v1\/route\/a\.([^/]+)\//.exec(path)?.[1];
 		if (target) response.setHeader("X-Credne-Account", target);
 		if (path.endsWith("/v1/messages") || path.includes("/v1/messages?")) return sse(response, ANTHROPIC_EVENTS);
@@ -288,8 +291,7 @@ describe("account catalog", () => {
 	it("maps each account to a provider on Pi's native adapter for its upstream", () => {
 		const catalog = testCatalog();
 		const specs = providerSpecs(catalog);
-		// The virtual pools pool:claude and pool:all are not the broker's; they span these accounts and local subscriptions.
-		expect(specs.map((entry) => entry.id)).toEqual(["pool:codex", ACCT_A, ACCT_B, ACCT_C]);
+		expect(specs.map((entry) => entry.id)).toEqual(["pool:all", "pool:claude", "pool:codex", ACCT_A, ACCT_B, ACCT_C]);
 		const [claude] = catalog.accounts[0]!.models;
 		expect(claude).toMatchObject({
 			id: "claude-test-1",
@@ -304,45 +306,24 @@ describe("account catalog", () => {
 		});
 		expect(catalog.accounts[2]!.models[0]).toMatchObject({ api: "openai-responses", input: ["text", "image"] });
 		expect(catalog.pools.map(({ name, accountCount }) => ({ name, accountCount }))).toEqual([
+			{ name: "all", accountCount: 3 },
+			{ name: "claude", accountCount: 2 },
 			{ name: "codex", accountCount: 1 },
 		]);
 		expect(spec(ACCT_A).name).toBe("Claude · a (API key)");
+		expect(spec(ACCT_B).name).toBe("Claude · b@example.com (subscription)");
 		expect(spec("pool:codex").name).toBe("ChatGPT Codex pool (1 account)");
 	});
 
-	it("leaves Claude subscriptions to this process, in new and in older catalog files", () => {
-		const subscription = account({
-			id: "claude-aaaa-sub@example.com.json",
-			provider: "claude",
-			email: "sub@example.com",
-		});
-		const catalog = buildCatalog(
-			[subscription, claudeA],
-			new Map([
-				[subscription.key, [claudeModel]],
-				[claudeA.key, [claudeModel]],
-			]),
-			() => undefined,
-		);
-		expect(catalog.accounts.map((entry) => entry.id)).toEqual([claudeA.id]);
-		expect(catalog.pools).toEqual([]);
-
+	it("restores Claude subscriptions and pools while ignoring obsolete Console accounts in the cache", () => {
+		const catalog = testCatalog();
 		const path = join(tempDir(), "catalog.json");
 		writeCatalog(path, {
 			version: 2,
-			accounts: [
-				{ ...catalog.accounts[0]!, id: subscription.id, key: subscription.key, provider: "claude", kind: "oauth" },
-				...catalog.accounts,
-			],
-			pools: [
-				{ name: "claude", accountCount: 1, models: [] },
-				{ name: "all", accountCount: 1, models: [] },
-				{ name: "codex", accountCount: 1, models: [] },
-			],
+			accounts: [...catalog.accounts, { ...catalog.accounts[0]!, id: "console", kind: "api-credits" }],
+			pools: catalog.pools.filter((pool) => pool.name === "codex"),
 		});
-		const read = readCatalog(path);
-		expect(read.accounts.map((entry) => entry.id)).toEqual([claudeA.id]);
-		expect(read.pools.map((entry) => entry.name)).toEqual(["codex"]);
+		expect(readCatalog(path)).toEqual(catalog);
 	});
 
 	it("reuses Pi's catalog metadata for known models", () => {
@@ -394,16 +375,10 @@ describe("account catalog", () => {
 			expect(catalog.accounts[0]!.classifiers).toEqual([
 				{ ...builtinLuna, provider: "acct:openai-api-key-luna", baseUrl: BROKER_PLACEHOLDER_URL },
 			]);
-			expect(catalog.pools).toEqual([
-				expect.objectContaining({
-					name: "openai",
-					classifiers: [{ ...builtinLuna, provider: "pool:openai", baseUrl: BROKER_PLACEHOLDER_URL }],
-				}),
+			expect(catalog.pools.find((pool) => pool.name === "openai")?.classifiers).toEqual([
+				{ ...builtinLuna, provider: "pool:openai", baseUrl: BROKER_PLACEHOLDER_URL },
 			]);
-			expect(catalog.accounts[0]!.classifiers![0]).toMatchObject({
-				cost: builtinLuna.cost,
-				contextWindow: builtinLuna.contextWindow,
-			});
+			expect(catalog.pools.find((pool) => pool.name === "all")?.classifiers).toBeUndefined();
 		});
 
 		it("is not offered for ChatGPT subscriptions, which the Decisions API rejects", () => {
@@ -421,10 +396,12 @@ describe("account catalog", () => {
 				[openaiKey.id, 1],
 			]);
 			expect(catalog.pools.map((pool) => [pool.name, pool.classifiers?.length])).toEqual([
+				["all", undefined],
 				["codex", undefined],
 				["openai", 1],
 			]);
 			expect(providerSpecs(catalog).map((entry) => [entry.id, entry.classifiers?.length])).toEqual([
+				["pool:all", undefined],
 				["pool:codex", undefined],
 				["pool:openai", 1],
 				[`acct:${subscription.id.replace(/\.json$/, "")}`, undefined],
@@ -449,26 +426,10 @@ describe("account catalog", () => {
 			expect(readCatalog(path)).toEqual(catalog);
 
 			const [pinned] = catalog.accounts;
-			const [pool] = catalog.pools;
-			writeFileSync(
-				path,
-				JSON.stringify({
-					version: 2,
-					accounts: [{ ...pinned, classifiers: "gpt-6-luna" }],
-					pools: [
-						{
-							...pool,
-							classifiers: [
-								{ type: "classifier", api: "typesafe-system-one", id: "jev-latest" },
-								...pool!.classifiers!,
-							],
-						},
-					],
-				}),
-			);
+			writeFileSync(path, JSON.stringify({ ...catalog, accounts: [{ ...pinned, classifiers: "gpt-6-luna" }] }));
 			const read = readCatalog(path);
 			expect(read.accounts[0]!.classifiers).toBeUndefined();
-			expect(read.pools[0]!.classifiers).toEqual(pool!.classifiers);
+			expect(read.pools.find((pool) => pool.name === "openai")?.classifiers).toBeUndefined();
 		});
 	});
 });
@@ -490,10 +451,58 @@ describe("accounts extension", () => {
 		expect(runtime.pendingNativeProviderRegistrations.map((entry) => entry.provider.id)).toEqual(
 			providerSpecs(testCatalog()).map((spec) => spec.id),
 		);
-		// The Claude pools are virtual models of the same provider ids, one per model of their accounts.
-		expect(
-			runtime.pendingVirtualModelRegistrations.map(({ definition }) => `${definition.provider}/${definition.id}`),
-		).toEqual(["pool:all/gpt-test", "pool:all/claude-test-1", "pool:claude/claude-test-1"]);
+		expect(runtime.pendingVirtualModelRegistrations).toEqual([]);
+	});
+
+	it.each(["omp-accounts.json", "api-accounts.json"])(
+		"detects a stopped broker from %s without a catalog or discovery file",
+		async (metadata) => {
+			const agentDir = tempDir();
+			const home = join(agentDir, "accounts");
+			mkdirSync(home);
+			writeFileSync(join(home, metadata), "{}");
+			vi.stubEnv("PI_ACCOUNTS_BROKER", join(agentDir, "missing-broker"));
+			const extension = await loadExtensionFromFactory(
+				(pi) => accountsExtension(pi, agentDir),
+				process.cwd(),
+				createEventBus(),
+				createExtensionRuntime(),
+				"builtin:accounts",
+			);
+			const notify = vi.fn();
+			await extension.commands.get("accounts")!.handler("list", { hasUI: false, ui: { notify } } as never);
+			// The metadata triggers a start attempt even though there is no cached provider yet.
+			expect(notify).toHaveBeenCalledWith(expect.stringContaining("Account broker not installed"), "warning");
+		},
+	);
+
+	it("leaves legacy local Claude credentials untouched and directs users to broker sign-in", async () => {
+		const agentDir = tempDir();
+		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+		const home = join(agentDir, "accounts");
+		mkdirSync(join(home, "auths"), { recursive: true });
+		const localPath = join(home, "claude-subscriptions.json");
+		const brokerPath = join(home, "auths", "claude-legacy.json");
+		const local = JSON.stringify({ "claude-sub:legacy": { type: "oauth", refresh: "local-test-token" } });
+		const broker = JSON.stringify({ type: "claude", refresh_token: "broker-test-token" });
+		writeFileSync(localPath, local);
+		writeFileSync(brokerPath, broker);
+		const runtime = createExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			accountsExtension,
+			process.cwd(),
+			createEventBus(),
+			runtime,
+			"builtin:accounts",
+		);
+		const notify = vi.fn();
+		const ctx = { ui: { notify, setStatus: vi.fn() } } as never;
+		await extension.handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+		await extension.commands.get("accounts")!.handler("remove claude-sub:legacy", ctx);
+		expect(notify).toHaveBeenCalledWith(expect.stringContaining("/accounts add claude-subscription"), "warning");
+		expect(runtime.pendingNativeProviderRegistrations).toEqual([]);
+		expect(readFileSync(localPath, "utf8")).toBe(local);
+		expect(readFileSync(brokerPath, "utf8")).toBe(broker);
 	});
 
 	it("keeps file tools out of the credential directory", async () => {
@@ -592,7 +601,9 @@ describe("accounts panel command", () => {
 	it("returns from management to the same selected account", async () => {
 		const result = await runPanel([["\x1b[B", "\x0f"], ["\x1b"]], "Disable");
 		expect(result.panels).toHaveLength(2);
-		expect(result.panels[1].some((line) => line.startsWith("\x1b[7m› Claude · b (API credits)"))).toBe(true);
+		expect(result.panels[1].some((line) => line.startsWith("\x1b[7m› Claude · b@example.com (subscription)"))).toBe(
+			true,
+		);
 		expect(
 			result.broker.requests.some((request) => request.path === `/credne/v1/accounts/${claudeB.key}/disable`),
 		).toBe(true);
@@ -671,22 +682,48 @@ describe("broker client", () => {
 	});
 });
 
+describe("daemon upgrade", () => {
+	it("refuses a previous backend without starting a second daemon", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) => (request.path === "/credne/v1/health" ? { status: 200, body: { ok: true } } : undefined),
+		});
+		const locateBinary = vi.fn(() => undefined);
+		const client = new BrokerClient({ home: broker.home, locateBinary });
+		await expect(client.connect()).rejects.toThrow("previous account broker");
+		expect(locateBinary).not.toHaveBeenCalled();
+		expect(broker.requests.map((request) => request.path)).toEqual(["/credne/v1/health"]);
+	});
+
+	it("does not start a second core while the existing daemon is unresponsive", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path === "/credne/v1/health" ? { status: 503, body: { error: "busy" } } : undefined,
+		});
+		const locateBinary = vi.fn(() => undefined);
+		await expect(new BrokerClient({ home: broker.home, locateBinary }).connect()).rejects.toThrow(
+			"still running but not responding",
+		);
+		expect(locateBinary).not.toHaveBeenCalled();
+		expect(broker.requests.map((request) => request.path)).toEqual(["/credne/v1/health"]);
+	});
+
+	it("can stop a previous daemon without accepting its provider backend", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path === "/credne/v1/shutdown" ? { status: 200, body: { ok: true } } : undefined,
+		});
+		await clientFor(broker.home).shutdown();
+		expect(broker.requests.map((request) => [request.method, request.path])).toEqual([
+			["POST", "/credne/v1/shutdown"],
+		]);
+	});
+});
+
 describe("account providers", () => {
 	it("a broker pool routes Claude and GPT models through one pool URL on their own APIs", async () => {
 		const broker = await startFakeBroker();
 		const models = createModels();
-		const mixed: BrokerProviderSpec = {
-			id: "pool:mixed",
-			name: "Mixed pool",
-			target: { type: "pool", name: "mixed" },
-			family: "mixed",
-			subscription: false,
-			disabled: false,
-			models: [...spec(ACCT_A).models, ...spec(ACCT_C).models].map((model) => ({
-				...model,
-				provider: "pool:mixed",
-			})),
-		};
+		const mixed = spec("pool:all");
 		models.setProvider(createAccountProvider(mixed, clientFor(broker.home)));
 		const [claude, gpt] = mixed.models;
 		await models.completeSimple(claude!, { messages: [{ role: "user", content: "a", timestamp: Date.now() }] });
@@ -694,7 +731,31 @@ describe("account providers", () => {
 		const paths = broker.requests
 			.filter((request) => request.path.startsWith("/credne/v1/route/"))
 			.map((r) => r.path);
-		expect(paths).toEqual(["/credne/v1/route/p.mixed/v1/messages?beta=true", "/credne/v1/route/p.mixed/responses"]);
+		expect(paths).toEqual(["/credne/v1/route/p.all/v1/messages?beta=true", "/credne/v1/route/p.all/responses"]);
+	});
+
+	it("does not redirect the broker token or use caller-provided inference fetch", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path.includes("/v1/messages")
+					? { status: 307, body: {}, headers: { location: "/other-endpoint" } }
+					: undefined,
+		});
+		const models = createModels();
+		const pinned = spec(ACCT_B);
+		models.setProvider(createAccountProvider(pinned, clientFor(broker.home)));
+		const fetch = vi.fn(globalThis.fetch);
+		const reply = await models.completeSimple(
+			pinned.models[0]!,
+			{ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] },
+			{ fetch, maxRetries: 0 },
+		);
+		expect(reply.stopReason).toBe("error");
+		expect(fetch).not.toHaveBeenCalled();
+		expect(broker.requests.map((request) => request.path)).toEqual([
+			"/credne/v1/health",
+			`/credne/v1/route/a.${claudeB.key}/v1/messages?beta=true`,
+		]);
 	});
 
 	it("reports which account served a request", async () => {
@@ -730,11 +791,13 @@ describe("account providers", () => {
 		expect(await disabled.auth.apiKey!.check!({ ctx, signal })).toBeUndefined();
 	});
 
-	it("streams thinking, text, tool calls and usage through Pi's Anthropic adapter", async () => {
+	it("streams a Claude subscription through the broker using only the loopback token", async () => {
 		const broker = await startFakeBroker();
 		const models = createModels();
-		const pinned = spec(ACCT_A);
-		models.setProvider(createAccountProvider(pinned, clientFor(broker.home)));
+		const pinned = spec(ACCT_B);
+		const provider = createAccountProvider(pinned, clientFor(broker.home));
+		expect(provider.auth.oauth).toBeUndefined();
+		models.setProvider(provider);
 		const message = await models.completeSimple(pinned.models[0]!, {
 			messages: [{ role: "user", content: "read a.txt", timestamp: Date.now() }],
 		});
@@ -746,7 +809,7 @@ describe("account providers", () => {
 		]);
 		expect(message.usage).toMatchObject({ input: 12, output: 20 });
 		const sent = broker.requests.find((request) => request.path.includes("/v1/messages"))!;
-		expect(sent.path.startsWith(`/credne/v1/route/a.${claudeA.key}/v1/messages`)).toBe(true);
+		expect(sent.path.startsWith(`/credne/v1/route/a.${claudeB.key}/v1/messages`)).toBe(true);
 		expect(sent.headers["x-api-key"]).toBe(TOKEN);
 	});
 
@@ -828,7 +891,7 @@ describe("account providers", () => {
 			() => undefined,
 			lookupClassifier,
 		);
-		const specOf = (id: string): BrokerProviderSpec => providerSpecs(catalog).find((entry) => entry.id === id)!;
+		const specOf = (id: string): AccountProviderSpec => providerSpecs(catalog).find((entry) => entry.id === id)!;
 		const pinned = specOf(`acct:${openaiKey.id}`);
 		const pool = specOf("pool:openai");
 		const context: ClassifierContext = {
@@ -890,7 +953,7 @@ describe("account providers", () => {
 
 		it("is available for an enabled API-key account and pool, never for a subscription or a disabled account", async () => {
 			const broker = await startFakeBroker();
-			const availableFor = async (spec: BrokerProviderSpec) => {
+			const availableFor = async (spec: AccountProviderSpec) => {
 				const models = createModels();
 				models.setProvider(createAccountProvider(spec, clientFor(broker.home)));
 				return (await models.getAvailableOfType("classifier")).map((model) => `${model.provider}/${model.id}`);
@@ -906,36 +969,24 @@ describe("account providers", () => {
 });
 
 describe("account add flow", () => {
-	const claudeCredits = account({
-		id: "claude-api-eeee-work.json",
-		provider: "claude-api",
-		kind: "api-credits",
-		label: "work",
-	});
-	const claudeLabels = [
-		"Subscription (Pro, Max, Team sign-in)",
-		"API credits (monthly credits of Max, Ultra, Team plans, Claude Console sign-in)",
-		"API key (Anthropic Console key)",
-	];
-	const addArguments = [
-		"claude",
-		"claude-subscription",
-		"claude-api-credits",
-		"claude-api-key",
-		"chatgpt",
-		"openai-api-key",
-		"codex",
-	];
+	const claudeLabels = ["Subscription (Pro, Max, Team sign-in)", "API key (Anthropic Console key)"];
+	const addArguments = ["claude", "claude-subscription", "claude-api-key", "chatgpt", "openai-api-key", "codex"];
 
 	beforeEach(() => {
 		vi.mocked(openBrowser).mockClear();
 	});
 
-	/** Broker routes for one browser login: it starts, then reports `status` for every status or cancel call. */
-	function loginRoutes(status: unknown): FakeBrokerOptions["respond"] {
+	/** Simulate a broker login with an optional warning before the browser URL becomes available. */
+	function loginRoutes(status: unknown, riskWarning?: string): FakeBrokerOptions["respond"] {
 		return (request) => {
 			if (request.method === "POST" && request.path === "/credne/v1/logins") {
-				return { status: 200, body: { state: "login-1", url: "https://auth.example/start" } };
+				return {
+					status: 200,
+					body: { state: "login-1", url: riskWarning ? "" : "https://auth.example/start", riskWarning },
+				};
+			}
+			if (riskWarning && request.method === "POST" && request.path === "/credne/v1/logins/login-1/acknowledge") {
+				return { status: 200, body: { state: "login-1", url: "https://auth.example/confirmed" } };
 			}
 			return request.path === "/credne/v1/logins/login-1" ? { status: 200, body: status } : undefined;
 		};
@@ -954,6 +1005,7 @@ describe("account add flow", () => {
 		choices?: (string | undefined)[];
 		/** Answers to the name and key inputs in order. */
 		answers?: string[];
+		confirm?: (title: string, warning: string) => boolean;
 		respond?: FakeBrokerOptions["respond"];
 	}
 
@@ -972,6 +1024,7 @@ describe("account add flow", () => {
 			model: undefined,
 			modelRegistry: { find: () => undefined, refresh: async () => {} },
 			ui: {
+				confirm: async (title: string, warning: string) => script.confirm?.(title, warning) ?? false,
 				select: async (title: string, options: string[]) => {
 					menus.push({ title, options });
 					return choices.shift();
@@ -1061,17 +1114,56 @@ describe("account add flow", () => {
 		expect(requests).toEqual([]);
 	});
 
-	it("/accounts add claude-api-credits asks for a name and skips the menus", async () => {
-		const { menus, inputs, notifications, requests } = await runAccount("add claude-api-credits", {
-			answers: ["work"],
-			respond: loginRoutes({ status: "ok", account: claudeCredits }),
-		});
+	it.each(["no warning", "warning accepted", "warning declined"])(
+		"runs /accounts add claude-subscription without menus: %s",
+		async (outcome) => {
+			const warning = "The provider may enforce its subscription terms when using a third-party client.";
+			const confirm = vi.fn(() => {
+				expect(openBrowser).not.toHaveBeenCalled();
+				return outcome === "warning accepted";
+			});
+			const { menus, inputs, notifications, requests } = await runAccount("add claude-subscription", {
+				confirm,
+				respond: loginRoutes({ status: "ok", account: claudeB }, outcome === "no warning" ? undefined : warning),
+			});
+			expect(menus).toEqual([]);
+			expect(loginRequest(requests)).toEqual({ provider: "claude" });
+			if (outcome === "no warning") expect(confirm).not.toHaveBeenCalled();
+			else expect(confirm).toHaveBeenCalledExactlyOnceWith("Acknowledge subscription sign-in risk?", warning);
+
+			const pending = "/credne/v1/logins/login-1";
+			const afterStart = requests.filter((request) => request.path.startsWith(pending));
+			const actions = afterStart.map(({ method, path }) => `${method} ${path}`);
+			if (outcome === "warning declined") {
+				expect(actions).toEqual([`DELETE ${pending}`]);
+				expect(openBrowser).not.toHaveBeenCalled();
+				expect(inputs).toEqual([]);
+				expect(notifications).toEqual([{ message: "Sign-in cancelled.", type: "warning" }]);
+				return;
+			}
+			if (outcome === "warning accepted") {
+				expect(actions).toEqual([`POST ${pending}/acknowledge`, `GET ${pending}`]);
+				expect(JSON.parse(afterStart[0]!.body)).toEqual({ answer: "yes" });
+				expect(openBrowser).toHaveBeenCalledExactlyOnceWith("https://auth.example/confirmed");
+			} else {
+				expect(actions).toEqual([`GET ${pending}`]);
+				expect(openBrowser).toHaveBeenCalledExactlyOnceWith("https://auth.example/start");
+			}
+			expect(inputs).toEqual(["Waiting for Claude sign-in"]);
+			expect(notifications.map((entry) => entry.message)).toEqual([
+				expect.stringContaining("Sign in to Claude in your browser"),
+				expect.stringContaining("Added Claude · b@example.com (subscription)"),
+			]);
+		},
+	);
+
+	it("explains that Console credits are unsupported without starting the broker", async () => {
+		const { menus, inputs, notifications, requests } = await runAccount("add claude-api-credits");
 		expect(menus).toEqual([]);
-		expect(inputs).toEqual(["Name for this API-credit account", "Waiting for the Claude Console sign-in"]);
-		expect(loginRequest(requests)).toEqual({ provider: "claude-api-credits", name: "work" });
-		expect(notifications.map((entry) => entry.message)).toEqual([
-			expect.stringContaining("Sign in to the Claude Console in your browser"),
-			expect.stringContaining("Added Claude · work (API credits)"),
+		expect(inputs).toEqual([]);
+		expect(requests).toEqual([]);
+		expect(notifications).toEqual([
+			{ message: expect.stringContaining("Use /accounts add claude-api-key"), type: "warning" },
 		]);
 	});
 
@@ -1089,7 +1181,7 @@ describe("account add flow", () => {
 		const complete = async (prefix: string) =>
 			((await extension.commands.get("accounts")!.getArgumentCompletions!(prefix)) ?? []).map((item) => item.value);
 		expect(await complete("add ")).toEqual(addArguments.map((entry) => `add ${entry}`));
-		expect(await complete("add claude-api")).toEqual(["add claude-api-credits", "add claude-api-key"]);
+		expect(await complete("add claude-api")).toEqual(["add claude-api-key"]);
 		expect(await complete("add x")).toEqual([]);
 	});
 

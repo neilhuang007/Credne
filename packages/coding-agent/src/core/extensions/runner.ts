@@ -422,8 +422,8 @@ export class ExtensionRunner {
 		contextActions: ExtensionContextActions,
 		providerActions?: {
 			registerProvider?: (name: string, config: ProviderConfig) => void;
-			registerNativeProvider?: (provider: Provider) => void;
-			unregisterProvider?: (name: string) => void;
+			registerNativeProvider?: (provider: Provider, extensionPath?: string) => void;
+			unregisterProvider?: (name: string, extensionPath?: string) => void;
 			registerVirtualModel?: (definition: VirtualModelDefinition) => void;
 			unregisterVirtualModel?: (provider: string, id: string) => void;
 		},
@@ -491,9 +491,9 @@ export class ExtensionRunner {
 		for (const { provider, extensionPath } of this.runtime.pendingNativeProviderRegistrations) {
 			try {
 				if (providerActions?.registerNativeProvider) {
-					providerActions.registerNativeProvider(provider);
+					providerActions.registerNativeProvider(provider, extensionPath);
 				} else {
-					this.modelRegistry.registerProvider(provider);
+					this.modelRegistry.registerNativeProvider(provider, extensionPath);
 				}
 			} catch (err) {
 				this.emitError({
@@ -532,19 +532,19 @@ export class ExtensionRunner {
 			}
 			this.modelRegistry.registerProvider(name, config);
 		};
-		this.runtime.registerNativeProvider = (provider) => {
+		this.runtime.registerNativeProvider = (provider, extensionPath) => {
 			if (providerActions?.registerNativeProvider) {
-				providerActions.registerNativeProvider(provider);
+				providerActions.registerNativeProvider(provider, extensionPath);
 				return;
 			}
-			this.modelRegistry.registerProvider(provider);
+			this.modelRegistry.registerNativeProvider(provider, extensionPath);
 		};
-		this.runtime.unregisterProvider = (name) => {
+		this.runtime.unregisterProvider = (name, extensionPath) => {
 			if (providerActions?.unregisterProvider) {
-				providerActions.unregisterProvider(name);
+				providerActions.unregisterProvider(name, extensionPath);
 				return;
 			}
-			this.modelRegistry.unregisterProvider(name);
+			this.modelRegistry.unregisterProvider(name, extensionPath);
 		};
 		this.runtime.registerVirtualModel = registerVirtualModel;
 		this.runtime.unregisterVirtualModel = (provider, id) => {

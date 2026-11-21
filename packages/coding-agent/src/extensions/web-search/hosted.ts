@@ -1,7 +1,4 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Response } from "undici";
-import type { ExtensionContext } from "../../core/extensions/types.ts";
-import { usageLimitFailure } from "../accounts/claude-limits.ts";
 import { fetchBroker } from "../accounts/client.ts";
 
 type Family = "codex" | "claude";
@@ -91,7 +88,8 @@ export async function searchHosted(
 	if (!response.ok || error != null) {
 		const status = response.ok ? "" : ` (HTTP ${response.status})`;
 		const detail = errorDetail(field(error, "message") ?? error, brokerToken);
-		throw new Error(`${provider} hosted web search failed${status}${detail ? `: ${detail}` : "."}`);
+		const message = `${provider} hosted web search failed${status}${detail ? `: ${detail}` : "."}`;
+		throw response.status === 429 ? new UsageLimitedSearchError(message) : new Error(message);
 	}
 	const collected = codex ? readCodex(payload, brokerToken) : readClaude(payload, brokerToken);
 	// Anthropic filters domains server-side; the Codex tool has no blocked list, so its links are filtered here.
@@ -113,43 +111,6 @@ export class UsageLimitedSearchError extends Error {
 	}
 }
 
-/**
- * Runs Claude's hosted web search on a local subscription's model through the model registry, not the broker. The
- * request is the model's own, shaped by its provider; only the `web_search_20250305` tool is added. Pi's stream
- * drops the server tool's blocks, so the raw stream events rebuild them for the shared reader.
- */
-export async function searchClaudeLocally(
-	registry: ExtensionContext["modelRegistry"],
-	model: Model<Api>,
-	query: string,
-	filter: DomainFilter,
-	signal: AbortSignal,
-): Promise<SearchResult> {
-	const reader = createClaudeEventReader();
-	const stream = registry.streamSimple(
-		model,
-		{
-			systemPrompt: SEARCH_SYSTEM_PROMPT,
-			messages: [{ role: "user", content: `Perform a web search for the query: ${query}`, timestamp: Date.now() }],
-		},
-		{
-			signal,
-			maxTokens: 4096,
-			onPayload: (params) => withClaudeSearchTool(params, filter),
-			onProviderStreamEvent: (event) => reader.add(event),
-		},
-	);
-	const message = await stream.result();
-	signal.throwIfAborted();
-	if (message.stopReason === "error") {
-		const detail = errorDetail(message.errorMessage, "");
-		const text = `Claude hosted web search failed${detail ? `: ${detail}` : "."}`;
-		throw usageLimitFailure(message, Date.now()) ? new UsageLimitedSearchError(text) : new Error(text);
-	}
-	const payload = reader.payload();
-	return finishHosted(readClaude(payload, ""), payload, "Claude", "", {}, "stop_reason");
-}
-
 const CLAUDE_SEARCH_TOOL_CHOICE = { type: "tool", name: "web_search" };
 
 function claudeSearchTool({ allowedDomains, blockedDomains }: DomainFilter) {
@@ -159,48 +120,6 @@ function claudeSearchTool({ allowedDomains, blockedDomains }: DomainFilter) {
 		max_uses: MAX_SEARCHES,
 		...(allowedDomains && { allowed_domains: allowedDomains }),
 		...(blockedDomains && { blocked_domains: blockedDomains }),
-	};
-}
-
-/** The model's request with the search tool forced. A forced tool call cannot combine with thinking. */
-function withClaudeSearchTool(params: unknown, filter: DomainFilter): unknown {
-	// The payload is the provider's wire request; anything but an object is left as built.
-	if (params === null || typeof params !== "object") return undefined;
-	const { thinking: _thinking, ...request } = params as Record<string, unknown>;
-	return { ...request, tools: [claudeSearchTool(filter)], tool_choice: CLAUDE_SEARCH_TOOL_CHOICE };
-}
-
-/** Collects the content blocks of a Messages stream from its raw events, which carry the server tool's blocks. */
-function createClaudeEventReader(): { add(event: unknown): void; payload(): unknown } {
-	const blocks = new Map<number, Record<string, unknown>>();
-	let stopReason: unknown;
-	return {
-		add(event) {
-			const type = field(event, "type");
-			const index = field(event, "index");
-			if (type === "message_delta") stopReason = field(field(event, "delta"), "stop_reason");
-			if (typeof index !== "number") return;
-			if (type === "content_block_start") {
-				const block = field(event, "content_block");
-				if (block !== null && typeof block === "object") blocks.set(index, { ...block });
-				return;
-			}
-			const delta = field(event, "delta");
-			const block = blocks.get(index);
-			const text = field(delta, "text");
-			if (
-				type === "content_block_delta" &&
-				field(delta, "type") === "text_delta" &&
-				block &&
-				typeof text === "string"
-			) {
-				block.text = `${typeof block.text === "string" ? block.text : ""}${text}`;
-			}
-		},
-		payload: () => ({
-			content: [...blocks.entries()].sort(([left], [right]) => left - right).map(([, block]) => block),
-			stop_reason: stopReason,
-		}),
 	};
 }
 

@@ -10,11 +10,7 @@ export interface BrokerConnection {
 	pid: number;
 }
 
-/**
- * How an account authenticates. They are not interchangeable: `oauth` uses a subscription through
- * CLIProxyAPI's client emulation, `api-credits` uses a Claude Console organization (for example the
- * monthly API credits of Max, Ultra and Team plans) through `ant`, and `api-key` uses a provider API key.
- */
+/** How an account authenticates. `api-credits` is a retired kind that can appear in older catalogs. */
 export type BrokerAccountKind = "oauth" | "api-key" | "api-credits";
 
 /** One account as the broker reports it. Never contains credentials. */
@@ -22,7 +18,7 @@ export interface BrokerAccount {
 	id: string;
 	/** base64url account id used in broker URLs. */
 	key: string;
-	/** CLIProxyAPI provider key: "claude", "claude-api", "codex", ... */
+	/** Broker provider key: "claude", "claude-api", "codex", ... */
 	provider: string;
 	kind: BrokerAccountKind;
 	source: string;
@@ -57,7 +53,7 @@ export type BrokerUsage =
 	| { status: "available"; windows: BrokerQuotaWindow[]; credits: BrokerCredit[] }
 	| { status: "unavailable" | "unsupported"; reason: string; windows: []; credits: [] };
 
-/** A model an account or pool can serve, as reported by CLIProxyAPI's registry. */
+/** A model an account or pool can serve, as reported by the broker. */
 export interface BrokerModel {
 	id: string;
 	displayName?: string;
@@ -68,12 +64,11 @@ export interface BrokerModel {
 	inputModalities?: string[];
 }
 
-export interface BrokerLogin {
-	state: string;
-	url: string;
-	flow?: string;
-	userCode?: string;
-}
+export type BrokerLogin =
+	| { type: "browser"; state: string; url: string; userCode?: string }
+	| { type: "acknowledge-risk"; state: string; warning: string };
+
+export type BrokerLoginProvider = "claude" | "codex";
 
 export interface BrokerLoginStatus {
 	status: "wait" | "ok" | "error";
@@ -147,7 +142,19 @@ export class BrokerClient {
 	async connectExisting(signal?: AbortSignal): Promise<BrokerConnection | undefined> {
 		if (this.connection && Date.now() - this.checkedAt < HEALTH_TTL_MS) return this.connection;
 		const discovered = this.readDiscovery();
-		if (!discovered || !(await this.healthy(discovered, signal))) return undefined;
+		if (!discovered) return undefined;
+		if (!(await this.healthy(discovered, signal))) {
+			// A stalled daemon still owns its credentials; only a dead process can be replaced.
+			try {
+				process.kill(discovered.pid, 0);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return undefined;
+				throw error;
+			}
+			throw new BrokerError(
+				`Account daemon PID ${discovered.pid} is still running but not responding. Stop it before starting another daemon.`,
+			);
+		}
 		this.remember(discovered);
 		return discovered;
 	}
@@ -196,13 +203,20 @@ export class BrokerClient {
 		return account === undefined ? undefined : parseAccounts([account])[0];
 	}
 
-	/** Start a browser login. `name` names API-credit accounts, whose provider is `claude-api-credits`. */
-	async startLogin(provider: string, name?: string, signal?: AbortSignal): Promise<BrokerLogin> {
-		const data = await this.request("POST", "/logins", { provider, name }, signal);
-		const state = field(data, "state");
-		const url = field(data, "url");
-		if (typeof state !== "string" || typeof url !== "string") throw new BrokerError("Broker returned no login URL");
-		return { state, url, flow: optionalString(data, "flow"), userCode: optionalString(data, "userCode") };
+	/** Start a subscription login; it may pause until the user accepts a provider warning. */
+	async startLogin(provider: BrokerLoginProvider): Promise<BrokerLogin> {
+		const data = await this.request("POST", "/logins", { provider });
+		const state = optionalString(data, "state");
+		if (!state) throw new BrokerError("Broker returned no login state");
+		const warning = optionalString(data, "riskWarning");
+		return warning ? { type: "acknowledge-risk", state, warning } : parseBrowserLogin(data, state);
+	}
+
+	/** Resume a pending login only after the user explicitly accepts the warning. */
+	async acknowledgeLoginRisk(state: string): Promise<Extract<BrokerLogin, { type: "browser" }>> {
+		const data = await this.request("POST", `/logins/${encodeURIComponent(state)}/acknowledge`, { answer: "yes" });
+		if (field(data, "state") !== state) throw new BrokerError("Broker returned a mismatched login state");
+		return parseBrowserLogin(data, state);
 	}
 
 	async loginStatus(state: string, signal?: AbortSignal): Promise<BrokerLoginStatus> {
@@ -226,7 +240,7 @@ export class BrokerClient {
 
 	/** Stop the broker for every harness process. The next request starts a new one. */
 	async shutdown(): Promise<void> {
-		const connection = await this.connectExisting();
+		const connection = this.readDiscovery();
 		if (!connection) return;
 		await fetchBroker(`${connection.url}/credne/v1/shutdown`, {
 			method: "POST",
@@ -271,7 +285,7 @@ export class BrokerClient {
 		const binary = this.locateBinary();
 		if (!binary) {
 			throw new BrokerError(
-				"Account broker not installed. Build broker/ with Go and place credne-broker on PATH, in the pi bin directory, or set PI_ACCOUNTS_BROKER.",
+				"Account broker not installed. Build broker/ with Bun and place credne-broker on PATH, in the pi bin directory, or set PI_ACCOUNTS_BROKER.",
 			);
 		}
 		const stale = this.readDiscovery();
@@ -337,11 +351,14 @@ export class BrokerClient {
 		const pid = field(data, "pid");
 		// Only a loopback URL may receive the broker token.
 		if (typeof url !== "string" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(url)) return undefined;
-		if (typeof token !== "string" || typeof pid !== "number") return undefined;
+		if (typeof token !== "string" || typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) {
+			return undefined;
+		}
 		return { url, token, pid };
 	}
 
 	private async healthy(connection: BrokerConnection, signal?: AbortSignal): Promise<boolean> {
+		let data: unknown;
 		try {
 			const response = await fetchBroker(`${connection.url}/credne/v1/health`, {
 				headers: { authorization: `Bearer ${connection.token}` },
@@ -349,11 +366,20 @@ export class BrokerClient {
 					? AbortSignal.any([signal, AbortSignal.timeout(HEALTH_TIMEOUT_MS)])
 					: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
 			});
-			await response.body?.cancel();
-			return response.ok;
+			if (!response.ok) {
+				await response.body?.cancel();
+				return false;
+			}
+			data = await response.json();
 		} catch {
 			return false;
 		}
+		if (field(data, "backend") !== "oh-my-pi") {
+			throw new BrokerError(
+				`A previous account broker is still running (PID ${connection.pid}). Stop it before using this version of Credne.`,
+			);
+		}
+		return true;
 	}
 
 	private remember(connection: BrokerConnection): void {
@@ -411,6 +437,12 @@ function optionalNumber(data: unknown, name: string): number | undefined {
 function optionalStrings(data: unknown, name: string): string[] | undefined {
 	const value = field(data, name);
 	return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : undefined;
+}
+
+function parseBrowserLogin(data: unknown, state: string): Extract<BrokerLogin, { type: "browser" }> {
+	const url = optionalString(data, "url");
+	if (!url || optionalString(data, "riskWarning")) throw new BrokerError("Broker returned no login URL");
+	return { type: "browser", state, url, userCode: optionalString(data, "userCode") };
 }
 
 function parseAccounts(data: unknown): BrokerAccount[] {

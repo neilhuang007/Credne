@@ -1,10 +1,11 @@
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
-import { getAgentDir } from "../config.ts";
+import { getAgentDir, USES_BROKER_AUTH } from "../config.ts";
+import { getBuiltInModelExtensions } from "../extensions/index.ts";
 import { resolvePath } from "../utils/paths.ts";
-import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
-import { ModelRuntime } from "./model-runtime.ts";
+import type { LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import { ModelRuntime, ProviderRegistrationDisabledError } from "./model-runtime.ts";
 import {
 	DefaultResourceLoader,
 	type DefaultResourceLoaderOptions,
@@ -146,36 +147,44 @@ export async function createAgentSessionServices(
 		}));
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const resourceLoader = new DefaultResourceLoader({
-		...(options.resourceLoaderOptions ?? {}),
+		extensionFactories: USES_BROKER_AUTH ? getBuiltInModelExtensions(agentDir) : undefined,
+		...options.resourceLoaderOptions,
 		cwd,
 		agentDir,
 		settingsManager,
 	});
 	await resourceLoader.reload(options.resourceLoaderReloadOptions);
 
+	const diagnostics = await registerPendingProviders(modelRuntime, resourceLoader.getExtensions());
+	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+
+	return { cwd, agentDir, modelRuntime, settingsManager, resourceLoader, diagnostics };
+}
+
+/** Register models before the startup selector, CLI overrides, or SDK choose a model. */
+export async function registerPendingProviders(
+	modelRuntime: ModelRuntime,
+	extensionsResult: LoadExtensionsResult,
+): Promise<AgentSessionRuntimeDiagnostic[]> {
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
-	const extensionsResult = resourceLoader.getExtensions();
+	const reportRegistrationIssue = (extensionPath: string, cause: unknown) => {
+		const message = cause instanceof Error ? cause.message : String(cause);
+		const type = cause instanceof ProviderRegistrationDisabledError ? "warning" : "error";
+		diagnostics.push({ type, message: `Extension "${extensionPath}" ${type}: ${message}` });
+	};
 	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
 		try {
 			modelRuntime.registerProvider(name, config);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
+			reportRegistrationIssue(extensionPath, error);
 		}
 	}
 	extensionsResult.runtime.pendingProviderRegistrations = [];
 	for (const { provider, extensionPath } of extensionsResult.runtime.pendingNativeProviderRegistrations) {
 		try {
-			modelRuntime.registerNativeProvider(provider);
+			modelRuntime.registerNativeProvider(provider, extensionPath);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
+			reportRegistrationIssue(extensionPath, error);
 		}
 	}
 	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
@@ -183,25 +192,12 @@ export async function createAgentSessionServices(
 		try {
 			modelRuntime.registerVirtualModel(definition);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
+			reportRegistrationIssue(extensionPath, error);
 		}
 	}
 	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
 	await modelRuntime.refresh({ allowNetwork: false });
-	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
-
-	return {
-		cwd,
-		agentDir,
-		modelRuntime,
-		settingsManager,
-		resourceLoader,
-		diagnostics,
-	};
+	return diagnostics;
 }
 
 /**

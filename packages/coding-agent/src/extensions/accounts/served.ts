@@ -1,8 +1,8 @@
-// Which physical account answered last. A virtual pool chooses the account per request, so only the answers tell.
+// The provider of the last successful response, for callers selecting a session's account.
 import type { SessionEntry } from "../../core/session-manager.ts";
-import { ACCOUNT_PROVIDER_PREFIX, isLocalClaudeProvider } from "./catalog.ts";
+import { ACCOUNT_PROVIDER_PREFIX } from "./catalog.ts";
 
-/** Provider of the latest successful answer on the branch, which is the account a virtual pool picked. */
+/** Provider of the latest successful answer on the branch. */
 export function latestServingProvider(branch: readonly SessionEntry[]): string | undefined {
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
@@ -13,7 +13,7 @@ export function latestServingProvider(branch: readonly SessionEntry[]): string |
 	return undefined;
 }
 
-/** Whether `providerId` is an account of this extension: a local Claude subscription or a pinned broker account. */
+/** Whether `providerId` pins one broker account. */
 export function isAccountProvider(providerId: string): boolean {
-	return isLocalClaudeProvider(providerId) || providerId.startsWith(ACCOUNT_PROVIDER_PREFIX);
+	return providerId.startsWith(ACCOUNT_PROVIDER_PREFIX);
 }

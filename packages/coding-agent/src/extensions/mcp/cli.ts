@@ -8,7 +8,8 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import chalk from "chalk";
-import { APP_NAME, CONFIG_DIR_NAME } from "../../config.ts";
+import { APP_NAME, CONFIG_DIR_NAME, USES_BROKER_AUTH } from "../../config.ts";
+import { BROKER_MCP_AUTH_GUIDANCE } from "../../core/auth-guidance.ts";
 import { validateMcpServerConfig } from "../../core/mcp-servers.ts";
 import { ModelRuntime } from "../../core/model-runtime.ts";
 import { ProjectTrustStore } from "../../core/trust-manager.ts";
@@ -145,11 +146,10 @@ function createConnection(
 }
 
 /**
- * Reads provider tokens from the agent directory's credentials, refreshing expired OAuth tokens like a
- * session does. The model runtime is created on the first request, so servers without `auth.provider`
- * do not load it.
+ * In Pi, read provider tokens only when an MCP server requests one. Credne never forwards broker auth.
  */
 function createProviderTokenReader(agentDir: string): (provider: string) => Promise<string | undefined> {
+	if (USES_BROKER_AUTH) return async () => undefined;
 	let runtime: Promise<ModelRuntime> | undefined;
 	return async (provider) => {
 		runtime ??= ModelRuntime.create({
@@ -286,7 +286,9 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 			const authProvider = getAuthProvider(entry);
 			if (authProvider) {
 				error(
-					`MCP server "${name}" uses the credentials of provider "${authProvider}". Run "${APP_NAME} auth ${command} ${authProvider}".`,
+					USES_BROKER_AUTH
+						? BROKER_MCP_AUTH_GUIDANCE
+						: `MCP server "${name}" uses the credentials of provider "${authProvider}". Run "${APP_NAME} auth ${command} ${authProvider}".`,
 				);
 				return 1;
 			}
@@ -580,7 +582,9 @@ async function list(
 		if (report.state === "needs-auth") {
 			log(
 				report.authProvider
-					? `  sign in with: /login ${report.authProvider} in ${APP_NAME}`
+					? USES_BROKER_AUTH
+						? `  ${BROKER_MCP_AUTH_GUIDANCE}`
+						: `  sign in with: /login ${report.authProvider} in ${APP_NAME}`
 					: `  sign in with: ${APP_NAME} mcp login ${report.name}`,
 			);
 		}
