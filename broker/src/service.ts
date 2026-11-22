@@ -140,7 +140,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 		pid: process.pid,
 		url: "",
 		token: `cbk_${randomBytes(32).toString("hex")}`,
-		brokerVersion: options.version ?? process.env.CREDNE_BROKER_VERSION ?? "0.1.5",
+		brokerVersion: options.version ?? process.env.CREDNE_BROKER_VERSION ?? "0.1.6",
 		upstreamVersion: "19.0.0",
 		backend: "oh-my-pi",
 		startedAt: new Date().toISOString(),
@@ -187,6 +187,8 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 			typesafeBaseUrl: options.typesafeBaseUrl ?? TYPESAFE_DEFAULT_BASE_URL,
 		});
 		await accounts.load();
+		// Subscriptions read their model lists in the background; the first pool request waits for them (gateway.ts).
+		for (const account of accounts.accounts.values()) void accounts.refreshSubscriptionModels(account);
 		gateway = new Gateway(accounts, options.maxConcurrency ?? 0);
 		logins = new Logins(accounts);
 		const store = accounts,
@@ -269,13 +271,14 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 							path,
 						);
 						const loginMatch = /^\/logins\/([A-Za-z0-9_-]+)(?:\/(callback|acknowledge))?$/.exec(path);
-						const routeMatch = /^\/route\/([^/]+)(\/pi\/stream|\/systemone)$/.exec(path);
+						const routeMatch = /^\/route\/([^/]+)(\/pi\/stream|\/systemone|\/search)$/.exec(path);
 						if (accountMatch) {
 							const account = store.get(accountMatch[1]);
 							const action = accountMatch[2];
-							if (request.method === "GET" && action === "models")
+							if (request.method === "GET" && action === "models") {
+								await store.refreshSubscriptionModels(account);
 								response = Response.json({ models: publicModels(account) });
-							else if (request.method === "GET" && action === "usage")
+							} else if (request.method === "GET" && action === "usage")
 								response = Response.json(await accountUsage(account, request.signal));
 							else if (request.method === "POST" && action && ["disable", "enable", "reset"].includes(action)) {
 								await store.mutate(account, action);

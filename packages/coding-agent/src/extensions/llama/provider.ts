@@ -18,6 +18,7 @@ import {
 	LlamaClient,
 	type LlamaModelInfo,
 	type LlamaServerProps,
+	LlamaUnreachableError,
 	llamaInferenceUrl,
 	normalizeLlamaServerUrl,
 } from "./client.ts";
@@ -185,6 +186,8 @@ export function createLlamaProvider(): LlamaProviderController {
 	const fallbackClassifier = llamaCppClassifyApi();
 	const decisionClassifier = typesafeSystemOneApi();
 	const localServerUrl = USES_BROKER_AUTH ? getUnauthenticatedServerUrl() : undefined;
+	// Without LLAMA_BASE_URL, Credne probes the default port; no server there means no local models, not an error.
+	const isImplicitServer = USES_BROKER_AUTH && !process.env.LLAMA_BASE_URL;
 
 	const setCatalog = (
 		catalog: readonly LlamaModelInfo[],
@@ -276,7 +279,13 @@ export function createLlamaProvider(): LlamaProviderController {
 			const serverUrl = USES_BROKER_AUTH ? localServerUrl : credentialServerUrl(credential);
 			if (!serverUrl) return;
 			const client = new LlamaClient(serverUrl, USES_BROKER_AUTH ? undefined : credential?.key);
-			const catalog = await client.list({ signal: context.signal });
+			let catalog: LlamaModelInfo[];
+			try {
+				catalog = await client.list({ signal: context.signal });
+			} catch (error) {
+				if (isImplicitServer && error instanceof LlamaUnreachableError) return;
+				throw error;
+			}
 			if (context.signal.aborted) return;
 			const routerAutoload = await routerAutoloadEnabled(client, catalog, context.signal);
 			if (context.signal.aborted) return;

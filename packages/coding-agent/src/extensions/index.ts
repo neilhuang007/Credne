@@ -6,6 +6,7 @@ import mcpExtension from "./mcp/index.ts";
 import planningExtension from "./planning/index.ts";
 import subagentExtension from "./subagent/index.ts";
 import toolSearchExtension from "./tool-search/index.ts";
+import webSearchExtension from "./web-search/index.ts";
 
 /** First-party model providers used by Credne's CLI and headless SDK. */
 export function getBuiltInModelExtensions(agentDir?: string): InlineExtension[] {
@@ -17,6 +18,7 @@ export function getBuiltInModelExtensions(agentDir?: string): InlineExtension[] 
 
 export const builtInExtensions: InlineExtension[] = [
 	...getBuiltInModelExtensions(),
+	{ name: "web-search", factory: webSearchExtension, replaceable: true, builtin: true },
 	{ name: "planning", factory: planningExtension, builtin: true },
 	{ name: "subagent", factory: subagentExtension, replaceable: true, builtin: true },
 	// Replaceable: an extension that registers `codemode`, `tool_search`, or `/mcp` (such as a third-party

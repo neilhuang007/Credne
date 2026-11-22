@@ -2,9 +2,19 @@ import type { Api, AuthCredential, Model } from "@oh-my-pi/pi-ai";
 import { normalizeClientSessionKey } from "@oh-my-pi/pi-ai/auth-gateway/dispatch";
 import { type AuthGatewayRouter, createAuthGatewayRouter } from "@oh-my-pi/pi-ai/auth-gateway/server";
 import { setTransports } from "@oh-my-pi/pi-utils/logger";
-import { type Account, type Accounts, accountKey, classifierAccount, HttpError, recordFailure } from "./accounts.ts";
+import {
+	type Account,
+	type Accounts,
+	accountKey,
+	classifierAccount,
+	cooldownStatuses,
+	HttpError,
+	recordFailure,
+} from "./accounts.ts";
 import { KeyRoute } from "./key-route.ts";
+import { SearchProviderError } from "./omp-search/types.ts";
 import { holdUntil, relay } from "./relay.ts";
+import { readSearchRequest, searchModels, searchOnModel } from "./search.ts";
 import { SessionLocks } from "./session-lock.ts";
 import { type Attempt, currentAttempt, isFailoverStatus, newAttempt, observingFetch, runAttempt } from "./transport.ts";
 import { object, text } from "./wire.ts";
@@ -81,7 +91,56 @@ export class Gateway {
 
 	async execute(request: Request, target: string, path: string): Promise<Response> {
 		if (path === "/systemone") return this.systemOne.execute(request, target);
+		if (path === "/search") return this.search(request, target);
 		return this.piStream(request, target);
+	}
+
+	/**
+	 * Hosted web search on one pinned subscription, sent by OMP's own search providers (see `search.ts`). The session is
+	 * held on the account's credential like a chat request, so OMP cannot fall back to an environment key. A failure on
+	 * the search swap model falls through to the session model, as in OMP; a usage limit benches the account.
+	 */
+	private async search(request: Request, target: string): Promise<Response> {
+		if (!target.startsWith("a.")) throw new HttpError(404, "Hosted web search runs on a pinned account route.");
+		const key = target.slice(2);
+		const account = this.accounts.get(key);
+		const search = await readSearchRequest(request);
+		if (account.record.disabled) return protocolError(403, "Pinned account is disabled.", key);
+		if (account.record.kind !== "oauth")
+			return protocolError(400, "Hosted web search needs a Claude or ChatGPT subscription account.", key);
+		if (account.cooldown > Date.now()) {
+			const seconds = String(Math.ceil((account.cooldown - Date.now()) / 1000));
+			return protocolError(account.lastStatus ?? 429, `account ${account.record.name}: cooling down`, key, seconds);
+		}
+		await account.discovering;
+		const sessionModel = findModel(account, search.modelId);
+		if (!sessionModel) return protocolError(404, "The account does not serve this model.", key);
+		const models = searchModels(account, sessionModel);
+		if (!models.length) return protocolError(400, `${sessionModel.id} has no hosted web search.`, key);
+		const credential = account.storage.credentials.get(account.provider);
+		if (!credential) return protocolError(401, "The selected account has no saved credential.", key);
+		const release = await this.acquire(account, request.signal);
+		const unlock = this.locks.hold(account, credential, search.sessionId);
+		try {
+			let failure: { status: number; message: string } | undefined;
+			for (const model of models) {
+				try {
+					const result = await searchOnModel(account, model, search, request.signal);
+					return Response.json(result, { headers: { "x-credne-account": key, "cache-control": "no-store" } });
+				} catch (error) {
+					request.signal.throwIfAborted();
+					const status = error instanceof SearchProviderError ? (error.status ?? 502) : 502;
+					failure = { status, message: error instanceof Error ? error.message : "search failed" };
+				}
+			}
+			const { status, message } = failure!;
+			if (cooldownStatuses.includes(status)) recordFailure(account, status);
+			const detail = message.replace(/[\s\p{Cc}]+/gu, " ").slice(0, 500);
+			return protocolError(status, `account ${account.record.name} (${account.family}): ${detail}`, key);
+		} finally {
+			unlock();
+			release();
+		}
 	}
 
 	/** Answers a System One request through OMP's own `/v1/systemone` route, which reads the account's key and speaks its judge's wire. */
@@ -137,6 +196,9 @@ export class Gateway {
 		let candidates = pin
 			? [this.accounts.get(target.slice(2))]
 			: [...this.accounts.accounts.values()].filter((account) => pool === "all" || account.family === pool);
+		// A subscription still reading its model list may serve a model its bundled list lacks; choosing before the read
+		// lands would send the request to an API key.
+		await Promise.all(candidates.map((account) => account.discovering));
 		candidates = candidates.filter((account) => !classifierAccount(account) && findModel(account, modelId));
 		if (pin && candidates[0]?.record.disabled)
 			return protocolError(403, "Pinned account is disabled.", target.slice(2));

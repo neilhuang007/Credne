@@ -1,9 +1,14 @@
-// Covers family aliases such as "sol" in subagent model resolution.
+// Covers family aliases such as "sol" in subagent model resolution and their latest-version rule.
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionToolContext } from "../src/core/extensions/types.ts";
 import { createSubagentDispatch } from "../src/extensions/subagent/dispatch.ts";
 import aliases from "../src/extensions/subagent/model-aliases.json" with { type: "json" };
+import {
+	findAliasRowOfModel,
+	resolveModelAlias,
+	resolveProviderAlias,
+} from "../src/extensions/subagent/model-aliases.ts";
 
 const parentProvider = "test-provider";
 
@@ -84,8 +89,14 @@ describe("model aliases", () => {
 		expect(resolveModel("other-provider/fable", models)).toBe("other-provider/claude-fable-5-2");
 	});
 
-	it("falls back to ordinary matching when the pool does not serve the alias target", () => {
+	it("uses an older version of the family when the pool does not serve the listed one", () => {
 		const models = [model("gpt-5.6-sol"), model("gpt-6.1-sol")];
+
+		expect(resolveModel("sol", models)).toBe("test-provider/gpt-6.1-sol");
+	});
+
+	it("falls back to ordinary matching when the pool serves no model of the alias family", () => {
+		const models = [model("gpt-sol-pro-1"), model("gpt-sol-max-1")];
 
 		expect(() => resolveModel("sol", models)).toThrow(/Ambiguous subagent model "sol"/);
 	});
@@ -95,5 +106,69 @@ describe("model aliases", () => {
 		const duplicates = keys.filter((key, index) => keys.indexOf(key) !== index);
 
 		expect(duplicates).toEqual([]);
+	});
+});
+
+describe("latest version of an alias family", () => {
+	function resolveId(alias: string, ids: string[]): string | undefined {
+		return resolveModelAlias(
+			alias,
+			ids.map((id) => model(id)),
+		)?.id;
+	}
+
+	it("picks a newer version that the table does not list", () => {
+		expect(resolveId("astra", ["gpt-6.2-astra", "gpt-6.3-astra", "gpt-6.1-astra"])).toBe("gpt-6.3-astra");
+		expect(resolveId("fable", ["claude-fable-5-2", "claude-fable-6"])).toBe("claude-fable-6");
+	});
+
+	it("compares version parts as numbers and a longer version above its prefix", () => {
+		expect(resolveId("astra", ["gpt-6.9-astra", "gpt-6.10-astra"])).toBe("gpt-6.10-astra");
+		expect(resolveId("astra", ["gpt-6.2-astra", "gpt-6.2.1-astra"])).toBe("gpt-6.2.1-astra");
+		expect(resolveId("luna", ["gpt-6-luna", "gpt-6.1-luna"])).toBe("gpt-6.1-luna");
+	});
+
+	it("uses an older version when the listed one is not served", () => {
+		expect(resolveId("astra", ["gpt-6.1-astra", "gpt-5.9-astra"])).toBe("gpt-6.1-astra");
+		expect(resolveId("pro", ["deepseek-v3-pro"])).toBe("deepseek-v3-pro");
+	});
+
+	it("prefers the undated ID over a dated snapshot of the same version, whatever their order", () => {
+		for (const ids of [
+			["claude-haiku-5-5-20260101", "claude-haiku-5-5"],
+			["claude-haiku-5-5", "claude-haiku-5-5-20260101"],
+		]) {
+			expect(resolveId("haiku", ids)).toBe("claude-haiku-5-5");
+		}
+		expect(resolveId("haiku", ["claude-haiku-5-5", "claude-haiku-5-6-20260301"])).toBe("claude-haiku-5-6-20260301");
+	});
+
+	it("does not match a different family that shares a word", () => {
+		expect(resolveId("astra", ["gpt-6.2-astra-pro", "gpt-6.9-astra-mini"])).toBeUndefined();
+		expect(resolveId("astra", ["gpt-6.9-astra-pro", "gpt-6.2-astra"])).toBe("gpt-6.2-astra");
+		expect(resolveId("flash", ["gemini-3.5-flash-lite"])).toBeUndefined();
+		expect(resolveId("flash-lite", ["gemini-3.5-flash-lite", "gemini-3.8-flash"])).toBe("gemini-3.5-flash-lite");
+	});
+
+	it("keeps the first of equal IDs and the model object of the item it picks", () => {
+		const first = model("gpt-6.2-sol", "pool:all");
+		const second = model("gpt-6.2-sol", "pool:codex");
+
+		expect(resolveModelAlias("sol", [first, second])).toBe(first);
+		expect(resolveModelAlias("sol", [second, first])).toBe(second);
+	});
+
+	it("resolves the rows of one provider", () => {
+		const items = [{ id: "gemini-3.9-flash" }, { id: "deepseek-flash" }];
+
+		expect(resolveProviderAlias("google", "flash", items)).toBe(items[0]);
+		expect(resolveProviderAlias("deepseek", "flash", items)).toBe(items[1]);
+		expect(resolveProviderAlias("anthropic", "flash", items)).toBeUndefined();
+	});
+
+	it("finds the alias row a model ID belongs to", () => {
+		expect(findAliasRowOfModel("gpt-6.1-sol")).toMatchObject({ provider: "openai", alias: "sol" });
+		expect(findAliasRowOfModel("claude-haiku-4-5-20251001")).toMatchObject({ provider: "anthropic", alias: "haiku" });
+		expect(findAliasRowOfModel("gpt-sol-pro-1")).toBeUndefined();
 	});
 });

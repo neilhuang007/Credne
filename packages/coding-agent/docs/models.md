@@ -28,6 +28,12 @@ Keep `auth.json` and any credential commands private. Project settings and exten
 
 Run `/model` to search available models. The picker shows models whose providers have usable authentication. Selecting a model, entering `/model <name>`, or cycling models remembers the model and provider/account for new sessions across projects. `Ctrl+S` also saves the selection. Explicit CLI options and project settings take precedence over the saved default.
 
+In Credne the picker is grouped by vendor and shows aliases instead of every routed model. Each [model alias](subagents.md#model-aliases), such as `fable` or `astra`, is one row that stands for the latest version of its family that your accounts serve. The row shows the resolved model ID after the alias, so accounts and pools that serve the same model add no rows. The sections are Claude, ChatGPT / OpenAI, xAI, Meta, DeepSeek, and Google, and a section appears only when it has a model. A local provider such as llama.cpp gets a section of its own, listed by model ID.
+
+Only the section of the current model starts unfolded. Move over a section header and press `Enter` to fold or unfold it; the fold state stays while you search and when the catalogs refresh. When the current model is an older version than its alias resolves to, it is listed by ID at the top of its section, so you can always see what is selected. Selecting an alias row selects the resolved model.
+
+Type to search. A search lists every choice as a flat list, including older versions and models that no alias covers, such as other IDs served by a pool. Clearing the search returns to the grouped list. The scoped list (`Tab`) and builds other than Credne stay flat.
+
 Run `/thinking [level]` or `/effort [level]` to set the current model's reasoning level. Without a level, either command opens a selector limited to levels supported by the selected model. The level you choose follows the session across models and accounts. For example, if you select `high`, switch to a model without reasoning, then switch to Astra, Astra uses `high` again. A configured per-model level or explicit cycling suffix overrides the preference only on that model. Press `Ctrl+S` in the selector to save the startup default for new sessions.
 
 `Ctrl+P` cycles through available models. Use `/scoped-models` to control that cycle and save the selection, or configure model patterns through [Settings](settings.md#model-cycling).

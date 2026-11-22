@@ -114,6 +114,25 @@ function makePicker(session: AgentSession, search?: string) {
 	return { selector, onSelect, render: () => stripAnsi(selector.render(120).join("\n")) };
 }
 
+const down = "\x1b[B";
+const up = "\x1b[A";
+const pageUp = "\x1b[5~";
+const pageDown = "\x1b[6~";
+const enter = "\r";
+
+/** The rendered list rows: section headers and model rows, with the alias column padding collapsed. */
+function listRows(output: string): string[] {
+	return output
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.filter((line) => /^[→ ] [⊟⊞] |^[→ ] {3}/.test(line))
+		.map((line) => line.replace(/(\w) {2,}/g, "$1 "));
+}
+
+function cursorRows(output: string): string[] {
+	return listRows(output).filter((line) => line.startsWith("→"));
+}
+
 type ModelCommandContext = {
 	session: AgentSession;
 	footer: { invalidate: () => void };
@@ -169,43 +188,215 @@ function modelCommand(session: AgentSession) {
 }
 
 describe("Credne model picker", () => {
-	it("shows one selectable global row per model, alongside local and conflicting family options", async () => {
+	it("groups the choices into one row per alias and a section per local provider, unfolding only the current one", async () => {
 		const { session } = await newSession();
-		const { selector, render } = makePicker(session);
+		const { selector, render, onSelect } = makePicker(session);
 		try {
-			const output = render();
-			expect(output).not.toMatch(/\[acct:|\[pool:codex\]|\[pool:openai\]/);
-			expect(output.match(/gpt-6\.2-sol \[/g)).toHaveLength(1);
-			expect(output).toContain(`${sol} [${globalPool}]`);
-			expect(output).toContain(`${shared} [pool:alpha]`);
-			expect(output).toContain(`${shared} [pool:beta]`);
-			expect(output).toContain("local-model [llama.cpp]");
+			// The accounts and pools that also serve the model add no rows, and older versions are not listed.
+			expect(listRows(render())).toEqual(["  ⊟ ChatGPT / OpenAI (1)", "→   ✓ sol gpt-6.2-sol", "  ⊞ llama.cpp (1)"]);
+			expect(render()).not.toMatch(/\[acct:|\[pool:/);
+			for (const hidden of [olderSol, shared, "qualified-id", "local-model"]) expect(render()).not.toContain(hidden);
+
+			// Enter on a header unfolds it without selecting, and the cursor stays on the header.
+			selector.handleInput(down);
+			selector.handleInput(enter);
+			expect(onSelect).not.toHaveBeenCalled();
+			expect(listRows(render())).toEqual([
+				"  ⊟ ChatGPT / OpenAI (1)",
+				"    ✓ sol gpt-6.2-sol",
+				"→ ⊟ llama.cpp (1)",
+				"      local-model",
+			]);
+			selector.handleInput(down);
+			selector.handleInput(enter);
+			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: local, id: "local-model" }));
 		} finally {
 			selector.dispose();
 			session.dispose();
 		}
 	});
 
-	it("shows the pinned account's rows in place of the pool rows it serves, and keeps the other choices", async () => {
+	it("keeps the fold state across a search and a catalog refresh", async () => {
+		const { session } = await newSession();
+		const { selector, render } = makePicker(session);
+		try {
+			// Unfold the local section, then fold the current one.
+			selector.handleInput(down);
+			selector.handleInput(enter);
+			selector.handleInput(up);
+			selector.handleInput(up);
+			selector.handleInput(enter);
+			const folded = ["→ ⊞ ChatGPT / OpenAI (1)", "  ⊟ llama.cpp (1)", "      local-model"];
+			expect(listRows(render())).toEqual(folded);
+
+			// A search lists the flat list, and clearing it restores the grouped list as it was left.
+			for (const char of "sol") selector.handleInput(char);
+			expect(render()).toContain(`${sol} [${globalPool}]`);
+			expect(render()).not.toMatch(/[⊟⊞]/);
+			for (const _ of "sol") selector.handleInput("\x7f");
+			expect(listRows(render())).toEqual(folded);
+
+			// The refresh that follows opening the picker lands after the sections were folded.
+			await vi.waitFor(() => expect(render()).not.toContain("Refreshing model catalogs"));
+			expect(listRows(render())).toEqual(folded);
+		} finally {
+			selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("keeps the caret keys of the search text from moving the highlighted row", async () => {
+		const { session } = await newSession();
+		const { selector, render } = makePicker(session);
+		try {
+			selector.handleInput(down);
+			expect(cursorRows(render())).toEqual(["→ ⊞ llama.cpp (1)"]);
+			selector.handleInput("\x1b[D");
+			selector.handleInput("\x1b[C");
+			expect(cursorRows(render())).toEqual(["→ ⊞ llama.cpp (1)"]);
+		} finally {
+			selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("lists every choice in the flat list while searching, including IDs no alias covers", async () => {
+		const { session } = await newSession();
+		const pickers = ["gpt", shared, "qualified", "local"].map((search) => makePicker(session, search));
+		try {
+			const [byFamily, byShared, byQualified, byLocal] = pickers.map(({ render }) => render());
+			expect(byFamily).toContain(`${sol} [${globalPool}]`);
+			expect(byFamily).toContain(`${olderSol} [${globalPool}]`);
+			expect(byShared).toContain(`${shared} [pool:alpha]`);
+			expect(byShared).toContain(`${shared} [pool:beta]`);
+			expect(byQualified).toContain(`vendor/qualified-id:tag [${globalPool}]`);
+			expect(byLocal).toContain("local-model [llama.cpp]");
+			expect(byLocal).not.toMatch(/[⊟⊞]/);
+		} finally {
+			for (const { selector } of pickers) selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("resolves each alias to the latest version served and lists no older version", async () => {
+		registerRoute(globalPool, [sol, olderSol, "gpt-6.3-sol", "claude-fable-5-1", "claude-fable-5-3"]);
+		await runtime.refresh({ allowNetwork: false });
+		const { session } = await newSession({ model: runtime.getModel(globalPool, "gpt-6.3-sol") });
+		const { selector, render, onSelect } = makePicker(session);
+		try {
+			expect(listRows(render())).toEqual([
+				"  ⊞ Claude (1)",
+				"  ⊟ ChatGPT / OpenAI (1)",
+				"→   ✓ sol gpt-6.3-sol",
+				"  ⊞ llama.cpp (1)",
+			]);
+			selector.handleInput(up);
+			selector.handleInput(up);
+			selector.handleInput(enter);
+			expect(listRows(render())).toContain("      fable claude-fable-5-3");
+			expect(render()).not.toMatch(/claude-fable-5-1|gpt-6\.2-sol|gpt-6\.1-sol/);
+			selector.handleInput(down);
+			selector.handleInput(enter);
+			expect(onSelect).toHaveBeenCalledWith(
+				expect.objectContaining({ provider: globalPool, id: "claude-fable-5-3" }),
+			);
+		} finally {
+			selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("shows the current model by ID at the top of its section when no alias resolves to it", async () => {
+		const { session } = await newSession({ model: runtime.getModel(globalPool, olderSol) });
+		const { selector, render, onSelect } = makePicker(session);
+		try {
+			expect(listRows(render())).toEqual([
+				"  ⊟ ChatGPT / OpenAI (2)",
+				"→   ✓ gpt-6.1-sol",
+				"      sol gpt-6.2-sol",
+				"  ⊞ llama.cpp (1)",
+			]);
+			selector.handleInput(down);
+			selector.handleInput(enter);
+			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: globalPool, id: sol }));
+		} finally {
+			selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("unfolds the section of a local current model instead of the first section", async () => {
+		const { session } = await newSession({ model: runtime.getModel(local, "local-model") });
+		const { selector, render } = makePicker(session);
+		try {
+			expect(listRows(render())).toEqual(["  ⊞ ChatGPT / OpenAI (1)", "  ⊟ llama.cpp (1)", "→   ✓ local-model"]);
+		} finally {
+			selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("shows the pinned account's row for its alias and keeps the other choices reachable", async () => {
 		const { session } = await newSession({ model: runtime.getModel(account, sol) });
 		const { selector, render, onSelect } = makePicker(session);
 		const other = makePicker(session, olderSol);
 		try {
-			const output = render();
-			expect(output).toContain(`✓ ${sol} [${account}]`);
-			expect(output).not.toContain(`${sol} [${globalPool}]`);
-			expect(output).not.toMatch(/\[acct:openai-metered\]|\[pool:codex\]|\[pool:openai\]/);
-			expect(output).toContain(`${olderSol} [${globalPool}]`);
-			expect(output).toContain(`${shared} [pool:alpha]`);
-			expect(output).toContain("local-model [llama.cpp]");
-			selector.handleInput("\r");
+			expect(listRows(render())).toEqual([
+				"  ⊟ ChatGPT / OpenAI (1)",
+				`→   ✓ sol gpt-6.2-sol [${account}]`,
+				"  ⊞ llama.cpp (1)",
+			]);
+			expect(render()).not.toMatch(/\[acct:openai-metered\]|\[pool:/);
+			selector.handleInput(enter);
 			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: account, id: sol }));
-			// A row the account does not serve is the way off the pin.
-			other.selector.handleInput("\r");
+			// A row the account does not serve is the way off the pin, and the search lists it.
+			expect(other.render()).toContain(`${olderSol} [${globalPool}]`);
+			other.selector.handleInput(enter);
 			expect(other.onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: globalPool, id: olderSol }));
 		} finally {
 			selector.dispose();
 			other.selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("keeps the cursor on a visible row in a list longer than one page", async () => {
+		registerRoute(globalPool, [
+			...["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"],
+			...[sol, "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6-luna"],
+		]);
+		await runtime.refresh({ allowNetwork: false });
+		const { session } = await newSession({ model: runtime.getModel(globalPool, "claude-opus-5-5") });
+		const { selector, render } = makePicker(session);
+		try {
+			// Claude is unfolded with four rows. Unfolding ChatGPT too makes eleven entries with the local header.
+			for (let step = 0; step < 3; step++) selector.handleInput(down);
+			selector.handleInput(enter);
+			expect(cursorRows(render())).toEqual(["→ ⊟ ChatGPT / OpenAI (4)"]);
+			expect(render()).toContain("(6/11)");
+			for (let step = 0; step < 11; step++) {
+				selector.handleInput(down);
+				expect(cursorRows(render())).toHaveLength(1);
+			}
+			selector.handleInput(pageDown);
+			expect(cursorRows(render())).toEqual(["→ ⊞ llama.cpp (1)"]);
+			expect(render()).toContain("(11/11)");
+			selector.handleInput(pageUp);
+			expect(cursorRows(render())).toEqual(["→ ⊟ Claude (4)"]);
+		} finally {
+			selector.dispose();
+			session.dispose();
+		}
+	});
+
+	it("keeps the scoped list flat", async () => {
+		const { session } = await newSession({ scoped: true });
+		const { selector, render } = makePicker(session);
+		try {
+			expect(render()).toContain(`${sol} [${account}]`);
+			expect(render()).not.toMatch(/[⊟⊞]/);
+		} finally {
+			selector.dispose();
 			session.dispose();
 		}
 	});

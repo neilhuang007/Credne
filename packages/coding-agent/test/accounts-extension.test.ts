@@ -881,6 +881,66 @@ describe("accounts extension", () => {
 	});
 });
 
+describe("account model refresh", () => {
+	const newerCodexModel: BrokerModel = { id: "gpt-test-2", thinking: true };
+	const codexProviderId = "acct:codex-cccc-c@example.com-plus";
+
+	/** Loads the extension over a cached catalog in which the Codex account serves only `gpt-test`. */
+	async function loadCached() {
+		const agentDir = tempDir();
+		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+		const home = join(agentDir, "accounts");
+		writeCatalog(join(home, "catalog.json"), testCatalog());
+		const runtime = createExtensionRuntime();
+		await loadExtensionFromFactory(accountsExtension, process.cwd(), createEventBus(), runtime, "builtin:accounts");
+		const refreshAll = (allowNetwork: boolean) =>
+			Promise.all(
+				runtime.pendingNativeProviderRegistrations.map(({ provider }) =>
+					provider.refreshModels!({
+						allowNetwork,
+						signal: new AbortController().signal,
+						publish: async () => true,
+					}),
+				),
+			);
+		const codexModels = () =>
+			runtime.pendingNativeProviderRegistrations
+				.filter(({ provider }) => provider.id === codexProviderId)
+				.map(({ provider }) => provider.getModels().map((model) => model.id));
+		return { home, runtime, refreshAll, codexModels };
+	}
+
+	it("re-registers accounts with the models a running broker now lists, reading it once per refresh", async () => {
+		const { home, refreshAll, codexModels } = await loadCached();
+		const broker = await startFakeBroker({
+			home,
+			respond: (request) =>
+				request.path.endsWith(`${codexC.key}/models`)
+					? { status: 200, body: { models: [codexModel, newerCodexModel] } }
+					: undefined,
+		});
+		await refreshAll(true);
+		expect(broker.requests.filter((request) => request.path === "/credne/v1/accounts")).toHaveLength(1);
+		expect(codexModels()).toEqual([["gpt-test"], ["gpt-test", "gpt-test-2"]]);
+		const cached = readCatalog(join(home, "catalog.json")).accounts.find((entry) => entry.id === codexC.id);
+		expect(cached?.models.map((model) => model.id)).toEqual(["gpt-test", "gpt-test-2"]);
+		// An unchanged broker list registers nothing again.
+		await refreshAll(true);
+		expect(codexModels()).toHaveLength(2);
+	});
+
+	it("does not contact the broker in the offline phase and never starts one", async () => {
+		const { home, runtime, refreshAll, codexModels } = await loadCached();
+		const registered = runtime.pendingNativeProviderRegistrations.length;
+		await refreshAll(true);
+		expect(runtime.pendingNativeProviderRegistrations).toHaveLength(registered);
+		const broker = await startFakeBroker({ home });
+		await refreshAll(false);
+		expect(broker.requests).toEqual([]);
+		expect(codexModels()).toEqual([["gpt-test"]]);
+	});
+});
+
 describe("Jev account warning", () => {
 	const warning =
 		"No Jev account. Add one with /accounts add jev; decisions fall back to gpt-6-luna or the session model.";

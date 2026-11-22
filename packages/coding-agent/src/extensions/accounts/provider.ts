@@ -78,19 +78,21 @@ export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
  * the broker serves for TypeSafe keys and, through oh-my-pi's judgment client, for OpenAI's gpt-6-luna.
  * The credential is the broker's per-run token, never a provider secret. `identify` finds oh-my-pi's provider and
  * API for the models of any account or pool, since a session's earlier turns can come from another one; without
- * it, earlier turns keep Pi's identity and oh-my-pi replays their reasoning as plain text.
+ * it, earlier turns keep Pi's identity and oh-my-pi replays their reasoning as plain text. `refresh` runs in the
+ * network phase of a model catalog refresh and re-reads the account list, which re-registers changed providers.
  */
 export function createAccountProvider(
 	spec: AccountProviderSpec,
 	client: BrokerClient,
 	onServedBy?: ServedByListener,
 	identify: OmpIdentityLookup = () => undefined,
+	refresh?: (signal: AbortSignal) => Promise<void>,
 ): Provider {
 	const report = (response: ProviderResponse) => {
 		const key = response.headers[ACCOUNT_HEADER];
 		if (key) onServedBy?.(spec.id, key);
 	};
-	return createProvider({
+	const provider = createProvider({
 		id: spec.id,
 		name: spec.name,
 		baseUrl: BROKER_PLACEHOLDER_URL,
@@ -115,6 +117,15 @@ export function createAccountProvider(
 		// A classification may be served by another pool account than the chat, so it must not move the footer.
 		classifiers: { "typesafe-system-one": viaLoopback(typesafeSystemOneApi()) },
 	});
+	if (!refresh) return provider;
+	return {
+		...provider,
+		// "configured" skips credential resolution, which would start the broker; the catalog check decides.
+		refreshModelsAuth: "configured",
+		refreshModels: async ({ allowNetwork, signal }) => {
+			if (allowNetwork && !signal.aborted) await refresh(signal);
+		},
+	};
 }
 
 /** Reports broker responses before invoking the caller's own response handler. */

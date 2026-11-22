@@ -209,7 +209,9 @@ Reuse a result while the parent model and serving account remain unchanged. Refr
 
 ### Model aliases
 
-A family alias is a short name for the newest model of a model family. Several generations of one family can be served together, such as `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6.2-sol`. Without an alias, `sol` matches all of them and fails as ambiguous. With the alias, `sol` selects `gpt-6.2-sol`.
+A family alias is a short name for the latest model of a model family. Several generations of one family can be served together, such as `gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol` and `gpt-6.2-sol`. Without an alias, `sol` matches all of them and fails as ambiguous. With the alias, `sol` selects the highest version served, here `gpt-6.2-sol`, and `gpt-6.3-sol` as soon as it is served, with no change to the table.
+
+The model of a row names a family, not a fixed version. An ID is split on `-` and `.`. Purely numeric parts, optionally with a `v` prefix such as `v4`, are the version. An eight-digit part is a date snapshot. Every other part is a family word, so `claude-fable-5-2` is the family `claude fable` at version 5.2 and `gpt-6.2-astra` is `gpt astra` at 6.2. An alias selects the served model of the row's family with the highest version, comparing the numbers part by part, where the longer version wins on a shared start (`6.2.1` over `6.2`). Among equal versions an ID without a date snapshot wins. A different family never matches: `gpt-6.2-astra-pro` is not Astra. When the listed version is not served, an older version of the family is used instead.
 
 A model reference is resolved in this order, within the models the current account (or the provider named in a `provider/model` reference) serves:
 
@@ -219,7 +221,9 @@ A model reference is resolved in this order, within the models the current accou
 
 An alias works wherever a subagent model is chosen: the `subagent` tool, `assign_tasks`, `change_agent_model`, an agent profile's `model`, and the rows of the [tier table](#model-tiers). Matching uses the model ID only, so one row covers the vendor's own provider, ChatGPT and Claude accounts, and pools, which all serve the vendor's model IDs unchanged.
 
-| Provider | Alias | Model |
+In Credne the same table drives the `/model` list: each alias is one row under its vendor and stands for the latest version served. See [Select a model](models.md#select-a-model).
+
+| Provider | Alias | Model (names the family) |
 | :--- | :--- | :--- |
 | `anthropic` | `fable` | `claude-fable-5-2` |
 | `anthropic` | `opus` | `claude-opus-5-5` |

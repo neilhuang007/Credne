@@ -165,6 +165,14 @@ function connectionErrorDetail(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** The server could not be reached at all: nothing listens at its URL, or the network failed. */
+export class LlamaUnreachableError extends Error {
+	constructor(message: string, options: ErrorOptions) {
+		super(message, options);
+		this.name = "LlamaUnreachableError";
+	}
+}
+
 export class LlamaClient {
 	readonly serverUrl: string;
 	private readonly apiKey: string | undefined;
@@ -180,9 +188,10 @@ export class LlamaClient {
 			return await fetch(`${this.serverUrl}${path}`, init);
 		} catch (error) {
 			if (init.signal?.aborted) throw error;
-			throw new Error(`Could not reach llama.cpp server at ${this.serverUrl}: ${connectionErrorDetail(error)}`, {
-				cause: error,
-			});
+			throw new LlamaUnreachableError(
+				`Could not reach llama.cpp server at ${this.serverUrl}: ${connectionErrorDetail(error)}`,
+				{ cause: error },
+			);
 		}
 	}
 

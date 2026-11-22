@@ -353,3 +353,41 @@ describe("Credne broker authentication", () => {
 		expect(await runtime.getAuth("llama.cpp")).toBeUndefined();
 	});
 });
+
+describe("local llama.cpp catalog refresh", () => {
+	const refreshLlama = (provider: ReturnType<typeof createLlamaProvider>["provider"]) =>
+		provider.refreshModels!({
+			publish: async (publication) => {
+				publication.update?.();
+				return true;
+			},
+			allowNetwork: true,
+			signal: new AbortController().signal,
+		});
+
+	it("treats no server at the default URL as no local models instead of a refresh error", async () => {
+		vi.stubEnv("LLAMA_BASE_URL", "");
+		const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("fetch failed"));
+		try {
+			const llama = createLlamaProvider();
+			await expect(refreshLlama(llama.provider)).resolves.toBeUndefined();
+			expect(fetch).toHaveBeenCalledOnce();
+			expect(String(fetch.mock.calls[0]![0])).toBe("http://127.0.0.1:9931/models");
+			expect(llama.provider.getModels()).toEqual([]);
+		} finally {
+			fetch.mockRestore();
+		}
+	});
+
+	it("reports an unreachable server that LLAMA_BASE_URL names", async () => {
+		vi.stubEnv("LLAMA_BASE_URL", "http://127.0.0.1:9310");
+		const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("fetch failed"));
+		try {
+			await expect(refreshLlama(createLlamaProvider().provider)).rejects.toThrow(
+				"Could not reach llama.cpp server at http://127.0.0.1:9310",
+			);
+		} finally {
+			fetch.mockRestore();
+		}
+	});
+});

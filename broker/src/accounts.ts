@@ -7,6 +7,7 @@ import { fetchTypeSafeModels } from "@oh-my-pi/pi-catalog/discovery/typesafe";
 import { getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import type { ProviderDescriptor } from "@oh-my-pi/pi-catalog/provider-models";
 import { loadBrokerConfig } from "./config.ts";
+import { discoverSubscriptionModels } from "./discovery.ts";
 import { accountProvider, brokerProvider, unsupportedEnrollment, validateProviderKey } from "./providers.ts";
 import { array, object, stringArray, text, type WireObject } from "./wire.ts";
 
@@ -43,7 +44,16 @@ export interface Account {
 	judges: Model<Api>[];
 	cooldown: number;
 	lastStatus?: number;
+	/** When a subscription's model list may be read from its provider again (epoch ms). */
+	nextDiscovery: number;
+	/** The subscription model read in progress, which a pool request waits for before choosing an account. */
+	discovering?: Promise<void>;
 }
+
+/** How long a subscription's discovered model list stands before the next model request reads it again. */
+const DISCOVERY_INTERVAL_MS = 15 * 60_000;
+/** How soon a failed model list read is retried. */
+const DISCOVERY_RETRY_MS = 60_000;
 export interface AccountOptions {
 	home: string;
 	anthropicBaseUrl: string;
@@ -319,6 +329,7 @@ export class Accounts {
 		const ids = record.models?.length ? record.models : bundled.keys();
 		const legacy = provider === "anthropic" || provider === "openai" || provider === "openai-codex";
 		const known = legacy ? new Map(getBundledModels(provider).map((model) => [model.id, model])) : bundled;
+		// Subscriptions start from the bundled list; refreshSubscriptionModels replaces it with the provider's own.
 		const models = [...ids].flatMap((id) => {
 			const base = known.get(id);
 			// TypeSafe serves every model ID its account lists, including IDs the bundled catalog lacks.
@@ -347,27 +358,52 @@ export class Accounts {
 						maxTokens: 16384,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					});
-			model.provider = provider;
-			model.preferWebsockets = false;
-			// OMP sends a model's headers with its requests; configured routing headers ride on the model.
-			if (record.headers) model.headers = { ...model.headers, ...record.headers };
-			if (record.baseUrl && record.provider === "codex" && record.source === "config") {
-				// Legacy Codex API keys append /responses to the configured base, not /v1/responses.
-				model.baseUrl = record.baseUrl;
-			} else if (legacy && (record.baseUrl || provider === "anthropic" || provider === "openai")) {
-				model.baseUrl = apiRoot(
-					record.baseUrl ??
-						(provider === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl),
-				);
-			}
-			return [model];
+			return [this.routed(record, provider, model)];
 		});
 		const judges = provider === "typesafe" ? models : openaiJudges(record, models);
-		const account: Account = { record, storage, provider, family, models, judges, cooldown: 0 };
+		const account: Account = { record, storage, provider, family, models, judges, cooldown: 0, nextDiscovery: 0 };
 		this.accounts.get(record.id)?.storage.close();
 		this.accounts.set(record.id, account);
 		await this.protectFiles(record.id);
 		return account;
+	}
+	/** Points a model the account serves at the account's endpoint and routing headers, as OMP will send it. */
+	private routed(record: AccountRecord, provider: string, model: Model<Api>): Model<Api> {
+		const legacy = provider === "anthropic" || provider === "openai" || provider === "openai-codex";
+		model.provider = provider;
+		model.preferWebsockets = false;
+		// OMP sends a model's headers with its requests; configured routing headers ride on the model.
+		if (record.headers) model.headers = { ...model.headers, ...record.headers };
+		if (record.baseUrl && record.provider === "codex" && record.source === "config") {
+			// Legacy Codex API keys append /responses to the configured base, not /v1/responses.
+			model.baseUrl = record.baseUrl;
+		} else if (legacy && (record.baseUrl || provider === "anthropic" || provider === "openai")) {
+			model.baseUrl = apiRoot(
+				record.baseUrl ?? (provider === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl),
+			);
+		}
+		return model;
+	}
+	/**
+	 * Replaces a subscription account's models with the list its provider gives for the account's sign-in, at most once
+	 * per discovery interval. The bundled catalog lags new releases: without this, a model only an API key lists, such
+	 * as a new GPT release the ChatGPT plan also serves, always routes to the billed key. A failed read keeps the
+	 * current models and is retried sooner. Concurrent callers share one read.
+	 */
+	refreshSubscriptionModels(account: Account): Promise<void> {
+		if (account.record.kind !== "oauth" || Date.now() < account.nextDiscovery) return Promise.resolve();
+		account.discovering ??= (async () => {
+			try {
+				const models = await discoverSubscriptionModels(account, this.options.anthropicBaseUrl);
+				if (models) account.models = models.map((model) => this.routed(account.record, account.provider, model));
+				account.nextDiscovery = Date.now() + (models ? DISCOVERY_INTERVAL_MS : DISCOVERY_RETRY_MS);
+			} catch {
+				account.nextDiscovery = Date.now() + DISCOVERY_RETRY_MS;
+			} finally {
+				account.discovering = undefined;
+			}
+		})();
+		return account.discovering;
 	}
 	private async protectFiles(id: string): Promise<void> {
 		for (const suffix of ["", "-wal", "-shm"]) {

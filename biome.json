@@ -39,6 +39,7 @@
 			"!**/models.generated.ts",
 			"!**/*.models.ts",
 			"!packages/mom/data/**/*",
+			"!broker/src/omp-search/{anthropic,base,codex,query,types,web-search-types}.ts",
 			"!!**/node_modules",
 			"!!apps"
 		]

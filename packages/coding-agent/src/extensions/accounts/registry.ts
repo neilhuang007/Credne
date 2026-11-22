@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { getBuiltinClassifierModel, getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import {
 	type AccountCatalog,
 	ALL_POOL,
@@ -30,6 +31,9 @@ const catalogClassifiers = [
 	getBuiltinClassifierModel("typesafe", "jev-latest"),
 ];
 
+/** How long a model refresh waits for the broker's account and model lists, which may include live discovery. */
+const BROKER_REFRESH_TIMEOUT_MS = 15_000;
+
 /** Registers broker accounts and pools from the cached catalog before contacting the daemon. */
 export class AccountRegistry {
 	private readonly pi: ExtensionAPI;
@@ -38,6 +42,10 @@ export class AccountRegistry {
 	private readonly onServedBy: ServedByListener;
 	private catalog: AccountCatalog;
 	private specs: AccountProviderSpec[] = [];
+	/** The broker read in progress, shared by syncs and model refreshes that overlap. */
+	private reading: Promise<{ accounts: BrokerAccount[]; catalog: AccountCatalog }> | undefined;
+	/** The model refresh in progress, shared by every account provider it refreshes. */
+	private refreshing: Promise<void> | undefined;
 	/** oh-my-pi's identity of a model of any registered account or pool, read when a request is encoded. */
 	private readonly identify: OmpIdentityLookup = (providerId, modelId) =>
 		upstreamIdentity(this.provider(providerId)?.upstream, modelId);
@@ -88,23 +96,8 @@ export class AccountRegistry {
 	async sync(ctx: ExtensionContext, signal?: AbortSignal): Promise<BrokerAccount[]> {
 		try {
 			if (!(await this.usesBroker(signal))) return [];
-			const accounts = (await this.client.listAccounts(signal)).filter((account) => account.kind !== "api-credits");
-			const accountModels = new Map(
-				await Promise.all(
-					accounts.map(
-						async (account) => [account.key, await this.client.accountModels(account.key, signal)] as const,
-					),
-				),
-			);
-			this.catalog = buildCatalog(
-				accounts,
-				accountModels,
-				(provider, id) => catalogSources.get(provider)?.get(id),
-				(provider, id) => catalogClassifiers.find((model) => model.provider === provider && model.id === id),
-			);
-			writeCatalog(this.catalogPath, this.catalog);
 			const previous = this.specs.map((spec) => spec.id);
-			this.apply();
+			const accounts = await this.reload(signal);
 			const changed = [...new Set([...previous, ...this.specs.map((spec) => spec.id)])];
 			// Registration recomputes availability asynchronously; wait so setModel() sees new accounts.
 			await ctx.modelRegistry.refresh({ providers: changed, allowNetwork: false, signal });
@@ -114,6 +107,58 @@ export class AccountRegistry {
 			ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
 			return [];
 		}
+	}
+
+	/**
+	 * The network phase of a model catalog refresh, such as opening /model: re-read accounts and their models
+	 * from a running broker, so subscription models the broker discovered since the last sync appear. Listing
+	 * models never starts the broker, and a failed read keeps the cached providers.
+	 */
+	async refreshFromBroker(signal: AbortSignal): Promise<void> {
+		this.refreshing ??= (async () => {
+			try {
+				const deadline = AbortSignal.timeout(BROKER_REFRESH_TIMEOUT_MS);
+				if (await this.client.connectExisting(deadline)) await this.reload(deadline);
+			} catch {
+				// The model selector reports refresh failures per provider; a stale account list is not one.
+			} finally {
+				this.refreshing = undefined;
+			}
+		})();
+		// Every account provider of one refresh waits for the same read; each may stop waiting on its own signal.
+		await raceWithAbortSignal(this.refreshing, signal);
+	}
+
+	/** Reads accounts and models from the broker, then registers the new catalog when it differs from the cached one. */
+	private async reload(signal?: AbortSignal): Promise<BrokerAccount[]> {
+		this.reading ??= this.readBroker(signal).finally(() => {
+			this.reading = undefined;
+		});
+		const { accounts, catalog } = await this.reading;
+		if (JSON.stringify(catalog) !== JSON.stringify(this.catalog)) {
+			this.catalog = catalog;
+			writeCatalog(this.catalogPath, catalog);
+			this.apply();
+		}
+		return accounts;
+	}
+
+	private async readBroker(signal?: AbortSignal): Promise<{ accounts: BrokerAccount[]; catalog: AccountCatalog }> {
+		const accounts = (await this.client.listAccounts(signal)).filter((account) => account.kind !== "api-credits");
+		const accountModels = new Map(
+			await Promise.all(
+				accounts.map(
+					async (account) => [account.key, await this.client.accountModels(account.key, signal)] as const,
+				),
+			),
+		);
+		const catalog = buildCatalog(
+			accounts,
+			accountModels,
+			(provider, id) => catalogSources.get(provider)?.get(id),
+			(provider, id) => catalogClassifiers.find((model) => model.provider === provider && model.id === id),
+		);
+		return { accounts, catalog };
 	}
 
 	/** Explicit commands can start a configured broker even before it has written the first catalog. */
@@ -134,7 +179,11 @@ export class AccountRegistry {
 			if (!ids.has(spec.id)) this.pi.unregisterProvider(spec.id);
 		}
 		for (const spec of specs)
-			this.pi.registerProvider(createAccountProvider(spec, this.client, this.onServedBy, this.identify));
+			this.pi.registerProvider(
+				createAccountProvider(spec, this.client, this.onServedBy, this.identify, (signal) =>
+					this.refreshFromBroker(signal),
+				),
+			);
 		this.specs = specs;
 	}
 }

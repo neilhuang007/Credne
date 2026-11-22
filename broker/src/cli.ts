@@ -18,7 +18,7 @@ function duration(value: string): number {
 }
 async function main(): Promise<void> {
 	process.umask(0o077);
-	const version = process.env.CREDNE_BROKER_VERSION ?? "0.1.5";
+	const version = process.env.CREDNE_BROKER_VERSION ?? "0.1.6";
 	const options: BrokerOptions = {
 		home: join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "accounts"),
 		version,

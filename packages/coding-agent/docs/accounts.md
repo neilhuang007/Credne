@@ -55,7 +55,7 @@ Claude Console browser sign-in (`/accounts add claude-api-credits`) is no longer
 
 ## Accounts and providers
 
-In Credne, `/model` normally shows the model rather than one copy per account. A bare model ID, or a recognized model-family alias such as `sonnet`, selects the available model and saves its routed ID, not the account that happens to answer. A session pinned to an account stays on it (see [Pinned accounts](#pinned-accounts)). When unrelated providers use the same ID and the broker cannot establish that they are the same model, choose the provider pool explicitly.
+In Credne, `/model` normally shows the model rather than one copy per account, as one row per model alias (`fable`, `astra`) that stands for the latest version served, grouped by vendor with the current vendor unfolded. A search lists every routed model as a flat list (see [Select a model](models.md#select-a-model)). A bare model ID, or a recognized model-family alias such as `sonnet`, selects the available model and saves its routed ID, not the account that happens to answer. A session pinned to an account stays on it (see [Pinned accounts](#pinned-accounts)). When unrelated providers use the same ID and the broker cannot establish that they are the same model, choose the provider pool explicitly.
 
 To choose the payer instead of using pooled routing, use `/accounts switch` or an explicit `acct:<id>/<model>` selection. For example, `--model acct:claude-api-work/claude-sonnet-4-5` pins the session when that account and model are registered. A deliberate account restriction is never widened to the global pool by an alias.
 
@@ -85,6 +85,21 @@ A pool exists as soon as one enabled account belongs to its family, so `pool:cla
 Pools try eligible subscription accounts before ordinary API keys. For example, if a ChatGPT subscription and an OpenAI API key both offer the selected GPT model, `pool:all` uses the subscription first. When the subscription is rate-limited, the pool can use the key and incur API charges. Once the subscription is eligible again, it takes priority even if the key served the previous turn. Claude subscriptions and Anthropic API keys follow the same rule. The configured routing strategy and session affinity choose between accounts within each group.
 
 Priority does not change the model or override a deliberate billing choice: `pool:openai` uses OpenAI API keys, and a pinned account never switches to a sibling. Pin a subscription if you want an error rather than API-key fallback. The footer shows which account served the last chat request.
+
+### Subscription models
+
+A pool can only prefer a subscription for models the subscription lists. The broker reads each Claude and ChatGPT subscription's model list from the provider with that account's own sign-in, using oh-my-pi's discovery: ChatGPT's Codex model list and Anthropic's `/v1/models`. It does this when the broker starts and at most every 15 minutes after that, whenever Credne asks for the account's models. Until the first read finishes, an account serves oh-my-pi's bundled list, and a pool request waits for the read before it chooses an account. Without this, a model newer than the bundled list (for example a new GPT release that both a ChatGPT plan and an OpenAI key offer) would always go to the billed key. A failed read keeps the current list and is retried after a minute. API-key accounts keep the list read when the key was added.
+
+Opening `/model` refreshes the account list from a running broker, so newly discovered models appear without starting a new session. Listing models never starts the broker.
+
+## Subscription web search
+
+The built-in `web_search` tool runs the provider's hosted search on a Claude or ChatGPT subscription; API keys and public search engines are never used for it. The broker sends the search with oh-my-pi's own web search providers (vendored from oh-my-pi 19.0.0 in `broker/src/omp-search/`). Each request therefore uses the same endpoint, headers, body, system prompt and Claude request signing as a search in oh-my-pi itself:
+
+- Claude: a separate Messages request with the `web_search_20250305` tool and the `web-search-2025-03-05` beta, on the session model's oh-my-pi search model (Claude Haiku 4.5), then on the session model if that fails.
+- ChatGPT: a Codex Responses request with the hosted `web_search` tool, on GPT-6 Luna, then on the session model.
+
+The tool sends only its query. `allowed_domains` and `blocked_domains` become oh-my-pi `site:` and `-site:` directives: Claude applies them as domain filters and ChatGPT as search operators. A session pinned to a subscription searches with that account only. A pool searches with a subscription in the pool that offers the session's model, and tries the next one after a usage limit. A search request is held on the account's credential like a chat request, so an environment API key can never answer it. Add a subscription with `/accounts add codex` or `/accounts add claude-subscription`. Searches count against the subscription's usage. The bundled explorer and deep-research (`crazy`) profiles include `web_search`; an extension that registers its own `web_search` replaces the built-in.
 
 ## Pinned accounts
 

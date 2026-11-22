@@ -2,20 +2,20 @@
 
 Credne is a Pi-based coding agent with account switching, planning, and subagents. Install [Node.js](https://nodejs.org/) 22.19 or newer first.
 
-## Install Credne 0.1.5 (Windows x64)
+## Install Credne 0.1.6 (Windows x64)
 
-Use the Credne archive, not the upstream Pi packages. The archive includes the compiled account broker and its runtime dependencies; only Node.js is needed at runtime, not Bun or Go. If upgrading from the Go broker, stop it first (see below). After upgrading from a 0.1.4 source build, choose `/accounts` → **Restart broker**.
+Use the Credne archive, not the upstream Pi packages. The archive includes the compiled account broker and its runtime dependencies; only Node.js is needed at runtime, not Bun or Go. If upgrading from the Go broker, stop it first (see below). After upgrading from 0.1.5 or a source build, choose `/accounts` → **Restart broker** so the new broker serves web search and subscription models.
 
 Run these commands in PowerShell or Command Prompt:
 
 ```shell
-curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.5/credne-0.1.5-windows-x64.tgz -o credne-0.1.5-windows-x64.tgz
-npm.cmd install --global --ignore-scripts .\credne-0.1.5-windows-x64.tgz
+curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.6/credne-0.1.6-windows-x64.tgz -o credne-0.1.6-windows-x64.tgz
+npm.cmd install --global --ignore-scripts .\credne-0.1.6-windows-x64.tgz
 credne.cmd --version
 credne.cmd
 ```
 
-`credne.cmd --version` should print `0.1.5`. Run Credne from the directory you want to work on. Install [Git for Windows](https://git-scm.com/download/win) if you need Bash for the Bash tool or `!` commands.
+`credne.cmd --version` should print `0.1.6`. Run Credne from the directory you want to work on. Install [Git for Windows](https://git-scm.com/download/win) if you need Bash for the Bash tool or `!` commands.
 
 ### Upgrade from the Go broker
 
@@ -29,18 +29,18 @@ Use `/model` to select a model without choosing an account. Pooled chat tries el
 
 See the [release notes](credne/RELEASE_NOTES.md) for migration details and the [accounts guide](packages/coding-agent/docs/accounts.md) for routing and sign-in options.
 
-## Build Credne from the 0.1.5 tag
+## Build Credne from the 0.1.6 tag
 
 Install Git, Node.js 22.19 or newer, and [Bun](https://bun.sh/) 1.4.4 or newer. Build on the platform and architecture where you will install Credne, including on macOS or Linux:
 
 ```sh
-git clone --branch 0.1.5 --depth 1 https://github.com/neilhuang007/Credne.git
+git clone --branch 0.1.6 --depth 1 https://github.com/neilhuang007/Credne.git
 cd Credne
 npm ci --ignore-scripts
 npm run build
 node credne/scripts/build.mjs
 npm pack ./credne --ignore-scripts
-npm install --global --ignore-scripts ./neilhuang007-credne-0.1.5.tgz
+npm install --global --ignore-scripts ./neilhuang007-credne-0.1.6.tgz
 credne --version
 ```
 

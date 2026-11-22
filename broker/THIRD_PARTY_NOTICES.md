@@ -6,6 +6,8 @@ Versions are pinned in `package.json` and the root `package-lock.json`. Distribu
 
 `@oh-my-pi/pi-ai`, `pi-catalog`, `pi-utils`, `pi-natives`, and their oh-my-pi dependencies are from https://github.com/can1357/oh-my-pi, used unmodified under MIT.
 
+`src/omp-search/` vendors oh-my-pi's web search providers from `@oh-my-pi/pi-coding-agent` 19.0.0 (`src/web/search/providers/anthropic.ts`, `codex.ts`, `base.ts`, `src/web/search/query.ts`, `types.ts`, `src/prompts/system/web-search*.md`) and `src/tools/web-search-types.ts` from `@oh-my-pi/pi-tui` 19.0.0, under the same MIT license. Only import paths are changed, plus one marked patch in `anthropic.ts` that ignores `ANTHROPIC_SEARCH_API_KEY`. `registry.ts`, `utils.ts` and `text-imports.d.ts` are Credne shims for the coding-agent modules those files import.
+
 ```text
 MIT License
 

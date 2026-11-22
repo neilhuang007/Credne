@@ -1,4 +1,28 @@
-# Credne 0.1.5 — Windows x64
+# Credne 0.1.6 — Windows x64
+
+- **Subscriptions serve their own models.** The broker now reads each Claude and ChatGPT subscription's model list from the provider with that account's own sign-in, through oh-my-pi's discovery, instead of only oh-my-pi's bundled list. Pools therefore send new models such as `gpt-6.2-astra` to the ChatGPT plan instead of a billed OpenAI API key. Opening `/model` refreshes account models from the running broker.
+- **Web search is back.** `web_search` runs hosted search on a Claude or ChatGPT subscription. The broker sends it with oh-my-pi's own web search providers, vendored from oh-my-pi 19.0.0, so the request has oh-my-pi's endpoint, headers, body and Claude signing. It searches on oh-my-pi's search model for the session model (Claude Haiku 4.5 or GPT-6 Luna), then on the session model. API keys are never used for search.
+- **`/model` shows aliases grouped by provider.** Each model family appears once by alias (`fable`, `opus`, `astra`, `sol`, …), not once per account, and picks the newest served version. Providers are collapsible sections; the current provider's section starts open. Typing a search still lists every model, including exact IDs.
+- `/model` no longer warns "Could not refresh llama.cpp" when no llama.cpp server runs at the default address.
+
+## Upgrade from 0.1.5
+
+After installing, choose `/accounts` → **Restart broker** once. The running 0.1.5 broker has neither the search route nor subscription model discovery.
+
+## Install on Windows x64
+
+Install Node.js 22.19 or newer. Install the Credne archive from PowerShell or Command Prompt:
+
+```shell
+curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.6/credne-0.1.6-windows-x64.tgz -o credne-0.1.6-windows-x64.tgz
+npm.cmd install --global --ignore-scripts .\credne-0.1.6-windows-x64.tgz
+credne.cmd --version
+credne.cmd
+```
+
+`credne.cmd --version` should print `0.1.6`. The archive includes the compiled broker, SQLite, and the provider catalog; you do not need Bun or Go to run it. Keep the packaged `bin/pi_natives.*.node` files beside `credne-broker` for locking and credential storage. For other platforms, follow the [tagged source instructions](https://github.com/neilhuang007/Credne/blob/0.1.6/README.md#build-credne-from-the-016-tag), which require Node.js 22.19 or newer and Bun 1.4.4 or newer.
+
+# Credne 0.1.5 (historical)
 
 0.1.5 is the first published release with the oh-my-pi (OMP) account broker. It includes everything prepared for 0.1.4, which was never published.
 
@@ -20,19 +44,6 @@ If you built and installed 0.1.4 from source, choose `/accounts` → **Restart b
 Finish active requests and sign-ins, then close all but one old Credne session. In that session choose `/accounts` → **Restart broker** to stop the shared broker. Close the last old session without sending another request. If Credne still reports a previous broker PID, verify that it belongs to the old `credne-broker` before stopping that process. Do not remove accounts or delete the accounts directory; it contains saved credentials and settings.
 
 Local `claude-sub:` accounts need a fresh sign-in with `/accounts add claude-subscription`. Use `/accounts switch` if you want to pin the new account. The old credential file stays intact. For Claude Console billing, add an Anthropic API key; Console browser sign-in through `ant` is no longer supported.
-
-## Install on Windows x64
-
-Install Node.js 22.19 or newer. Install the Credne archive from PowerShell or Command Prompt:
-
-```shell
-curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.5/credne-0.1.5-windows-x64.tgz -o credne-0.1.5-windows-x64.tgz
-npm.cmd install --global --ignore-scripts .\credne-0.1.5-windows-x64.tgz
-credne.cmd --version
-credne.cmd
-```
-
-`credne.cmd --version` should print `0.1.5`. The archive includes the compiled broker, SQLite, and the provider catalog; you do not need Bun or Go to run it. Keep the packaged `bin/pi_natives.*.node` files beside `credne-broker` for locking and credential storage. For other platforms, follow the [tagged source instructions](https://github.com/neilhuang007/Credne/blob/0.1.5/README.md#build-credne-from-the-015-tag), which require Node.js 22.19 or newer and Bun 1.4.4 or newer.
 
 # Credne 0.1.3 (historical)
 
