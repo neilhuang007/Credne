@@ -15,7 +15,11 @@ import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import { ModelSelectorComponent } from "../src/modes/interactive/components/model-selector.ts";
+import type { CachedAccount } from "../src/extensions/accounts/catalog.ts";
+import {
+	type ModelPickerSelection,
+	ModelSelectorComponent,
+} from "../src/modes/interactive/components/model-selector.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -52,22 +56,21 @@ function model(provider: string, id: string): Model<"openai-completions"> {
 
 let runtime: ModelRuntime;
 
-function registerRoute(provider: string, ids: readonly string[]) {
-	runtime.registerNativeProvider(
-		createProvider({
-			id: provider,
-			models: ids.map((id) => model(provider, id)),
-			api: openAICompletionsApi(),
-			auth: {
-				apiKey: {
-					name: "Faux",
-					check: async () => ({ type: "api_key", source: "test" }),
-					resolve: async () => ({ auth: {}, source: "test" }),
-				},
+function registerRoute(provider: string, ids: readonly string[], poolAccounts?: readonly CachedAccount[]) {
+	const route = createProvider({
+		id: provider,
+		models: ids.map((id) => model(provider, id)),
+		api: openAICompletionsApi(),
+		auth: {
+			apiKey: {
+				name: "Faux",
+				check: async () => ({ type: "api_key", source: "test" }),
+				resolve: async () => ({ auth: {}, source: "test" }),
 			},
-		}),
-		provider === local ? "builtin:llama.cpp" : "builtin:accounts",
-	);
+		},
+	});
+	const withAccounts = { ...route, poolAccounts };
+	runtime.registerNativeProvider(withAccounts, provider === local ? "builtin:llama.cpp" : "builtin:accounts");
 }
 
 beforeEach(async () => {
@@ -135,9 +138,16 @@ function cursorRows(output: string): string[] {
 
 type ModelCommandContext = {
 	session: AgentSession;
+	selectInteractiveModel: (
+		session: AgentSession,
+		selection: ModelPickerSelection,
+		source: "command" | "picker",
+		signal: AbortSignal,
+	) => Promise<void>;
 	footer: { invalidate: () => void };
 	findExactModelMatch: (searchTerm: string) => Promise<Model<Api> | undefined>;
 	showModelSelector: (searchTerm?: string) => void;
+	showExtensionSelector: (title: string, options: string[]) => Promise<string | undefined>;
 	showError: (message: string) => void;
 	showStatus: (message: string) => void;
 	updateEditorBorderColor: () => void;
@@ -154,6 +164,7 @@ type AutocompleteContext = {
 
 const interactive = InteractiveMode.prototype as unknown as {
 	findExactModelMatch: ModelCommandContext["findExactModelMatch"];
+	selectInteractiveModel: ModelCommandContext["selectInteractiveModel"];
 	handleModelCommand(this: ModelCommandContext, searchTerm: string): Promise<void>;
 	createBaseAutocompleteProvider(this: AutocompleteContext): AutocompleteProvider;
 };
@@ -174,17 +185,24 @@ async function modelCompletions(session: AgentSession, prefix: string): Promise<
 }
 
 function modelCommand(session: AgentSession) {
+	const showExtensionSelector = vi.fn<ModelCommandContext["showExtensionSelector"]>();
 	const context: ModelCommandContext = {
 		session,
+		selectInteractiveModel: interactive.selectInteractiveModel,
 		footer: { invalidate: vi.fn() },
 		findExactModelMatch: interactive.findExactModelMatch,
 		showModelSelector: vi.fn(),
+		showExtensionSelector,
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
 		maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
 	};
-	return { context, run: (query: string) => interactive.handleModelCommand.call(context, query) };
+	return {
+		context,
+		showExtensionSelector,
+		run: (query: string) => interactive.handleModelCommand.call(context, query),
+	};
 }
 
 describe("Credne model picker", () => {
@@ -209,7 +227,12 @@ describe("Credne model picker", () => {
 			]);
 			selector.handleInput(down);
 			selector.handleInput(enter);
-			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: local, id: "local-model" }));
+			expect(onSelect).toHaveBeenCalledWith({
+				model: expect.objectContaining({ provider: local, id: "local-model" }),
+				scope: "all",
+				alias: undefined,
+				query: "",
+			});
 		} finally {
 			selector.dispose();
 			session.dispose();
@@ -297,9 +320,12 @@ describe("Credne model picker", () => {
 			expect(render()).not.toMatch(/claude-fable-5-1|gpt-6\.2-sol|gpt-6\.1-sol/);
 			selector.handleInput(down);
 			selector.handleInput(enter);
-			expect(onSelect).toHaveBeenCalledWith(
-				expect.objectContaining({ provider: globalPool, id: "claude-fable-5-3" }),
-			);
+			expect(onSelect).toHaveBeenCalledWith({
+				model: expect.objectContaining({ provider: globalPool, id: "claude-fable-5-3" }),
+				scope: "all",
+				alias: "fable",
+				query: "",
+			});
 		} finally {
 			selector.dispose();
 			session.dispose();
@@ -318,7 +344,12 @@ describe("Credne model picker", () => {
 			]);
 			selector.handleInput(down);
 			selector.handleInput(enter);
-			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: globalPool, id: sol }));
+			expect(onSelect).toHaveBeenCalledWith({
+				model: expect.objectContaining({ provider: globalPool, id: sol }),
+				scope: "all",
+				alias: "sol",
+				query: "",
+			});
 		} finally {
 			selector.dispose();
 			session.dispose();
@@ -337,22 +368,34 @@ describe("Credne model picker", () => {
 	});
 
 	it("shows the pinned account's row for its alias and keeps the other choices reachable", async () => {
-		const { session } = await newSession({ model: runtime.getModel(account, sol) });
+		registerRoute(account, [olderSol]);
+		await runtime.refresh({ allowNetwork: false });
+		const { session } = await newSession({ model: runtime.getModel(account, olderSol) });
 		const { selector, render, onSelect } = makePicker(session);
-		const other = makePicker(session, olderSol);
+		const other = makePicker(session, sol);
 		try {
 			expect(listRows(render())).toEqual([
 				"  ⊟ ChatGPT / OpenAI (1)",
-				`→   ✓ sol gpt-6.2-sol [${account}]`,
+				`→   ✓ sol ${olderSol} [${account}]`,
 				"  ⊞ llama.cpp (1)",
 			]);
 			expect(render()).not.toMatch(/\[acct:openai-metered\]|\[pool:/);
 			selector.handleInput(enter);
-			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: account, id: sol }));
+			expect(onSelect).toHaveBeenCalledWith({
+				model: expect.objectContaining({ provider: account, id: olderSol }),
+				scope: "all",
+				alias: "sol",
+				query: "",
+			});
 			// A row the account does not serve is the way off the pin, and the search lists it.
-			expect(other.render()).toContain(`${olderSol} [${globalPool}]`);
+			expect(other.render()).toContain(`${sol} [${globalPool}]`);
 			other.selector.handleInput(enter);
-			expect(other.onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: globalPool, id: olderSol }));
+			expect(other.onSelect).toHaveBeenCalledWith({
+				model: expect.objectContaining({ provider: globalPool, id: sol }),
+				scope: "all",
+				alias: undefined,
+				query: sol,
+			});
 		} finally {
 			selector.dispose();
 			other.selector.dispose();
@@ -407,7 +450,12 @@ describe("Credne model picker", () => {
 			for (const search of ["SOL", sol]) {
 				const { selector, onSelect } = makePicker(session, search);
 				selector.handleInput("\r");
-				expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: globalPool, id: sol }));
+				expect(onSelect).toHaveBeenCalledWith({
+					model: expect.objectContaining({ provider: globalPool, id: sol }),
+					scope: "all",
+					alias: search === "SOL" ? search : undefined,
+					query: search,
+				});
 			}
 		} finally {
 			session.dispose();
@@ -421,7 +469,12 @@ describe("Credne model picker", () => {
 			expect(render()).toContain(`${sol} [${account}]`);
 			expect(render()).not.toContain(`[${globalPool}]`);
 			selector.handleInput("\r");
-			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: account, id: sol }));
+			expect(onSelect).toHaveBeenCalledWith({
+				model: expect.objectContaining({ provider: account, id: sol }),
+				scope: "scoped",
+				alias: undefined,
+				query: "sol",
+			});
 		} finally {
 			selector.dispose();
 			session.dispose();
@@ -430,22 +483,63 @@ describe("Credne model picker", () => {
 });
 
 describe("Credne model command", () => {
-	it("persists an unqualified alias and exact ID as the canonical pool selection on a pool session", async () => {
-		const { session } = await newSession({ model: runtime.getModel(globalPool, olderSol) });
+	it("lets an unqualified alias select an account's version without broadening an exact ID", async () => {
+		const metered = "acct:openai-metered";
+		registerRoute(account, [olderSol]);
+		registerRoute(
+			globalPool,
+			[sol, olderSol],
+			[
+				{
+					id: "openai-metered",
+					key: "openai-metered",
+					provider: "openai-api",
+					kind: "api-key",
+					disabled: false,
+					models: [model(metered, sol)],
+				},
+				{
+					id: "codex-work",
+					key: "codex-work",
+					provider: "codex",
+					kind: "oauth",
+					disabled: false,
+					models: [model(account, olderSol)],
+				},
+			],
+		);
+		await runtime.refresh({ allowNetwork: false });
+		const { session } = await newSession({ model: runtime.getModel(globalPool, sol) });
 		try {
-			const { context, run } = modelCommand(session);
-			for (const query of ["sOL", sol]) {
-				await run(query);
-				expect(context.showError).not.toHaveBeenCalled();
-				expect(context.showModelSelector).not.toHaveBeenCalled();
-				expect(session.model).toMatchObject({ provider: globalPool, id: sol });
-				expect(session.settingsManager.getDefaultProvider()).toBe(globalPool);
-				expect(session.settingsManager.getDefaultModel()).toBe(sol);
-				expect(session.sessionManager.getEntries().findLast(({ type }) => type === "model_change")).toMatchObject({
-					provider: globalPool,
-					modelId: sol,
-				});
-			}
+			const { context, run, showExtensionSelector } = modelCommand(session);
+			showExtensionSelector.mockResolvedValueOnce(undefined);
+			await run("sOL");
+			expect(showExtensionSelector.mock.calls[0]?.[1]).toEqual([
+				expect.stringMatching(/^Subscription:.*gpt-6\.1-sol$/),
+				expect.stringMatching(/^API key:.*gpt-6\.2-sol$/),
+				expect.stringContaining("automatic failover"),
+			]);
+			expect(session.model).toMatchObject({ provider: globalPool, id: sol });
+			expect(session.settingsManager.getDefaultProvider()).toBeUndefined();
+
+			showExtensionSelector.mockImplementationOnce(async (_title, options) => options[0]);
+			await run("sOL");
+			expect(session.model).toMatchObject({ provider: account, id: olderSol });
+			expect(session.settingsManager.getDefaultProvider()).toBe(account);
+			expect(session.settingsManager.getDefaultModel()).toBe(olderSol);
+			expect(session.sessionManager.getEntries().findLast(({ type }) => type === "model_change")).toMatchObject({
+				provider: account,
+				modelId: olderSol,
+			});
+
+			await run(sol);
+			await run(`${globalPool}/sOL`);
+			expect(showExtensionSelector).toHaveBeenCalledTimes(2);
+			expect(context.showError).not.toHaveBeenCalled();
+			expect(context.showModelSelector).not.toHaveBeenCalled();
+			expect(session.model).toMatchObject({ provider: globalPool, id: sol });
+			expect(session.settingsManager.getDefaultProvider()).toBe(globalPool);
+			expect(session.settingsManager.getDefaultModel()).toBe(sol);
 		} finally {
 			session.dispose();
 		}
@@ -497,11 +591,21 @@ describe("Credne model command", () => {
 		try {
 			const pinnedValues = await modelCompletions(pinned, "sol");
 			expect(pinnedValues[0]).toBe(`${account}/${sol}`);
-			expect(pinnedValues).toContain(`${globalPool}/${olderSol}`);
+			expect(pinnedValues).toContain(olderSol);
+			expect(pinnedValues).not.toContain(sol);
 			expect(pinnedValues).not.toContain(`${globalPool}/${sol}`);
 			const pooledValues = await modelCompletions(pooled, "sol");
-			expect(pooledValues[0]).toBe(`${globalPool}/${sol}`);
+			expect(pooledValues[0]).toBe("sol");
+			expect(await modelCompletions(pooled, "gpt-6.2-s")).toContain(sol);
 			expect(pooledValues.filter((value) => value.startsWith("acct:"))).toEqual([]);
+			expect(await modelCompletions(pooled, `${globalPool}/sol`)).toContain(`${globalPool}/${sol}`);
+
+			registerRoute(local, [sol]);
+			await runtime.refresh({ allowNetwork: false });
+			const ambiguousValues = await modelCompletions(pooled, sol);
+			expect(ambiguousValues).toContain(`${globalPool}/${sol}`);
+			expect(ambiguousValues).toContain(`${local}/${sol}`);
+			expect(ambiguousValues).not.toContain(sol);
 		} finally {
 			pinned.dispose();
 			pooled.dispose();

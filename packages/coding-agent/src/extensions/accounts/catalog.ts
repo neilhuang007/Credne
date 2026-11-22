@@ -15,7 +15,7 @@ import { OMP_NATIVE_API, type OmpIdentity } from "./omp-native.ts";
 export const ACCOUNT_PROVIDER_PREFIX = "acct:";
 /** Prefix of providers that let the broker balance requests across accounts. */
 export const POOL_PROVIDER_PREFIX = "pool:";
-/** Pool over every account of every family; the default for new sessions. */
+/** Pool over every enabled account across all model families. */
 export const ALL_POOL = "all";
 /** Whether `providerId` names the retired in-process Claude subscription provider. */
 export function isLocalClaudeProvider(providerId: string): boolean {

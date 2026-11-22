@@ -148,13 +148,19 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 
 ### Accounts panel
 
-These actions apply inside `/accounts`. Up/Down browse providers, Enter uses the selected provider, Escape closes, and PageUp/PageDown scroll account details through the configurable `tui.select.*` actions.
+These actions apply inside `/accounts`. Up/Down highlight an account or pool without switching to it. Enter uses the highlighted provider in this session and sets it as the default for new sessions. Escape closes, and PageUp/PageDown scroll the details. These keys use the configurable `tui.select.*` actions.
+
+Marking accounts does not change the highlighted provider. Tab moves focus between the list and toolbar. While the toolbar has focus, use Left/Right or Up/Down to choose an action and Enter to run it. You can also click the toolbar actions or the checkboxes next to accounts. Enable, Disable, and Delete apply to marked accounts, or to the highlighted account if none are marked. Pools, cached accounts, and accounts from `config.yaml` cannot be marked or modified through the toolbar.
 
 | Keybinding id | Default | Description |
 |---|---|---|
-| `app.accounts.manage` | `ctrl+o` | Manage the selected account |
-| `app.accounts.model` | `ctrl+l` | Choose a model on the selected account or pool |
-| `app.accounts.refresh` | `ctrl+r` | Refresh selected account usage |
+| `app.accounts.add` | `ctrl+a` | Add an account |
+| `app.accounts.mark` | `space` | Mark or unmark the highlighted account |
+| `app.accounts.toolbar` | `tab` | Move focus between account actions and the list |
+| `app.accounts.remove` | `delete` | Confirm deletion of the marked accounts, or the highlighted account if none are marked |
+| `app.accounts.manage` | `ctrl+o` | Manage the highlighted account |
+| `app.accounts.model` | `ctrl+l` | Choose a model on the highlighted account or pool and set it as the default |
+| `app.accounts.refresh` | `ctrl+r` | Refresh usage for the highlighted account |
 
 ### Models and Thinking
 

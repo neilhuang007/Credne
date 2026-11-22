@@ -15,6 +15,7 @@ import type { JsonAgentSessionEvent } from "../../modes/json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "../../modes/rpc/jsonl.ts";
 import type { RpcCommand, RpcResponse } from "../../modes/rpc/rpc-types.ts";
 import type { SubagentContextSnapshot } from "./context.ts";
+import type { ModelChoice } from "./dispatch.ts";
 import { PrefixWarmup, type ReleaseWarmup } from "./prefix-warmup.ts";
 import { type WorkerChannel, type WorkerRequest, workerEnvelopeSchema } from "./worker-channel.ts";
 import { WORKER_CONVERSATION_ENV, WORKER_FLAG } from "./worker-prompt.ts";
@@ -60,6 +61,8 @@ export interface SingleResult {
 
 export interface SubagentDetails {
 	mode: "single" | "parallel" | "chain";
+	/** Resolved launch choices in argument order, including background jobs that return no results here. */
+	modelChoices?: ModelChoice[];
 	results: SingleResult[];
 	/** Usage summed over `results`. */
 	usage: UsageStats;

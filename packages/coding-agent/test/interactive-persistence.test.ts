@@ -18,6 +18,7 @@ const prototype = InteractiveMode.prototype as unknown as {
 	renderInitialMessages(this: object): void;
 	handleFollowUp(this: object): Promise<void>;
 	handleModelCommand(this: object, searchTerm: string): Promise<void>;
+	selectInteractiveModel(this: object, ...args: unknown[]): Promise<void>;
 	cycleModel(this: object, direction: "forward" | "backward"): Promise<void>;
 	showWarning(this: object, message: string): void;
 };
@@ -206,6 +207,7 @@ describe("interactive model selection", () => {
 		const host = {
 			session,
 			findExactModelMatch: vi.fn(async () => model),
+			selectInteractiveModel: prototype.selectInteractiveModel,
 			footer: { invalidate: vi.fn() },
 			updateEditorBorderColor: vi.fn(),
 			showStatus: vi.fn(),

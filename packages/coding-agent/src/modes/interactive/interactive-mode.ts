@@ -10,11 +10,13 @@ import * as path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
 import {
+	type Api,
 	type AssistantMessage,
 	type ImageContent,
 	isRetryableAssistantError,
 	type Message,
 	type Model,
+	modelsAreEqual,
 	type Usage,
 } from "@earendil-works/pi-ai/compat";
 import type {
@@ -107,7 +109,7 @@ import {
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
-import { getModelSelectionChoices } from "../../core/model-selection.ts";
+import { GLOBAL_BROKER_PROVIDER, getModelSelectionChoices } from "../../core/model-selection.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { compareProviders } from "../../core/preferred-providers.ts";
 import { PromptHistory } from "../../core/prompt-history.ts";
@@ -135,7 +137,9 @@ import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
+import { choosePoolModelAccount } from "../../extensions/accounts/model-choice.ts";
 import { addMcpServerConfig } from "../../extensions/mcp/config.ts";
+import { modelAliasRows } from "../../extensions/subagent/model-aliases.ts";
 import type { SubagentWidget } from "../../extensions/subagent/widget.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
@@ -170,7 +174,7 @@ import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./c
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { createMarkdownTransform } from "./components/markdown-transform.ts";
 import { createMermaidMarkdownTransformer } from "./components/mermaid.ts";
-import { ModelSelectorComponent } from "./components/model-selector.ts";
+import { type ModelPickerSelection, ModelSelectorComponent } from "./components/model-selector.ts";
 import {
 	type AuthSelectorProvider,
 	formatAuthSelectorProviderStatus,
@@ -398,6 +402,11 @@ const RADIUS_LOGIN_INTRO = "Radius is a service crafted for Pi by the builders o
 
 const AUTH_TYPE_ORDER = { oauth: 0, api_key: 1 } satisfies Record<AuthSelectorProvider["authType"], number>;
 
+function hasModelProviderQualifier(text: string, provider: string): boolean {
+	const query = text.trimStart().toLowerCase();
+	return query.startsWith(provider.toLowerCase()) && query.slice(provider.length).trimStart().startsWith("/");
+}
+
 function createFuzzyAutocompleteItems<T>(
 	items: T[],
 	prefix: string,
@@ -505,6 +514,7 @@ export class InteractiveMode {
 	private editorContainer: Container;
 	private activeSelectorToken?: object;
 	private activeSelectorDispose?: () => void;
+	private modelSelectionLifetime?: AbortController;
 	private footer: FooterComponent;
 	private footerContainer: Container;
 	private footerDataProvider: FooterDataProvider;
@@ -792,23 +802,38 @@ export class InteractiveMode {
 		const modelCommand = slashCommands.find((command) => command.name === "model");
 		if (modelCommand) {
 			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
-				const models =
-					this.session.scopedModels.length > 0
-						? this.session.scopedModels.map((s) => s.model)
-						: [
-								...getModelSelectionChoices(
-									this.session.modelRuntime.getAvailableSnapshot(),
-									this.session.model?.provider,
-								),
-							];
+				const session = this.session;
+				const pinned = session.model?.provider;
+				const snapshot =
+					session.scopedModels.length === 0 ? session.modelRuntime.getAvailableSnapshot() : undefined;
+				const models = snapshot
+					? [...getModelSelectionChoices(snapshot, pinned)]
+					: session.scopedModels.map((scoped) => scoped.model);
 				const matches = filterModelSelection(models, prefix, (model) => model, getModelSearchText);
-				return matches.length > 0
-					? matches.map((model) => ({
-							value: `${model.provider}/${model.id}`,
-							label: model.id,
-							description: model.provider,
-						}))
-					: null;
+				if (matches.length === 0) return null;
+				const idCounts = new Map<string, number>();
+				const query = prefix.trim();
+				const normalized = query.toLowerCase();
+				let aliasTarget: Model<Api> | undefined;
+				if (USES_BROKER_AUTH && snapshot && !hasModelProviderQualifier(query, GLOBAL_BROKER_PROVIDER)) {
+					for (const model of models) {
+						const id = model.id.toLowerCase();
+						idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+					}
+					if (modelAliasRows.some((row) => row.alias === normalized)) {
+						const exact = getExactModelSelectionMatches(query, snapshot, "all", pinned);
+						if (exact.length === 1 && exact[0].id.toLowerCase() !== normalized) aliasTarget = exact[0];
+					}
+				}
+				return matches.map((model) => {
+					let value = `${model.provider}/${model.id}`;
+					if (model.provider === GLOBAL_BROKER_PROVIDER) {
+						// Keep a bare alias or ID only if it resolves to the route shown by the completion.
+						if (modelsAreEqual(aliasTarget, model)) value = query;
+						else if (!model.id.includes("/") && idCounts.get(model.id.toLowerCase()) === 1) value = model.id;
+					}
+					return { value, label: model.id, description: model.provider };
+				});
 			};
 		}
 
@@ -2652,6 +2677,8 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		this.modelSelectionLifetime?.abort();
+		this.modelSelectionLifetime = undefined;
 		if (this.extensionDialogs.length > 0) {
 			for (const dialog of this.extensionDialogs) {
 				dialog.component.dispose?.();
@@ -5540,25 +5567,59 @@ export class InteractiveMode {
 		}
 
 		const session = this.session;
+		this.modelSelectionLifetime ??= new AbortController();
+		const signal = this.modelSelectionLifetime.signal;
 		const model = await this.findExactModelMatch(searchTerm);
-		if (this.session !== session) return;
-		if (model) {
-			try {
-				await session.setModel(model, { persist: true });
-				this.footer.invalidate();
-				this.updateEditorBorderColor();
-				this.showStatus(`Model: ${model.id}`);
-				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-			} catch (error) {
-				this.showError(error instanceof Error ? error.message : String(error));
-			}
+		if (signal.aborted || this.session !== session) return;
+		if (!model) {
+			this.showModelSelector(searchTerm);
 			return;
 		}
 
-		this.showModelSelector(searchTerm);
+		const scope = session.scopedModels.length > 0 ? "scoped" : "all";
+		const query = searchTerm.trim();
+		const alias =
+			query.toLowerCase() === model.id.toLowerCase() || hasModelProviderQualifier(query, model.provider)
+				? undefined
+				: query;
+		await this.selectInteractiveModel(session, { model, scope, alias, query }, "command", signal);
 	}
 
-	private async findExactModelMatch(searchTerm: string): Promise<Model<any> | undefined> {
+	private async selectInteractiveModel(
+		session: AgentSession,
+		{ model, scope, alias, query }: ModelPickerSelection,
+		source: "command" | "picker",
+		signal: AbortSignal,
+	): Promise<void> {
+		if (signal.aborted || this.session !== session) return;
+		try {
+			const selected =
+				USES_BROKER_AUTH && scope === "all" && !hasModelProviderQualifier(query, model.provider)
+					? await choosePoolModelAccount(
+							model,
+							session.modelRuntime.getProvider(model.provider),
+							(title, options) => this.showExtensionSelector(title, options, { signal }),
+							alias,
+						)
+					: model;
+			if (!selected || signal.aborted || this.session !== session) return;
+			await session.setModel(selected, { persist: true });
+			if (signal.aborted || this.session !== session) return;
+			if (source === "picker") this.updateAvailableProviderCount();
+			this.footer.invalidate();
+			this.updateEditorBorderColor();
+			this.showStatus(
+				source === "picker" ? `Default model: ${selected.provider}/${selected.id}` : `Model: ${selected.id}`,
+			);
+			void this.maybeWarnAboutAnthropicSubscriptionAuth(selected);
+		} catch (error) {
+			if (!signal.aborted && this.session === session) {
+				this.showError(error instanceof Error ? error.message : String(error));
+			}
+		}
+	}
+
+	private async findExactModelMatch(searchTerm: string): Promise<Model<Api> | undefined> {
 		const session = this.session;
 		const findMatches = () =>
 			session.scopedModels.length > 0
@@ -5696,35 +5757,29 @@ export class InteractiveMode {
 	}
 
 	private showModelSelector(initialSearchInput?: string): void {
+		const session = this.session;
+		this.modelSelectionLifetime ??= new AbortController();
+		const signal = this.modelSelectionLifetime.signal;
 		this.showSelector((done) => {
-			const selectModel = async (model: Model<any>, persist: boolean) => {
-				try {
-					await this.session.setModel(model, { persist });
-					this.updateAvailableProviderCount();
-					this.footer.invalidate();
-					this.updateEditorBorderColor();
-					done();
-					this.showStatus(persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);
-					void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-				} catch (error) {
-					done();
-					this.showError(error instanceof Error ? error.message : String(error));
-				}
+			const close = () => {
+				done();
+				this.ui.requestRender();
+			};
+			const selectModel = (selection: ModelPickerSelection) => {
+				close();
+				void this.selectInteractiveModel(session, selection, "picker", signal);
 			};
 			const defaultProvider = this.settingsManager.getDefaultProvider();
 			const defaultModel = this.settingsManager.getDefaultModel();
 			const selector = new ModelSelectorComponent(
 				this.ui,
-				this.session.model,
-				this.session.modelRuntime,
-				this.session.scopedModels,
-				(model) => selectModel(model, true),
-				() => {
-					done();
-					this.ui.requestRender();
-				},
+				session.model,
+				session.modelRuntime,
+				session.scopedModels,
+				selectModel,
+				close,
 				initialSearchInput,
-				(model) => selectModel(model, true),
+				selectModel,
 				defaultProvider && defaultModel ? { provider: defaultProvider, id: defaultModel } : undefined,
 			);
 			return { component: selector, focus: selector, dispose: () => selector.dispose() };
@@ -7487,6 +7542,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.modelSelectionLifetime?.abort();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

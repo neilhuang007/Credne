@@ -1,5 +1,6 @@
 // Groups /model choices into sections: one row per model alias under its vendor, and one section per local provider.
 import { type Api, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
+import { getPinnedAccountModels } from "../../core/model-selection.ts";
 import { isBrokerProvider } from "../../extensions/accounts/catalog.ts";
 import { findAliasRowOfModel, modelAliasRows, resolveAliasRow } from "../../extensions/subagent/model-aliases.ts";
 
@@ -27,8 +28,8 @@ const vendorTitles: Record<string, string> = {
 
 /**
  * Sections in a stable order: vendors in alias file order, then providers in the order of `choices`. An alias row
- * resolves to its family's latest model among `choices`, so accounts and pools that serve it add no rows. Broker
- * models no alias covers stay out, except `currentModel`, which is listed by ID so the selection is visible.
+ * resolves to its family's latest model on the pinned account when served there, or among `choices` otherwise.
+ * Broker models no alias covers stay out, except `currentModel`, which is listed by ID so the selection is visible.
  * `choices` is the order of preference when equal IDs are served by several providers.
  */
 export function buildModelSections(
@@ -40,8 +41,9 @@ export function buildModelSections(
 	const providerSection = (provider: string) =>
 		getSection(sections, `provider:${provider}`, getProviderName(provider) ?? provider);
 	const listed = new Set<Model<Api>>();
+	const pinnedModels = getPinnedAccountModels(choices, currentModel?.provider);
 	for (const row of modelAliasRows) {
-		const model = resolveAliasRow(row, choices);
+		const model = resolveAliasRow(row, pinnedModels) ?? resolveAliasRow(row, choices);
 		if (!model) continue;
 		listed.add(model);
 		getSection(sections, `vendor:${row.provider}`, vendorTitle(row.provider)).rows.push({ model, alias: row.alias });

@@ -110,7 +110,12 @@ describe("model selector", () => {
 		selector.handleInput("\x1bv"); // Alt+V
 		selector.handleInput("\r");
 
-		expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "model-01" }));
+		expect(onSelect).toHaveBeenCalledWith({
+			model: expect.objectContaining({ id: "model-01" }),
+			scope: "all",
+			alias: undefined,
+			query: "",
+		});
 		selector.dispose();
 	});
 
@@ -134,7 +139,7 @@ describe("model selector", () => {
 		selector.handleInput("\x13");
 		expect(saveDefault).not.toHaveBeenCalled();
 		selector.handleInput("\x12");
-		expect(saveDefault).toHaveBeenCalledWith(currentModel);
+		expect(saveDefault).toHaveBeenCalledWith({ model: currentModel, scope: "all", alias: undefined, query: "" });
 	});
 
 	it("lists every catalog that failed to refresh", async () => {

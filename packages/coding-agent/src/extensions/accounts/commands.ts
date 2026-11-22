@@ -1,18 +1,17 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../core/extensions/types.ts";
 import {
-	ALL_POOL,
 	accountDisplayName,
 	accountProviderId,
 	familyOf,
 	isBrokerProvider,
 	isLocalClaudeProvider,
-	poolProviderId,
 	sharedRouteFamily,
 } from "./catalog.ts";
 import type { BrokerAccount, BrokerClient, BrokerUsage } from "./client.ts";
 import { sessionAccountCosts } from "./costs.ts";
 import { enrollAccount } from "./enrollment.ts";
+import { choosePoolModelAccount } from "./model-choice.ts";
 import { type AccountPanelResult, AccountsPanel } from "./panel.ts";
 import type { AccountProviderSpec } from "./provider.ts";
 import type { AccountRegistry } from "./registry.ts";
@@ -42,6 +41,7 @@ const LEGACY_CLAUDE_MESSAGE =
 /** `/accounts`: browse accounts, pools, quotas and session estimates in one panel. */
 export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
 	let selectedId: string | undefined;
+	let markedIds: string[] = [];
 	for (;;) {
 		const accounts = managedAccounts(await deps.registry.sync(ctx));
 		if (!ctx.hasUI) {
@@ -53,7 +53,9 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 			(tui, theme, keybindings, done) =>
 				new AccountsPanel(tui, theme, keybindings, done, {
 					currentId: ctx.model?.provider,
+					defaultId: deps.pi.getSettings().defaultProvider,
 					selectedId,
+					markedIds,
 					entries: deps.registry.providers().map((spec) => {
 						const account = accounts.find((entry) => entry.providerId === spec.id);
 						return {
@@ -65,6 +67,8 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 									? `${spec.models.length} models · balanced pool`
 									: `${spec.models.length} models · cached account`,
 							account: account !== undefined,
+							pool: spec.target.type === "pool",
+							readOnly: account?.readOnly,
 							disabled: spec.disabled,
 							costs: sessionAccountCosts(entries, spec.id),
 						};
@@ -74,7 +78,14 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 		);
 		selectedId = result.selectedId;
 		if (result.action === "cancel") return;
-		if (result.action === "add") await addAccount(deps, ctx, "");
+		if (result.action === "bulk") {
+			const ids = new Set(result.selectedIds);
+			const selected = accounts.filter((account) => ids.has(account.providerId) && !account.readOnly);
+			markedIds = await applyAccountActions(deps, ctx, selected, result.operation);
+			continue;
+		}
+		markedIds = [];
+		if (result.action === "add") selectedId = (await addAccount(deps, ctx, "")) ?? selectedId;
 		else if (result.action === "restart") {
 			await deps.client.shutdown();
 			ctx.ui.notify("Account broker stopped; it restarts on the next request.", "info");
@@ -90,11 +101,12 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 				return;
 			}
 			if (result.action === "model") {
-				const model = await chooseModel(ctx, spec, providerModels(ctx, spec));
-				if (model) await useModel(deps, ctx, spec, model);
+				await chooseAccountModel(deps, ctx, spec);
 			} else {
 				const account = accounts.find((entry) => entry.providerId === spec.id);
-				if (account) await manageAccount(deps, ctx, account);
+				if (!account) continue;
+				if (result.action === "remove") await applyAccountActions(deps, ctx, [account], "remove");
+				else await manageAccount(deps, ctx, account);
 			}
 		}
 	}
@@ -135,7 +147,10 @@ export async function runAccountCommand(
 		case "reset": {
 			const accounts = managedAccounts(await deps.registry.sync(ctx));
 			const account = await chooseAccount(ctx, accounts, `${subcommand} account`, query);
-			if (account) await applyAccountAction(deps, ctx, account, subcommand);
+			if (account) {
+				await applyAccountActions(deps, ctx, [account], subcommand);
+				await deps.registry.sync(ctx);
+			}
 			return;
 		}
 	}
@@ -161,8 +176,24 @@ export async function showModels(deps: AccountCommandDeps, query: string, ctx: E
 		ctx.ui.notify([`${spec.name}:`, ...models.map((model) => `  ${model.id}`)].join("\n"), "info");
 		return;
 	}
+	await chooseAccountModel(deps, ctx, spec, models);
+}
+
+async function chooseAccountModel(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	spec: AccountProviderSpec,
+	models = providerModels(ctx, spec),
+): Promise<void> {
 	const model = await chooseModel(ctx, spec, models);
-	if (model) await useModel(deps, ctx, spec, model);
+	if (!model) return;
+	const selected =
+		spec.target.type === "pool"
+			? await choosePoolModelAccount(model, ctx.modelRegistry.getProvider(spec.id), (title, options) =>
+					ctx.ui.select(title, options),
+				)
+			: model;
+	if (selected) await useModel(deps, ctx, deps.registry.provider(selected.provider) ?? spec, selected);
 }
 
 function showStatus(deps: AccountCommandDeps, ctx: ExtensionContext): void {
@@ -190,42 +221,83 @@ async function manageAccount(
 	account: ManagedAccount,
 ): Promise<void> {
 	const actions = {
-		use: "Use in this session",
+		use: "Use and make default",
 		model: "Choose model",
 		toggle: account.disabled ? "Enable" : "Disable",
 		reset: "Clear cooldown",
 		remove: "Remove",
 	};
-	const choice = await ctx.ui.select(account.name, [...Object.values(actions), "Back"]);
+	const options = [
+		...(!account.disabled ? [actions.use, actions.model] : []),
+		...(!account.readOnly ? [actions.toggle, actions.remove] : []),
+		actions.reset,
+		"Back",
+	];
+	const choice = await ctx.ui.select(account.name, options);
 	const spec = deps.registry.provider(account.providerId);
 	if (choice === actions.use && spec) await switchTo(deps, ctx, spec, true);
-	else if (choice === actions.model && spec) {
-		const model = await chooseModel(ctx, spec, providerModels(ctx, spec));
-		if (model) await useModel(deps, ctx, spec, model);
-	} else if (choice === actions.toggle)
-		await applyAccountAction(deps, ctx, account, account.disabled ? "enable" : "disable");
-	else if (choice === actions.reset) await applyAccountAction(deps, ctx, account, "reset");
-	else if (choice === actions.remove) await applyAccountAction(deps, ctx, account, "remove");
+	else if (choice === actions.model && spec) await chooseAccountModel(deps, ctx, spec);
+	else if (choice === actions.toggle)
+		await applyAccountActions(deps, ctx, [account], account.disabled ? "enable" : "disable");
+	else if (choice === actions.reset) await applyAccountActions(deps, ctx, [account], "reset");
+	else if (choice === actions.remove) await applyAccountActions(deps, ctx, [account], "remove");
 }
 
 type AccountAction = "remove" | "enable" | "disable" | "reset";
 
-async function applyAccountAction(
+async function applyAccountActions(
 	deps: AccountCommandDeps,
 	ctx: ExtensionCommandContext,
-	account: ManagedAccount,
+	accounts: ManagedAccount[],
 	action: AccountAction,
-): Promise<void> {
-	const name = account.name;
-	if (action === "remove" && ctx.hasUI) {
-		if (!(await ctx.ui.confirm("Remove account?", `${name}\nIts stored credential is deleted.`))) return;
+): Promise<string[]> {
+	const targets = accounts.filter((account) => {
+		if (account.readOnly && action !== "reset") {
+			ctx.ui.notify(`${account.name} is managed in config.yaml. Edit the file and restart the broker.`, "warning");
+			return false;
+		}
+		return !(action === "enable" && !account.disabled) && !(action === "disable" && account.disabled);
+	});
+	if (!targets.length) {
+		if ((action === "enable" || action === "disable") && accounts.some((account) => !account.readOnly)) {
+			ctx.ui.notify(`The selected accounts are already ${action === "enable" ? "enabled" : "disabled"}.`, "info");
+		}
+		return [];
 	}
-	if (action === "remove") await deps.client.removeAccount(account.key);
-	else if (action === "reset") await deps.client.resetCooldown(account.key);
-	else await deps.client.setDisabled(account.key, action === "disable");
-	await deps.registry.sync(ctx);
-	const done = { remove: "Removed", enable: "Enabled", disable: "Disabled", reset: "Cleared cooldown for" }[action];
-	ctx.ui.notify(`${done} ${name}`, "info");
+	if (action === "remove" && ctx.hasUI) {
+		const title = targets.length === 1 ? "Delete account?" : `Delete ${targets.length} accounts?`;
+		const names = targets.map((account) => `${account.name} [${account.providerId}]`).join("\n");
+		if (!(await ctx.ui.confirm(title, `${names}\nStored credentials will be deleted. This cannot be undone.`))) {
+			return targets.map((account) => account.providerId);
+		}
+	}
+	const done = { remove: "Deleted", enable: "Enabled", disable: "Disabled", reset: "Cleared cooldown for" }[action];
+	const completed: ManagedAccount[] = [];
+	const failed: string[] = [];
+	for (const account of targets) {
+		try {
+			if (action === "remove") await deps.client.removeAccount(account.key);
+			else if (action === "reset") await deps.client.resetCooldown(account.key);
+			else await deps.client.setDisabled(account.key, action === "disable");
+			completed.push(account);
+		} catch (error) {
+			failed.push(account.providerId);
+			ctx.ui.notify(`${account.name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
+	}
+	if (completed.length) {
+		const unavailable = action === "remove" || action === "disable";
+		const defaultId = unavailable ? deps.pi.getSettings().defaultProvider : undefined;
+		const changedRoute =
+			unavailable &&
+			completed.some((account) => account.providerId === ctx.model?.provider || account.providerId === defaultId);
+		const message = `${done} ${completed.length === 1 ? completed[0].name : `${completed.length} accounts`}.`;
+		ctx.ui.notify(
+			changedRoute ? `${message} Select another account in /accounts to set a new default.` : message,
+			"info",
+		);
+	}
+	return failed;
 }
 
 /** Switch this session to an account or pool; with `persist` it also becomes the default for new sessions. */
@@ -280,22 +352,31 @@ async function useModel(
 	ctx.ui.notify(`${scope} ${model.id} on ${spec.name}.${history}`, "info");
 }
 
-/**
- * After the first account is added, adopt the combined pool only when no model is selected or configured.
- */
-async function adoptPoolAsDefault(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
-	if (ctx.model || deps.pi.getSettings().defaultProvider) return;
-	const pool = deps.registry.provider(poolProviderId(ALL_POOL));
-	if (pool) await switchTo(deps, ctx, pool, true);
-}
-
-async function addAccount(deps: AccountCommandDeps, ctx: ExtensionCommandContext, requested: string): Promise<void> {
-	const hadAccounts = deps.registry.providers().length > 0;
+async function addAccount(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	requested: string,
+): Promise<string | undefined> {
+	const hadChatAccount = deps.registry
+		.providers()
+		.some((spec) => !spec.disabled && spec.target.type === "account" && spec.models.length > 0);
 	const added = await enrollAccount(deps.client, ctx, requested);
 	if (!added) return;
 	await deps.registry.sync(ctx);
-	ctx.ui.notify(`Added ${accountDisplayName(added)}. It funds the matching pools; /accounts switch pins it.`, "info");
-	if (!hadAccounts) await adoptPoolAsDefault(deps, ctx);
+	const id = accountProviderId(added.id);
+	ctx.ui.notify(`Added ${accountDisplayName(added)}. Select it in /accounts to use it as your default.`, "info");
+	const spec = deps.registry.provider(id);
+	if (
+		!hadChatAccount &&
+		!ctx.model &&
+		!deps.pi.getSettings().defaultProvider &&
+		spec &&
+		!spec.disabled &&
+		spec.models.length
+	) {
+		await switchTo(deps, ctx, spec, true);
+	}
+	return id;
 }
 
 function providerModels(ctx: ExtensionContext, spec: AccountProviderSpec): Model<Api>[] {
@@ -397,6 +478,7 @@ interface ManagedAccount {
 	name: string;
 	state: string;
 	disabled: boolean;
+	readOnly: boolean;
 	modelCount: number;
 	/** Texts a query may match: ids, email, label. */
 	aliases: readonly (string | undefined)[];
@@ -411,6 +493,7 @@ function managedAccounts(accounts: readonly BrokerAccount[]): ManagedAccount[] {
 			name: accountDisplayName(account),
 			state: accountState(account),
 			disabled: account.disabled,
+			readOnly: account.source === "config",
 			modelCount: account.modelCount,
 			aliases: [account.id, providerId, account.email, account.label],
 		};

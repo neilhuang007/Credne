@@ -12,6 +12,11 @@
 - When the user asks a question, answer it first before making edits or running implementation commands.
 - When responding to user feedback or an analysis, explicitly say whether you agree or disagree before saying what you changed.
 
+## Prompt Changes
+
+- Use Claude Code as the source for all product prompts, including main-agent, subagent, and tool instructions. Identify the source text before changing a prompt. If the source is unavailable, ask the user rather than inventing substitute wording.
+- Leave existing prompts unchanged unless the user explicitly requests a prompt change. A subagent may edit a prompt only when that specific edit is part of its assignment; otherwise report the proposed change to the main agent without applying it.
+
 ## Code Quality
 
 - Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.

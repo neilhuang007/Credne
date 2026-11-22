@@ -17,15 +17,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import { CONFIG_DIR_NAME, getAgentDir } from "../../config.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import { formatReadLineRange } from "../../core/tools/render-utils.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "../../core/tools/truncate.ts";
-import { getMarkdownTheme, type ThemeColor } from "../../modes/interactive/theme/theme.ts";
+import { getMarkdownTheme, type Theme, type ThemeColor } from "../../modes/interactive/theme/theme.ts";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { captureSubagentContext, turnSchema } from "./context.ts";
-import { createSubagentDispatch, dropBlankSelections, reasoningEffortSchema } from "./dispatch.ts";
+import { createSubagentDispatch, dropBlankSelections, type ModelChoice, reasoningEffortSchema } from "./dispatch.ts";
 import { registerModelSearch } from "./model-search.ts";
 import { type ModelTier, modelTierSchema } from "./model-tiers.ts";
 import {
@@ -294,6 +294,65 @@ const SubagentParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
+interface CallRenderState {
+	call?: Text;
+	modelChoices?: ModelChoice[];
+}
+
+function modelBadge(choice: ModelChoice | undefined, theme: Theme): string {
+	if (!choice) return "";
+	const parts = [choice.method === "explicit" ? "explicit model" : "auto model"];
+	if (choice.decision) {
+		const outcome =
+			choice.decision.outcome === "rated tier" && choice.method !== "auto"
+				? "tier unavailable"
+				: choice.decision.outcome;
+		parts.push(`decision: ${choice.decision.modelId}${outcome === "rated tier" ? "" : ` (${outcome})`}`);
+	}
+	if (choice.tier)
+		parts.push(
+			`${choice.method === "explicit tier" ? "explicit tier" : choice.method === "auto" ? "tier" : "default tier"}: ${choice.tier}`,
+		);
+	else if (choice.method === "profile" || choice.method === "inherited") parts.push(choice.method);
+	parts.push(choice.modelId, `${choice.explicitEffort ? "explicit effort" : "effort"}: ${choice.effort}`);
+	return theme.fg("muted", ` [${parts.join(" · ")}]`);
+}
+
+function formatCall(
+	args: Static<typeof SubagentParams>,
+	state: CallRenderState,
+	expanded: boolean,
+	theme: Theme,
+): string {
+	const title = theme.fg("toolTitle", theme.bold("subagent "));
+	const scope = theme.fg("muted", ` [${args.agentScope ?? "user"}]`);
+	const chain = args.chain?.length ? args.chain : undefined;
+	const items = chain ?? args.tasks;
+	if (items?.length) {
+		const mode = chain ? `chain (${items.length} steps)` : `parallel (${items.length} tasks)`;
+		let text = title + theme.fg("accent", mode) + scope;
+		const count = expanded ? items.length : Math.min(items.length, 3);
+		for (let i = 0; i < count; i++) {
+			const item = items[i];
+			// Arguments may still be streaming before execution starts.
+			const task = chain ? item.task?.replace(/\{previous\}/g, "").trim() : item.task;
+			const prefix = chain ? `${theme.fg("muted", `${i + 1}.`)} ` : "";
+			const preview = task && task.length > 40 ? `${task.slice(0, 40)}...` : (task ?? "...");
+			text += `\n  ${prefix}${theme.fg("accent", item.agent || "...")}${modelBadge(state.modelChoices?.[i], theme)}${theme.fg("dim", ` ${preview}`)}`;
+		}
+		if (count < items.length) text += `\n  ${theme.fg("muted", `... +${items.length - count} more`)}`;
+		return text;
+	}
+	const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+	return (
+		title +
+		theme.fg("accent", args.agent || "...") +
+		modelBadge(state.modelChoices?.[0], theme) +
+		scope +
+		`\n  ${theme.fg("dim", preview)}`
+	);
+}
+
 // Calls that start workers; the first one on a branch reveals DELEGATION_TOOLS.
 const DELEGATING_TOOLS = new Set(["subagent", "assign_tasks", "assign_task"]);
 // The subagent tool's loadout change until the branch delegates: requests leave out the follow-up tools.
@@ -379,7 +438,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.registerTool({
+	pi.registerTool<typeof SubagentParams, SubagentDetails, CallRenderState>({
 		name: "subagent",
 		label: "Subagent",
 		description: [
@@ -461,10 +520,12 @@ export default function (pi: ExtensionAPI) {
 			const hasSingle = Boolean(params.agent && params.task);
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
+			let modelChoices: ModelChoice[] | undefined;
 			const makeDetails =
 				(mode: "single" | "parallel" | "chain", forceError = false) =>
 				(results: SingleResult[]): SubagentDetails => ({
 					mode,
+					...(modelChoices && { modelChoices }),
 					results,
 					usage: aggregateUsage(results),
 					isError: forceError || results.some(isFailedResult),
@@ -499,8 +560,8 @@ export default function (pi: ExtensionAPI) {
 				},
 				resolved: ResolvedAgent<AgentConfig>,
 				rating: TierOverride | undefined,
-			): DispatchDefaults => ({
-				...dispatch.resolve(
+			) => ({
+				...dispatch.resolveWithChoice(
 					{
 						model: selection.model ?? params.model,
 						tier: selection.tier ?? params.tier,
@@ -615,6 +676,7 @@ export default function (pi: ExtensionAPI) {
 						content: [{ type: "text", text: "Unknown agent. No background jobs were started." }],
 						details: makeDetails(hasTasks ? "parallel" : "single", true)([]),
 					};
+				modelChoices = defaults.map((item) => item.modelChoice);
 				const jobIds = tasks.map(
 					(task, index) =>
 						team.spawn({
@@ -643,6 +705,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.chain && params.chain.length > 0) {
+				modelChoices = chainDefaults.map((item) => item.modelChoice);
 				const results: SingleResult[] = [];
 				let previousOutput = "";
 
@@ -715,6 +778,7 @@ export default function (pi: ExtensionAPI) {
 						details: makeDetails("parallel", true)([]),
 					};
 
+				modelChoices = taskDefaults.map((item) => item.modelChoice);
 				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
 
@@ -793,9 +857,10 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.agent && params.task && resolvedSingle) {
+			if (params.agent && params.task && resolvedSingle && singleDefaults) {
+				modelChoices = [singleDefaults.modelChoice];
 				const result = await runForeground(
-					singleDefaults!,
+					singleDefaults,
 					resolvedSingle,
 					params.agent,
 					params.task,
@@ -835,52 +900,19 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
-		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "user";
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent) +
-						theme.fg("dim", ` ${preview}`);
-				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			if (args.tasks && args.tasks.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (const t of args.tasks.slice(0, 3)) {
-					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
-					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
-				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
-				return new Text(text, 0, 0);
-			}
-			const agentName = args.agent || "...";
-			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
-			let text =
-				theme.fg("toolTitle", theme.bold("subagent ")) +
-				theme.fg("accent", agentName) +
-				theme.fg("muted", ` [${scope}]`);
-			text += `\n  ${theme.fg("dim", preview)}`;
-			return new Text(text, 0, 0);
+		renderCall(args, theme, { state, expanded }) {
+			state.call ??= new Text("", 0, 0);
+			state.call.setText(formatCall(args, state, expanded, theme));
+			return state.call;
 		},
 
-		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as SubagentDetails | undefined;
+		renderResult(result, { expanded }, theme, { state, args }) {
+			const details = result.details;
+			// The call renderer runs first, including on session replay. Update that same header before it is drawn.
+			if (details?.modelChoices && details.modelChoices !== state.modelChoices) {
+				state.modelChoices = details.modelChoices;
+				state.call?.setText(formatCall(args, state, expanded, theme));
+			}
 			if (!details || details.results.length === 0) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);

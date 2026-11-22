@@ -14,9 +14,12 @@ import {
 import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
 import {
 	type AccountCatalog,
+	ALL_POOL,
 	accountDisplayName,
 	accountProviderId,
 	BROKER_PLACEHOLDER_URL,
+	type CachedAccount,
+	familyOf,
 	poolDisplayName,
 	poolProviderId,
 } from "./catalog.ts";
@@ -34,6 +37,7 @@ export interface AccountProviderSpec {
 	/** Disabled accounts stay registered so sessions that used them fail with a clear reason. */
 	disabled: boolean;
 	models: Model<Api>[];
+	poolAccounts?: readonly CachedAccount[];
 	/** oh-my-pi's provider and API for the models of this entry, by model ID. Absent for an ID with none. */
 	upstream?: Record<string, OmpIdentity>;
 	/** Classifier models served through this entry's broker route, for example the gpt-6-luna model of an OpenAI API key. */
@@ -53,6 +57,9 @@ export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
 				target: { type: "pool", name: pool.name },
 				disabled: false,
 				models: pool.models,
+				poolAccounts: catalog.accounts.filter(
+					(account) => !account.disabled && (pool.name === ALL_POOL || familyOf(account.provider) === pool.name),
+				),
 				upstream: pool.upstream,
 				classifiers: pool.classifiers,
 			}),
@@ -87,7 +94,7 @@ export function createAccountProvider(
 	onServedBy?: ServedByListener,
 	identify: OmpIdentityLookup = () => undefined,
 	refresh?: (signal: AbortSignal) => Promise<void>,
-): Provider {
+): Provider & Pick<AccountProviderSpec, "poolAccounts"> {
 	const report = (response: ProviderResponse) => {
 		const key = response.headers[ACCOUNT_HEADER];
 		if (key) onServedBy?.(spec.id, key);
@@ -117,9 +124,10 @@ export function createAccountProvider(
 		// A classification may be served by another pool account than the chat, so it must not move the footer.
 		classifiers: { "typesafe-system-one": viaLoopback(typesafeSystemOneApi()) },
 	});
-	if (!refresh) return provider;
+	const accountProvider = { ...provider, poolAccounts: spec.poolAccounts };
+	if (!refresh) return accountProvider;
 	return {
-		...provider,
+		...accountProvider,
 		// "configured" skips credential resolution, which would start the broker; the catalog check decides.
 		refreshModelsAuth: "configured",
 		refreshModels: async ({ allowNetwork, signal }) => {

@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import {
 	type Api,
 	type AssistantMessage,
@@ -999,18 +1000,23 @@ describe("Jev account warning", () => {
 });
 
 describe("accounts panel command", () => {
-	async function runPanel(keys: string[][], manageChoice?: string) {
+	async function runPanel(
+		keys: string[][],
+		options: { manageChoice?: string; confirm?: boolean; respond?: FakeBrokerOptions["respond"] } = {},
+	) {
 		initTheme("dark");
 		const agentDir = tempDir();
 		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
 		const broker = await startFakeBroker({
 			home: join(agentDir, "accounts"),
-			respond: (request) => (request.path.endsWith("/disable") ? { status: 200, body: {} } : undefined),
+			respond: (request) =>
+				options.respond?.(request) ?? (request.path.endsWith("/disable") ? { status: 200, body: {} } : undefined),
 		});
 		writeCatalog(join(agentDir, "accounts", "catalog.json"), testCatalog());
 		const runtime = createExtensionRuntime();
 		const setModel = vi.fn(async () => true);
 		runtime.setModel = setModel;
+		runtime.getSettings = () => ({ defaultProvider: ACCT_C });
 		const extension = await loadExtensionFromFactory(
 			accountsExtension,
 			process.cwd(),
@@ -1019,7 +1025,8 @@ describe("accounts panel command", () => {
 			"builtin:accounts",
 		);
 		const panels: string[][] = [];
-		const select = vi.fn(async () => manageChoice);
+		const confirm = vi.fn(async () => options.confirm ?? false);
+		const select = vi.fn(async () => options.manageChoice);
 		const ctx = {
 			hasUI: true,
 			model: spec(ACCT_A).models[0],
@@ -1030,6 +1037,7 @@ describe("accounts panel command", () => {
 			},
 			sessionManager: { getEntries: () => [], getBranch: () => [] },
 			ui: {
+				confirm,
 				select,
 				notify: vi.fn(),
 				custom: async (factory: Parameters<ExtensionCommandContext["ui"]["custom"]>[0]) => {
@@ -1042,15 +1050,15 @@ describe("accounts panel command", () => {
 							result = value;
 						},
 					);
-					panels.push(component.render(120));
-					for (const key of keys[panels.length - 1] ?? []) component.handleInput?.(key);
+					panels.push(component.render(120).map(stripVTControlCharacters));
+					for (const key of keys[panels.length - 1] ?? ["\x1b"]) component.handleInput?.(key);
 					component.dispose?.();
 					return result;
 				},
 			},
 		};
 		await extension.commands.get("accounts")!.handler("", ctx as never);
-		return { setModel, select, panels, broker, notifications: ctx.ui.notify.mock.calls };
+		return { setModel, select, confirm, panels, broker, notifications: ctx.ui.notify.mock.calls };
 	}
 
 	it("default opens a custom panel and Enter remembers the account and model for new sessions", async () => {
@@ -1069,14 +1077,63 @@ describe("accounts panel command", () => {
 	});
 
 	it("returns from management to the same selected account", async () => {
-		const result = await runPanel([["\x1b[B", "\x0f"], ["\x1b"]], "Disable");
+		const result = await runPanel([["\x1b[B", "\x0f"], ["\x1b"]], { manageChoice: "Disable" });
 		expect(result.panels).toHaveLength(2);
-		expect(result.panels[1].some((line) => line.startsWith("\x1b[7m› Claude · b@example.com (subscription)"))).toBe(
-			true,
-		);
+		expect(result.panels[1]).toEqual(expect.arrayContaining([expect.stringMatching(/^› .*b@example\.com.*│/)]));
 		expect(
 			result.broker.requests.some((request) => request.path === `/credne/v1/accounts/${claudeB.key}/disable`),
 		).toBe(true);
+		expect(result.setModel).not.toHaveBeenCalled();
+	});
+
+	it("uses the toolbar to mark accounts and restores marks after declining batch deletion", async () => {
+		const result = await runPanel([["\t", "\x1b[C", "\r", "\t", "\x1b[3~"], ["\x1b"]]);
+		expect(result.confirm).toHaveBeenCalledExactlyOnceWith(
+			"Delete 3 accounts?",
+			expect.stringMatching(/Claude · a \(API key\).*\n.*b@example\.com.*\n.*c@example\.com/),
+		);
+		expect(result.panels[1]).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("3 marked"),
+				expect.stringMatching(/^› \[x\].*Claude · a .*●.*│/),
+				expect.stringMatching(/^ {2}\[x\].*b@example\.com.*│/),
+				expect.stringMatching(/^ {2}\[x\].*c@example\.com.*◆.*│/),
+				expect.stringMatching(/^ {2}Pool: /),
+			]),
+		);
+		expect(result.broker.requests.some((request) => request.method === "DELETE")).toBe(false);
+		expect(result.setModel).not.toHaveBeenCalled();
+	});
+
+	it("deletes only marked accounts after one confirmation and keeps the failed account marked", async () => {
+		const one = `/credne/v1/accounts/${claudeA.key}`;
+		const two = `/credne/v1/accounts/${claudeB.key}`;
+		let deleted = false;
+		const result = await runPanel([[" ", "\x1b[B", " ", "\x1b[3~"], ["\x1b"]], {
+			confirm: true,
+			respond: ({ method, path }) => {
+				if (path === "/credne/v1/accounts" && deleted)
+					return { status: 200, body: { accounts: [claudeB, codexC] } };
+				if (method === "DELETE" && path === one) {
+					deleted = true;
+					return { status: 200, body: {} };
+				}
+				return method === "DELETE" && path === two
+					? { status: 500, body: { error: "Could not delete account" } }
+					: undefined;
+			},
+		});
+		expect(result.confirm).toHaveBeenCalledExactlyOnceWith("Delete 2 accounts?", expect.stringContaining(ACCT_B));
+		expect(
+			result.broker.requests.filter((request) => request.method === "DELETE").map((request) => request.path),
+		).toEqual([one, two]);
+		expect(result.notifications).toContainEqual([expect.stringContaining("Could not delete account"), "error"]);
+		expect(result.panels[1]).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("1 marked"),
+				expect.stringMatching(/^› \[x\].*b@example\.com/),
+			]),
+		);
 		expect(result.setModel).not.toHaveBeenCalled();
 	});
 });

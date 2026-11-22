@@ -19,7 +19,7 @@ import { SETTINGS_DEFAULTS } from "../../core/settings-defaults.ts";
 import type { TierClassifierMode } from "../../core/settings-schema.ts";
 import type { TaskInput } from "../planning/graph.ts";
 import type { AgentConfig } from "./agents.ts";
-import type { ProfileDefaults, SubagentDispatch } from "./dispatch.ts";
+import type { DispatchDecision, ProfileDefaults, SubagentDispatch } from "./dispatch.ts";
 import { type ModelTier, resolveModelTier } from "./model-tiers.ts";
 
 // What the classifier is asked, and how sure it must be before apply mode acts on its answer.
@@ -125,6 +125,8 @@ export interface TierRequest {
 
 /** What a rating changes for one request. Each field that is absent keeps the profile's own value. */
 export interface TierOverride {
+	/** Display metadata only; a consulted rater does not necessarily change dispatch. */
+	decision?: DispatchDecision;
 	/** Replaces the profile's tier. */
 	tier?: ModelTier;
 	/** Replaces the effort of the tier row that selects the model. */
@@ -230,7 +232,7 @@ interface ChatCall extends RatingSetup {
 
 /**
  * Rates each request, all at once, and returns per request what to dispatch with in place of the agent profile's
- * tier and tier effort, or undefined to keep both. Only `apply` mode returns anything. A classifier model rates when
+ * tier and tier effort, plus the decision model for display when one was consulted. Only `apply` mode changes dispatch. A classifier model rates when
  * one is available; otherwise the light-tier chat model of the current account does. Never throws and waits at most
  * three seconds for a classifier model or five for a chat model. Unless the mode is off, every rating, failure and
  * skipped request is recorded as a session entry.
@@ -259,7 +261,12 @@ export function withRating(
 	rating: TierOverride | undefined,
 ): ProfileDefaults | undefined {
 	if (!rating) return profile;
-	return { ...profile, tier: rating.tier ?? profile?.tier, ratedEffort: rating.effort };
+	return {
+		...profile,
+		tier: rating.tier ?? profile?.tier,
+		ratedEffort: rating.effort,
+		decision: rating.decision,
+	};
 }
 
 function readMode(pi: ExtensionAPI): TierClassifierMode {
@@ -337,7 +344,15 @@ async function classifyRequest(request: TierRequest, call: ClassifierCall): Prom
 		...(rating.outcome === "classified" ? { ...rating, applied: tier !== undefined } : rating),
 	};
 	record(call, request, `${call.classifier.provider}/${call.classifier.id}`, startedAt, body, usage);
-	return tier ? { tier } : undefined;
+	const outcome =
+		rating.outcome === "failed"
+			? "failed"
+			: call.mode === "shadow"
+				? "shadow"
+				: tier
+					? "rated tier"
+					: "low confidence";
+	return { tier, decision: { modelId: call.classifier.id, outcome } };
 }
 
 /** The tier apply mode uses: the likeliest level, when its probability reaches the minimum. */
@@ -440,7 +455,17 @@ async function chatRequest(request: TierRequest, call: ChatCall): Promise<TierOv
 		...(rating.outcome === "classified" ? { ...rating, applied } : rating),
 	};
 	record(call, request, `${call.model.provider}/${call.model.id}`, startedAt, body, usage);
-	return override;
+	const outcome =
+		rating.outcome === "failed"
+			? "failed"
+			: call.mode === "shadow"
+				? "shadow"
+				: override?.tier
+					? "rated tier"
+					: override?.effort
+						? "rated effort"
+						: "kept default";
+	return { ...override, decision: { modelId: call.model.id, outcome } };
 }
 
 /** What apply mode uses of a chat rating: each field it answered, but not `default`. */

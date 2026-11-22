@@ -1,4 +1,4 @@
-import { type Model, modelsAreEqual } from "@earendil-works/pi-ai";
+import { type Api, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import {
 	Container,
 	type Focusable,
@@ -10,6 +10,7 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 import { USES_BROKER_AUTH } from "../../../config.ts";
+import { getExactModelSelectionMatches } from "../../../core/model-resolver.ts";
 import type { ModelRuntime } from "../../../core/model-runtime.ts";
 import { getModelSelectionChoices } from "../../../core/model-selection.ts";
 import { ACCOUNT_PROVIDER_PREFIX } from "../../../extensions/accounts/catalog.ts";
@@ -55,6 +56,13 @@ interface DefaultModelReference {
 
 type ModelScope = "all" | "scoped";
 
+export interface ModelPickerSelection {
+	model: Model<Api>;
+	scope: ModelScope;
+	alias?: string;
+	query: string;
+}
+
 const MAX_VISIBLE = 10;
 
 function toModelItem(model: Model<any>): ModelItem {
@@ -97,8 +105,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private selectedIndex: number = 0;
 	private currentModel?: Model<any>;
 	private modelRuntime: ModelRuntime;
-	private onSelectCallback: (model: Model<any>) => void;
-	private onSelectAsDefaultCallback?: (model: Model<any>) => void;
+	private onSelectCallback: (selection: ModelPickerSelection) => void;
+	private onSelectAsDefaultCallback?: (selection: ModelPickerSelection) => void;
 	private onCancelCallback: () => void;
 	private errorMessage?: string;
 	private refreshStatusMessage = "Refreshing model catalogs…";
@@ -118,10 +126,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		currentModel: Model<any> | undefined,
 		modelRuntime: ModelRuntime,
 		scopedModels: ReadonlyArray<ScopedModelItem>,
-		onSelect: (model: Model<any>) => void,
+		onSelect: (selection: ModelPickerSelection) => void,
 		onCancel: () => void,
 		initialSearchInput?: string,
-		onSelectAsDefault?: (model: Model<any>) => void,
+		onSelectAsDefault?: (selection: ModelPickerSelection) => void,
 		defaultModel?: DefaultModelReference,
 	) {
 		super();
@@ -535,8 +543,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		else if (kb.matches(keyData, "app.models.save") && this.onSelectAsDefaultCallback) {
 			const entry = this.entries[this.selectedIndex];
 			if (entry?.type === "model") {
-				this.dispose();
-				this.onSelectAsDefaultCallback(entry.item.model);
+				this.handleSelect(entry, this.onSelectAsDefaultCallback);
 			}
 		}
 		// Pass everything else to search input
@@ -562,12 +569,30 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.toggleSection(entry.section);
 			return;
 		}
-		this.handleSelect(entry.item.model);
+		this.handleSelect(entry, this.onSelectCallback);
 	}
 
-	private handleSelect(model: Model<any>): void {
+	private handleSelect(entry: ModelEntry, callback: (selection: ModelPickerSelection) => void): void {
+		const query = this.searchInput.getValue().trim();
+		const { model } = entry.item;
+		let alias = entry.alias;
+		if (
+			USES_BROKER_AUTH &&
+			this.scope === "all" &&
+			query &&
+			!query.includes("/") &&
+			query.toLowerCase() !== model.id.toLowerCase()
+		) {
+			// Only the exact alias match stands for a family; choosing another search result selects an exact ID.
+			const matches = getExactModelSelectionMatches(
+				query,
+				this.activeModels.map((item) => item.model),
+				"scoped",
+			);
+			if (matches.length === 1 && modelsAreEqual(matches[0], model)) alias = query;
+		}
 		this.dispose();
-		this.onSelectCallback(model);
+		callback({ model, scope: this.scope, alias, query });
 	}
 
 	getSearchInput(): Input {

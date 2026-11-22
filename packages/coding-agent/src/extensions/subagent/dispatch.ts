@@ -42,7 +42,26 @@ export interface ProfileDefaults {
 	tier?: ModelTier;
 	/** An effort rated for this task: it replaces the effort of the tier row that selects the model, and nothing else. */
 	ratedEffort?: ThinkingLevel;
+	decision?: DispatchDecision;
 }
+
+export interface DispatchDecision {
+	modelId: string;
+	outcome: "rated tier" | "rated effort" | "kept default" | "low confidence" | "failed" | "shadow";
+}
+
+type ModelSource = {
+	method: "explicit" | "explicit tier" | "profile" | "profile tier" | "inherited" | "auto";
+	tier?: ModelTier;
+};
+
+/** The dispatch decision shown in chat, without the serving provider or account. */
+export type ModelChoice = ModelSource & {
+	modelId: string;
+	decision?: DispatchDecision;
+	effort: ThinkingLevel;
+	explicitEffort: boolean;
+};
 
 export interface DispatchResolution {
 	model: string;
@@ -52,6 +71,12 @@ export interface DispatchResolution {
 export interface SubagentDispatch {
 	/** Picks the child model: explicit model, explicit tier, profile model, profile tier, then the parent's model. */
 	resolve(selection: DispatchSelection, ctx: ExtensionContext, profile?: ProfileDefaults): DispatchResolution;
+	/** Also reports which source supplied the model, for a subagent call's terminal badge. */
+	resolveWithChoice(
+		selection: DispatchSelection,
+		ctx: ExtensionContext,
+		profile?: ProfileDefaults,
+	): DispatchResolution & { modelChoice: ModelChoice };
 	models(ctx: ExtensionContext, provider?: string): { provider: string; models: Model<Api>[] };
 }
 
@@ -102,26 +127,50 @@ export function createSubagentDispatch(pi: ExtensionAPI): SubagentDispatch {
 		selection: DispatchSelection,
 		ctx: ExtensionContext,
 		profile: ProfileDefaults | undefined,
-	): { model: Model<Api>; effort?: ThinkingLevel } => {
-		if (selection.model !== undefined) return { model: modelFromReference(selection.model, ctx, "caller") };
+	): { model: Model<Api>; effort?: ThinkingLevel } & ModelSource => {
+		if (selection.model !== undefined)
+			return { model: modelFromReference(selection.model, ctx, "caller"), method: "explicit" };
 		const explicitTier = modelFromTier(selection.tier, ctx);
-		if (explicitTier) return explicitTier;
+		if (explicitTier) return { ...explicitTier, method: "explicit tier", tier: selection.tier };
 		if (profile?.model !== undefined) {
-			return { model: modelFromReference(profile.model, ctx, "profile"), effort: profile.effort };
+			return { model: modelFromReference(profile.model, ctx, "profile"), effort: profile.effort, method: "profile" };
 		}
 		const profileTier = modelFromTier(profile?.tier, ctx);
-		if (profileTier) return { model: profileTier.model, effort: profile?.ratedEffort ?? profileTier.effort };
-		return { model: inheritedModel(ctx) };
+		if (profileTier) {
+			return {
+				model: profileTier.model,
+				effort: profile?.ratedEffort ?? profileTier.effort,
+				method: profile?.decision?.outcome === "rated tier" ? "auto" : "profile tier",
+				tier: profile?.tier,
+			};
+		}
+		return { model: inheritedModel(ctx), method: "inherited" };
+	};
+	const resolveWithChoice: SubagentDispatch["resolveWithChoice"] = (selection, ctx, profile) => {
+		const { model, effort, ...source } = pickModel(selection, ctx, profile);
+		const requested = selection.reasoningEffort ?? effort ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
+		if (selection.reasoningEffort !== undefined && !getSupportedThinkingLevels(model).includes(requested)) {
+			throw new Error(`Model ${model.provider}/${model.id} does not support reasoning effort ${requested}.`);
+		}
+		const thinkingLevel = clampThinkingLevel(model, requested);
+		return {
+			model: `${model.provider}/${model.id}`,
+			thinkingLevel,
+			modelChoice: {
+				modelId: model.id,
+				decision: profile?.decision,
+				effort: thinkingLevel,
+				explicitEffort: selection.reasoningEffort !== undefined,
+				...source,
+			},
+		};
 	};
 	return {
 		models,
+		resolveWithChoice,
 		resolve(selection, ctx, profile) {
-			const { model, effort } = pickModel(selection, ctx, profile);
-			const requested = selection.reasoningEffort ?? effort ?? ctx.thinkingLevel ?? pi.getThinkingLevel();
-			if (selection.reasoningEffort !== undefined && !getSupportedThinkingLevels(model).includes(requested)) {
-				throw new Error(`Model ${model.provider}/${model.id} does not support reasoning effort ${requested}.`);
-			}
-			return { model: `${model.provider}/${model.id}`, thinkingLevel: clampThinkingLevel(model, requested) };
+			const { model, thinkingLevel } = resolveWithChoice(selection, ctx, profile);
+			return { model, thinkingLevel };
 		},
 	};
 }

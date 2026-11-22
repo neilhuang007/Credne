@@ -45,7 +45,7 @@ For browser sign-in, Credne opens the page and also shows the link, so you can o
 
 The API-key prompt shows the key while you type, because extension dialogs have no masked input. The broker checks the key by listing its models before it stores the account, so an invalid key is rejected and nothing is saved.
 
-The first account you add also becomes the default for new sessions, unless a default model is already configured. The default is the combined pool `pool:all`, described below.
+When you add your first chat account and no model is selected or configured, Credne offers to use a model on that account as the default for new sessions. Adding another account doesn't change an existing selection.
 
 ## Upgrading from local Claude subscriptions or Console credits
 
@@ -55,7 +55,7 @@ Claude Console browser sign-in (`/accounts add claude-api-credits`) is no longer
 
 ## Accounts and providers
 
-In Credne, `/model` normally shows the model rather than one copy per account, as one row per model alias (`fable`, `astra`) that stands for the latest version served, grouped by vendor with the current vendor unfolded. A search lists every routed model as a flat list (see [Select a model](models.md#select-a-model)). A bare model ID, or a recognized model-family alias such as `sonnet`, selects the available model and saves its routed ID, not the account that happens to answer. A session pinned to an account stays on it (see [Pinned accounts](#pinned-accounts)). When unrelated providers use the same ID and the broker cannot establish that they are the same model, choose the provider pool explicitly.
+In Credne, `/model` normally shows the model rather than one copy per account, as one row per model alias (`fable`, `astra`) that stands for the latest version served, grouped by vendor with the current vendor unfolded. A search lists every routed model as a flat list (see [Select a model](models.md#select-a-model)). When an interactive selection from a pool has several possible accounts, Credne asks which one to use before saving the model. Subscription accounts appear before API keys, and each option shows its exact model ID. Choosing an account pins it; choosing the pool keeps automatic failover. A session pinned to an account stays on it (see [Pinned accounts](#pinned-accounts)). When unrelated providers use the same ID and the broker cannot establish that they are the same model, choose the provider pool explicitly.
 
 To choose the payer instead of using pooled routing, use `/accounts switch` or an explicit `acct:<id>/<model>` selection. For example, `--model acct:claude-api-work/claude-sonnet-4-5` pins the session when that account and model are registered. A deliberate account restriction is never widened to the global pool by an alias.
 
@@ -75,7 +75,7 @@ A pool is a provider that lets the broker route each request to an enabled accou
 
 | Pool | Provider | Contents |
 | --- | --- | --- |
-| All accounts | `pool:all` | Every enabled account, of any family. This is the default for new sessions after the first account is added, unless a default model is already configured. |
+| All accounts | `pool:all` | Every enabled account, of any family. Select it explicitly when you want automatic routing across accounts. |
 | Claude | `pool:claude` | Enabled Claude subscriptions and Anthropic API keys. |
 | ChatGPT Codex | `pool:codex` | Enabled ChatGPT subscriptions. |
 | OpenAI API | `pool:openai` | Enabled OpenAI API key accounts. |
@@ -162,14 +162,14 @@ The singular `/account` command is no longer registered. All account commands an
 
 ### Panel controls
 
-- Up/Down browse accounts and pools. The active provider is marked `● active`.
-- Enter uses the selected provider immediately, keeping the current model when available, otherwise selecting its first model. There is no second "Use" menu.
-- Click a row to select it and inspect its details without switching. Enter confirms.
-- `Ctrl+O` opens management (enable/disable, clear cooldown, remove). `Ctrl+L` chooses a model. Returning from either keeps the selected provider highlighted.
-- `Ctrl+R` refreshes the selected account's live usage. PageUp/PageDown scroll its details on short terminals. Escape cancels without switching.
-- `+ Add account` and `Restart broker` are navigable rows.
+Accounts and pools are listed on the left. The right pane shows the highlighted row's identity, state, quota and session costs. On narrow terminals the details move below the list. The current session and saved default are marked separately when they differ.
 
-These controls use `tui.select.*`, `app.accounts.manage`, `app.accounts.model`, and `app.accounts.refresh` in [keybindings.json](keybindings.md). Loading usage is cancelled on selection changes or close; late responses cannot replace another account's details.
+- Click a row or use Up/Down to inspect it without switching. Enter uses that account and makes it the default for new sessions, keeping the current model if possible. `Ctrl+L` chooses a specific model instead.
+- Press Space to mark accounts without changing the payer. Use the toolbar above the list to add an account, select all or clear the selection, enable, disable, or delete. Tab focuses the toolbar, arrows choose an action, and Enter runs it. Tab returns to the list. Pools, cached offline entries, and accounts managed in `config.yaml` cannot be marked for bulk changes.
+- Delete asks for confirmation and names the accounts whose stored credentials will be removed. Cancelling keeps the marks. If only some deletions succeed, the remaining failed accounts stay marked for retry. Disable an account instead to keep its credentials.
+- `Ctrl+O` opens individual account management, including clearing a cooldown. `Ctrl+R` refreshes usage. PageUp/PageDown scroll details; Escape closes without switching.
+
+The shortcuts are configurable in [keybindings.json](keybindings.md). Loading usage is cancelled on selection changes or close; late responses cannot replace another account's details.
 
 ### Usage and session costs
 
