@@ -4,9 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { OAuthAccounts } from "@oh-my-pi/pi-ai/auth/oauth";
-import { wrapFetchForCch } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { startBroker } from "../src/service.ts";
 import { array, object } from "../src/wire.ts";
+import { anthropicReply, fakeNetwork, fakeUpstream, piBody, piEvents, piText, refusal } from "./fixtures.ts";
 
 test("manual OAuth callbacks bind to pending state and renew duplicate identities without adding siblings", async () => {
 	const home = await mkdtemp(join(tmpdir(), "credne-login-"));
@@ -69,7 +69,7 @@ test("manual OAuth callbacks bind to pending state and renew duplicate identitie
 	}
 }, 20000);
 
-test("Claude OAuth waits for explicit risk consent and sends OMP-authenticated Messages", async () => {
+test("Claude OAuth waits for explicit risk consent, and OMP refreshes the token it sends", async () => {
 	const home = await mkdtemp(join(tmpdir(), "credne-claude-login-"));
 	const actualLogin = OAuthAccounts.prototype.login;
 	const warning = "Provider account restrictions apply. Proceed only if you accept the risk.";
@@ -83,60 +83,28 @@ test("Claude OAuth waits for explicit risk consent and sends OMP-authenticated M
 		if (answer !== "yes") return undefined;
 		return actualLogin.call(this, provider, controller);
 	});
-	const realFetch = globalThis.fetch;
-	const network: { fetch: FetchImpl } = globalThis;
 	const access = "sk-ant-oat01-fixture-subscription";
 	const tokenUrl = "https://api.anthropic.com/v1/oauth/token";
 	let exchanges = 0;
-	const received: { headers: Headers; body: string }[] = [];
 	const model = "claude-sonnet-5";
-	const transport = spyOn(network, "fetch").mockImplementation(async (input, init) => {
-		const request = new Request(input, init);
-		const url = new URL(request.url);
-		if (url.hostname === "127.0.0.1" || url.hostname === "localhost") return realFetch(request);
-		if (url.href === tokenUrl) {
-			const body = object(await request.json());
-			exchanges++;
-			expect(body.grant_type).toBe(exchanges === 1 ? "authorization_code" : "refresh_token");
-			return Response.json({
-				access_token: exchanges === 1 ? access : `${access}-renewed`,
-				refresh_token: "private-refresh",
-				expires_in: 3600,
-				account: { uuid: "account-id", email_address: "claude@example.com" },
-				organization: { uuid: "org-id", name: "Claude Max" },
-			});
-		}
-		if (url.href !== "https://api.anthropic.com/v1/messages?beta=true")
-			throw new Error(`Unexpected provider network request: ${url.href}`);
-		const body =
-			request.headers.get("content-encoding") === "gzip"
-				? new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await request.arrayBuffer())))
-				: await request.text();
-		received.push({ headers: request.headers, body });
-		if (received.length === 1) return Response.json({ error: { message: "expired" } }, { status: 401 });
-		const events = [
-			{
-				type: "message_start",
-				message: {
-					id: "reply",
-					type: "message",
-					role: "assistant",
-					model,
-					content: [],
-					usage: { input_tokens: 4, output_tokens: 0 },
-				},
-			},
-			{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-			{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Done." } },
-			{ type: "content_block_stop", index: 0 },
-			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
-			{ type: "message_stop" },
-		];
-		return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
-			headers: { "content-type": "text/event-stream" },
+	// The first Messages request finds the token expired; OMP's own 401 recovery then refreshes it and retries.
+	const upstream = fakeUpstream((call) =>
+		call.headers.get("authorization") === `Bearer ${access}` ? refusal(401, "expired") : anthropicReply("Done."),
+	);
+	const network = fakeNetwork(async (request) => {
+		if (request.url !== tokenUrl) return new Response(null, { status: 404 });
+		const body = object(await request.json());
+		exchanges++;
+		expect(body.grant_type).toBe(exchanges === 1 ? "authorization_code" : "refresh_token");
+		return Response.json({
+			access_token: exchanges === 1 ? access : `${access}-renewed`,
+			refresh_token: "private-refresh",
+			expires_in: 3600,
+			account: { uuid: "account-id", email_address: "claude@example.com" },
+			organization: { uuid: "org-id", name: "Claude Max" },
 		});
 	});
-	const broker = await startBroker({ home, idleTimeout: 0 });
+	const broker = await startBroker({ home, idleTimeout: 0, anthropicBaseUrl: upstream.origin });
 	if (!broker) throw new Error("No test broker");
 	const request = (path: string, body?: unknown, method?: string) =>
 		fetch(`${broker.state.url}/credne/v1${path}`, {
@@ -177,44 +145,29 @@ test("Claude OAuth waits for explicit risk consent and sends OMP-authenticated M
 		expect(account).toMatchObject({ email: "claude@example.com", kind: "oauth", provider: "claude" });
 		expect(JSON.stringify(result)).not.toContain(access);
 
-		const marker = { type: "ephemeral", ttl: "1h" };
-		for (const [target, system] of [
-			[`a.${account.key}`, undefined],
-			["p.claude", [{ type: "text", text: "reference", cache_control: marker }]],
+		for (const [target, session] of [
+			[`a.${account.key}`, "login-pinned"],
+			["p.claude", "login-pooled"],
 		] as const) {
-			const reply = await request(`/route/${target}/v1/messages`, {
-				model,
-				max_tokens: 64,
-				stream: false,
-				system,
-				messages: [{ role: "user", content: "long prompt ".repeat(900) }],
-			});
+			const reply = await request(`/route/${target}/pi/stream`, JSON.parse(piBody(`anthropic/${model}`, session)));
 			expect(reply.status).toBe(200);
 			expect(reply.headers.get("x-credne-account")).toBe(String(account.key));
-			expect(await reply.text()).toContain("Done.");
+			expect(piText(await piEvents(reply))).toBe("Done.");
 		}
 		expect(exchanges).toBe(2);
+		const received = upstream.calls;
 		expect(received).toHaveLength(3);
 		for (const [index, wire] of received.entries()) {
 			expect(wire.headers.get("authorization")).toBe(`Bearer ${access}${index === 0 ? "" : "-renewed"}`);
 			expect(wire.headers.get("anthropic-beta")).toContain("oauth-2025-04-20");
 			expect(wire.headers.has("x-api-key")).toBe(false);
 			expect(wire.headers.has("chatgpt-account-id")).toBe(false);
-			expect(wire.headers.get("content-encoding")).toBe(index === 2 ? null : "gzip");
-			expect(wire.body).toMatch(/cc_version=.*; cch=(?!00000)[0-9a-f]{5}/);
-			const verify = wrapFetchForCch(async (_input, init) => new Response(init?.body));
-			const signed = await verify(tokenUrl, { body: wire.body.replace(/\bcch=[0-9a-f]{5}\b/, "cch=00000") });
-			expect(await signed.text()).toBe(wire.body);
 		}
-		expect(array(object(JSON.parse(received[2].body)).system)).toContainEqual({
-			type: "text",
-			text: "reference",
-			cache_control: marker,
-		});
 	} finally {
 		await broker.close();
 		login.mockRestore();
-		transport.mockRestore();
+		network.restore();
+		await upstream.server.stop(true);
 		await rm(home, { recursive: true, force: true });
 	}
 }, 20000);

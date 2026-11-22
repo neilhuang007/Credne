@@ -53,7 +53,7 @@ test("legacy migration preserves rollback files while OMP account changes surviv
 		async fetch(request) {
 			upstreamRequests.push({ path: new URL(request.url).pathname, bearer: request.headers.get("authorization") });
 			await request.arrayBuffer();
-			return Response.json({ answers: [] });
+			return Response.json({ model, answers: [{ type: "predicate", name: "easy", probability: 0.5 }] });
 		},
 	});
 	let broker: BrokerHandle | undefined;
@@ -71,7 +71,12 @@ test("legacy migration preserves rollback files while OMP account changes surviv
 		});
 	};
 	const list = async () => object(await (await request("/accounts")).json()).accounts;
-	const decide = () => request(`/route/a.${key}/decisions`, "POST", { model, input: "Migration test", questions: [] });
+	const decide = () =>
+		request(`/route/a.${key}/systemone`, "POST", {
+			model,
+			state: "Migration test",
+			questions: { easy: { type: "noul", instructions: "Is it a test?" } },
+		});
 	try {
 		await restart();
 		expect(await list()).toMatchObject([
@@ -98,7 +103,7 @@ test("legacy migration preserves rollback files while OMP account changes surviv
 		]);
 		const response = await decide();
 		expect(response.status).toBe(200);
-		expect(await response.json()).toEqual({ answers: [] });
+		expect(object(await response.json()).answers).toEqual({ easy: { type: "noul", noul: 0.5 } });
 		expect(upstreamRequests).toEqual([{ path: "/v1/decisions", bearer: `Bearer ${legacyKey}` }]);
 
 		for (const deleted of [key, accountKey(subscription)]) {

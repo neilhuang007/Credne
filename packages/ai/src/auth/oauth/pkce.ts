@@ -16,12 +16,11 @@ function base64urlEncode(bytes: Uint8Array): string {
 
 /**
  * Generate PKCE code verifier and challenge.
- * Uses Web Crypto API for cross-platform compatibility. The verifier is `byteLength` random bytes (32 by default),
- * base64url encoded.
+ * Uses Web Crypto API for cross-platform compatibility.
  */
-export async function generatePKCE(byteLength = 32): Promise<{ verifier: string; challenge: string }> {
+export async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
 	// Generate random verifier
-	const verifierBytes = new Uint8Array(byteLength);
+	const verifierBytes = new Uint8Array(32);
 	crypto.getRandomValues(verifierBytes);
 	const verifier = base64urlEncode(verifierBytes);
 

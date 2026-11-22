@@ -16,7 +16,10 @@ import { PROVIDER_DESCRIPTORS, type ProviderDescriptor } from "@oh-my-pi/pi-cata
 
 export type AuthMethod = "api-key" | "oauth";
 type KeyEnrollment =
-	| { kind: "legacy" }
+	// Anthropic and OpenAI keys are checked, and their models listed, through the catalog descriptor.
+	| { kind: "legacy"; descriptor: ProviderDescriptor }
+	// TypeSafe lists its Jev models as classifiers; its key is checked by listing them.
+	| { kind: "classifier" }
 	| {
 			kind: "upstream";
 			login: NonNullable<ProviderDefinition["login"]>;
@@ -105,7 +108,7 @@ export function accountProvider(
 /** Checks a key using OMP's login validator or its authenticated model-list descriptor. */
 export async function validateProviderKey(
 	provider: Provider,
-	enrollment: Exclude<KeyEnrollment, { kind: "legacy" }>,
+	enrollment: Exclude<KeyEnrollment, { kind: "legacy" | "classifier" }>,
 	key: string,
 	signal: AbortSignal,
 ): Promise<{ key: string; ids?: string[] }> {
@@ -209,6 +212,13 @@ function buildProviders(): Map<string, Provider> {
 		provider.key = keyEnrollment(policy, definition, descriptors.get(id), provider.oauth);
 		if (provider.key || provider.oauth) providers.set(id, provider);
 	}
+	// OMP lists TypeSafe's Jev models as `kind: "judge"`, which the chat filter above rightly drops.
+	providers.set("typesafe", {
+		id: "typesafe",
+		name: "TypeSafe",
+		models: getBundledModels("typesafe"),
+		key: { kind: "classifier" },
+	});
 	return providers;
 }
 
@@ -243,7 +253,7 @@ function keyEnrollment(
 	oauth?: Provider["oauth"],
 ): KeyEnrollment | undefined {
 	const { id, login } = policy;
-	if (id === "anthropic" || id === "openai") return { kind: "legacy" };
+	if (id === "anthropic" || id === "openai") return descriptor && { kind: "legacy", descriptor };
 	if (policy.loginWarning) return;
 	const validation = login?.kind === "api-key" ? login.validate : undefined;
 	if (validation && definition.login) {

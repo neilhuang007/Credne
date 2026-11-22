@@ -144,7 +144,6 @@ for (const entry of [
 	join(codingAgentDistDir, "utils", "image-resize-worker.js"),
 	join(codingAgentDistDir, "extensions", "codemode", "worker.js"),
 	join(aiDistDir, "api", "bedrock-converse-stream.js"),
-	join(aiDistDir, "auth", "oauth", "anthropic.js"),
 ]) {
 	if (!existsSync(entry)) {
 		throw new Error(`Bundle input is missing: ${relative(repoRoot, entry)}. Build the workspace packages first.`);
@@ -179,7 +178,6 @@ if (dirname(bedrockLoaderOutput) !== dirname(oauthLoaderOutput)) {
 // worker URL, so the main bundle cannot follow them. Emit one self-contained
 // file per implementation beside the code that resolves it.
 const lazyEntryPoints = {
-	anthropic: join(aiDistDir, "auth", "oauth", "anthropic.js"),
 	"bedrock-converse-stream": join(aiDistDir, "api", "bedrock-converse-stream.js"),
 	"github-copilot": join(aiDistDir, "auth", "oauth", "github-copilot.js"),
 	"image-resize-worker": join(codingAgentDistDir, "utils", "image-resize-worker.js"),

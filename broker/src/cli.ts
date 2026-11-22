@@ -18,7 +18,7 @@ function duration(value: string): number {
 }
 async function main(): Promise<void> {
 	process.umask(0o077);
-	const version = process.env.CREDNE_BROKER_VERSION ?? "0.1.4";
+	const version = process.env.CREDNE_BROKER_VERSION ?? "0.1.5";
 	const options: BrokerOptions = {
 		home: join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "accounts"),
 		version,
@@ -37,7 +37,7 @@ async function main(): Promise<void> {
 		}
 		if (flag === "--help" || flag === "-h") {
 			console.log(
-				"credne-broker [--home DIR] [--idle-timeout 30m] [--max-concurrency-per-account N] [--anthropic-base-url URL] [--openai-base-url URL] [--debug] [--version]",
+				"credne-broker [--home DIR] [--idle-timeout 30m] [--max-concurrency-per-account N] [--anthropic-base-url URL] [--openai-base-url URL] [--typesafe-base-url URL] [--debug] [--version]",
 			);
 			return;
 		}
@@ -56,12 +56,15 @@ async function main(): Promise<void> {
 					throw new Error("Concurrency must be a nonnegative integer.");
 				break;
 			case "--anthropic-base-url":
-			case "--openai-base-url": {
+			case "--openai-base-url":
+			case "--typesafe-base-url": {
 				const url = new URL(value);
 				if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash)
 					throw new Error("Invalid provider base URL.");
-				if (flag === "--anthropic-base-url") options.anthropicBaseUrl = url.href.replace(/\/$/, "");
-				else options.openaiBaseUrl = url.href.replace(/\/$/, "");
+				const base = url.href.replace(/\/$/, "");
+				if (flag === "--anthropic-base-url") options.anthropicBaseUrl = base;
+				else if (flag === "--openai-base-url") options.openaiBaseUrl = base;
+				else options.typesafeBaseUrl = base;
 				break;
 			}
 			default:

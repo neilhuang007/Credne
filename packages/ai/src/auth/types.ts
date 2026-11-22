@@ -223,7 +223,7 @@ export interface LoginOptions {
  * auth from whatever credential ends up stored.
  */
 export interface OAuthAuth {
-	/** Display name, e.g. "Anthropic (Claude Pro/Max)". */
+	/** Display name, e.g. "OpenAI (ChatGPT Plus/Pro)". */
 	name: string;
 
 	/** Whether access through this auth method is backed by a provider subscription. */
@@ -246,12 +246,6 @@ export interface OAuthAuth {
 	 * can load the implementation on first use.
 	 */
 	toAuth(credential: OAuthCredential): Promise<ModelAuth>;
-
-	/**
-	 * Optional side-effect-free derivation of provider env values from a valid credential, merged into the
-	 * request's `env`. Carries per-credential request identity such as Anthropic's account uuid.
-	 */
-	toEnv?(credential: OAuthCredential): Promise<ProviderEnv | undefined>;
 }
 
 /**

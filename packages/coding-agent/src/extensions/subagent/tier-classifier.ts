@@ -92,7 +92,7 @@ const chatMaxTokens = 100;
 const maxTaskChars = 16_000;
 const maxObjectiveChars = 2_000;
 const maxMessageChars = 200;
-const preferredClassifierId = "gpt-6-luna";
+const lunaClassifierId = "gpt-6-luna";
 // The first flat object of a reply: the expected answer has no nested braces.
 const flatObjectPattern = /\{[^{}]*\}/g;
 
@@ -138,6 +138,12 @@ type EffortAnswer = RatedEffort | "default";
 
 type TierFailureReason = "timeout" | "aborted" | "error" | "malformed" | "no-level-probabilities";
 
+/**
+ * Why a request was not rated: the caller chose its model or tier, its profile pins a model, or the account has
+ * neither a classifier model nor a light-tier chat model to rate with.
+ */
+type TierSkipReason = "caller-model" | "caller-tier" | "profile-model" | "no-rater";
+
 interface TierClassified {
 	outcome: "classified";
 	/** The level with the highest probability. */
@@ -164,12 +170,21 @@ interface TierFailed {
 type DecisionRating = TierClassified | TierFailed;
 type ChatRating = ChatClassified | TierFailed;
 
+interface TierSkipped {
+	outcome: "skipped";
+	reason: TierSkipReason;
+}
+
 type RatingMode = Exclude<TierClassifierMode, "off">;
 
-interface TierEntryHeader {
+/** What every entry names: the mode and the task's agent and profile tier. */
+interface TierEntryBase {
 	mode: RatingMode;
 	agent: string;
 	profileTier?: ModelTier;
+}
+
+interface TierEntryHeader extends TierEntryBase {
 	/** `provider/id` of the model that rated: a classifier model for `decision`, a chat model for `chat`. */
 	classifier: string;
 	latencyMs: number;
@@ -184,8 +199,10 @@ type ChatEntryBody = { backend: "chat" } & (
 	| (ChatClassified & { applied: { tier: boolean; effort: boolean } })
 );
 
-/** The record of one classification: the task text is left out, the tool call already holds it. */
-export type TierClassificationEntry = TierEntryHeader & (DecisionEntryBody | ChatEntryBody);
+/** The record of one classification, or of a request that was not rated: the task text is left out, the tool call already holds it. */
+export type TierClassificationEntry =
+	| (TierEntryHeader & (DecisionEntryBody | ChatEntryBody))
+	| (TierEntryBase & TierSkipped);
 
 type ClassifierRef = ClassifierModel<ClassifierApi>;
 
@@ -215,7 +232,8 @@ interface ChatCall extends RatingSetup {
  * Rates each request, all at once, and returns per request what to dispatch with in place of the agent profile's
  * tier and tier effort, or undefined to keep both. Only `apply` mode returns anything. A classifier model rates when
  * one is available; otherwise the light-tier chat model of the current account does. Never throws and waits at most
- * three seconds for a classifier model or five for a chat model; every rating or failure is recorded as a session entry.
+ * three seconds for a classifier model or five for a chat model. Unless the mode is off, every rating, failure and
+ * skipped request is recorded as a session entry.
  */
 export async function classifyTiers(
 	pi: ExtensionAPI,
@@ -225,9 +243,10 @@ export async function classifyTiers(
 	signal: AbortSignal | undefined,
 ): Promise<(TierOverride | undefined)[]> {
 	const mode = readMode(pi);
-	const eligible = requests.map((request) => (isEligible(request) ? request : undefined));
-	if (mode === "off" || !eligible.some((request) => request !== undefined)) return requests.map(() => undefined);
+	if (mode === "off") return requests.map(() => undefined);
 	const setup: RatingSetup = { pi, mode, registry: ctx.modelRegistry };
+	const eligible = requests.map((request) => (request ? eligibleRequest(request, setup) : undefined));
+	if (!eligible.some((request) => request !== undefined)) return requests.map(() => undefined);
 	return (
 		(await rateWithClassifier(eligible, setup, signal)) ??
 		(await rateWithChat(eligible, setup, dispatch, ctx, signal))
@@ -249,14 +268,20 @@ function readMode(pi: ExtensionAPI): TierClassifierMode {
 	return mode === "off" || mode === "shadow" || mode === "apply" ? mode : SETTINGS_DEFAULTS.subagents.tierClassifier;
 }
 
-/** Only a task whose model and tier nobody chose is rated: a pinned profile model or a caller's choice wins. */
-function isEligible(request: TierRequest | undefined): request is TierRequest {
-	return (
-		request !== undefined &&
-		request.model === undefined &&
-		request.tier === undefined &&
-		request.agent.model === undefined
-	);
+/** The request when nobody chose its model or tier; otherwise records why it is skipped and returns undefined. */
+function eligibleRequest(request: TierRequest, setup: RatingSetup): TierRequest | undefined {
+	const reason = skipReason(request);
+	if (reason === undefined) return request;
+	recordSkip(setup, request, reason);
+	return undefined;
+}
+
+/** A caller's choice or a pinned profile model wins over a rating, checked in the order dispatch applies them. */
+function skipReason(request: TierRequest): TierSkipReason | undefined {
+	if (request.model !== undefined) return "caller-model";
+	if (request.tier !== undefined) return "caller-tier";
+	if (request.agent.model !== undefined) return "profile-model";
+	return undefined;
 }
 
 function createDeadline(parent: AbortSignal | undefined, timeoutMs: number): Deadline {
@@ -286,7 +311,7 @@ async function rateWithClassifier(
 	}
 }
 
-/** The available classifier model to use: `gpt-6-luna`, then a Jev model, then any other. */
+/** The available classifier model to use: a Jev model, then `gpt-6-luna`, then any other. */
 async function selectClassifier(registry: ModelRegistry, signal: AbortSignal): Promise<ClassifierRef | undefined> {
 	try {
 		const available = await registry.getAvailableOfType("classifier", undefined, { signal });
@@ -299,8 +324,8 @@ async function selectClassifier(registry: ModelRegistry, signal: AbortSignal): P
 
 function classifierRank(model: ClassifierRef): number {
 	const id = model.id.toLowerCase();
-	if (id === preferredClassifierId) return 0;
-	return id.includes("jev") ? 1 : 2;
+	if (id.includes("jev")) return 0;
+	return id === lunaClassifierId ? 1 : 2;
 }
 
 async function classifyRequest(request: TierRequest, call: ClassifierCall): Promise<TierOverride | undefined> {
@@ -369,7 +394,10 @@ function readRating(result: ClassifierResult, deadline: Deadline): DecisionRatin
 	};
 }
 
-/** The ratings by the light-tier chat model of the current account. Nothing is rated when the account has none. */
+/**
+ * The ratings by the light-tier chat model of the current account. When the account has none, nothing is rated and
+ * each request is recorded as skipped.
+ */
 async function rateWithChat(
 	eligible: readonly (TierRequest | undefined)[],
 	setup: RatingSetup,
@@ -377,9 +405,13 @@ async function rateWithChat(
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 ): Promise<(TierOverride | undefined)[]> {
-	const model = findChatModel(dispatch, ctx);
 	// A call aborted while the classifiers were looked up is not rated.
-	if (!model || signal?.aborted) return eligible.map(() => undefined);
+	if (signal?.aborted) return eligible.map(() => undefined);
+	const model = findChatModel(dispatch, ctx);
+	if (!model) {
+		for (const request of eligible) if (request) recordSkip(setup, request, "no-rater");
+		return eligible.map(() => undefined);
+	}
 	const deadline = createDeadline(signal, chatTimeoutMs);
 	try {
 		const call: ChatCall = { ...setup, model, deadline };
@@ -496,15 +528,23 @@ function record(
 	usage: Usage | undefined,
 ): void {
 	const entry: TierClassificationEntry = {
-		mode: call.mode,
-		agent: request.agent.name,
-		profileTier: request.agent.tier,
+		...entryBase(call, request),
 		classifier: rater,
 		latencyMs: Date.now() - startedAt,
 		usage,
 		...body,
 	};
 	call.pi.appendEntry(tierClassificationEntryType, entry);
+}
+
+/** Appends the entry of a request that was not rated, so a missing rating always has a recorded reason. */
+function recordSkip(setup: RatingSetup, request: TierRequest, reason: TierSkipReason): void {
+	const entry: TierClassificationEntry = { ...entryBase(setup, request), outcome: "skipped", reason };
+	setup.pi.appendEntry(tierClassificationEntryType, entry);
+}
+
+function entryBase(setup: RatingSetup, request: TierRequest): TierEntryBase {
+	return { mode: setup.mode, agent: request.agent.name, profileTier: request.agent.tier };
 }
 
 function failed(reason: TierFailureReason, message?: string): TierFailed {

@@ -55,6 +55,5 @@ export function lazyOAuth(input: {
 		login: async (interaction, options) => (await loaded()).login(interaction, options),
 		refresh: async (credential, signal) => (await loaded()).refresh(credential, signal),
 		toAuth: async (credential) => (await loaded()).toAuth(credential),
-		toEnv: async (credential) => (await loaded()).toEnv?.(credential),
 	};
 }

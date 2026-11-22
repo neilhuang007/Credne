@@ -1,6 +1,6 @@
 {
 	"name": "@neilhuang007/credne",
-	"version": "0.1.4",
+	"version": "0.1.5",
 	"description": "Pi-based coding agent with model-first selection and shared subscription and API-key accounts managed by an oh-my-pi broker",
 	"type": "module",
 	"private": true,

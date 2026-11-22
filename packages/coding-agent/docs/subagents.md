@@ -6,12 +6,12 @@ Bundled definitions have the lowest priority. User definitions in the agent conf
 
 ## Model tiers
 
-Each bundled profile carries a default capability tier: `light`, `medium`, or `heavy`. The harness maps the tier to a model and a reasoning effort on the current serving account, so the main agent usually does not choose a model. It passes `tier` only when a task is clearly easier or harder than its profile assumes.
+Each bundled profile carries a default capability tier, `light`, `medium`, or `heavy`, except `worker`, which pins a model instead (see [Profile model and effort](#profile-model-and-effort)). The harness maps the tier to a model and a reasoning effort on the current serving account, so the main agent usually does not choose a model. It passes `tier` only when a task is clearly easier or harder than its profile assumes.
 
-| Profile | Default tier | Meant for |
+| Profile | Default | Meant for |
 | :--- | :--- | :--- |
 | `explorer` | `light` | Searching and returning information, not reasoning about solutions. |
-| `worker` | `medium` | Implementation within the assigned scope. |
+| `worker` | `claude-opus-5-5` at `xhigh` | Implementation within the assigned scope. |
 | `critic` | `heavy` | Reviewing the current diff. |
 | `crazy` | `heavy` | Extremely hard tasks and deep research. Supply the relevant context, references, constraints, and a focused question. |
 
@@ -38,13 +38,21 @@ The effort comes from `reasoningEffort` in the call when it is set. An effort th
 
 A user or project agent sets its default with a `tier: light`, `tier: medium`, or `tier: heavy` line in its frontmatter. Any other value is ignored and the agent still loads. A profile `model` is more specific than its tier and wins over it.
 
+### Profile model and effort
+
+A profile pins its model with `model` in its frontmatter, and the effort that goes with it with `effort`: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. The child starts at that effort, moved to the nearest level the model supports, unless the call passes `reasoningEffort`, which wins and is rejected when the model does not support it. Without `effort` the child inherits the main agent's effort. An invalid `effort` is ignored and the agent still loads, and `effort` has no effect without `model`.
+
+A profile `model` resolves on the current account. When the account does not serve it, a broker pool that does serves it instead, a family pool such as `pool:claude` before `pool:all`; only when no pool serves it either is the model unknown. A model chosen in the call never falls back this way.
+
+The bundled `worker` is the example: `model: claude-opus-5-5` and `effort: xhigh`, with no tier. It runs on that model at that effort whatever the main agent runs on, so a ChatGPT account uses a Claude pool for its workers. It is never rated by the [tier classifier](#tier-classifier), because a profile that pins a model is not rated. On an account that has no Claude models and no Claude pool, `worker` fails as an unknown model; pass `model` or `tier` in the call, or override `worker` with a user or project profile.
+
 The mapping is the source file `src/extensions/subagent/model-tiers.json` of the coding agent package: a list of `{ "provider", "tier", "alias", "effort" }` rows. `alias` names a row of `model-aliases.json` for the same `provider`. The rows of a tier are tried in file order, and the first whose model the account serves wins. The file is compiled into the build, so a change needs a rebuild. Only `anthropic` and `openai` have rows; accounts of other vendors inherit the main agent's model until rows are added.
 
 Use `search_models` to see which models an account serves, or to choose a model explicitly.
 
 ### Tier classifier
 
-A profile's tier is a fixed guess. The `worker` profile is `medium`, so a one-line rename and a redesign of the cache both run on the `medium` model unless the main agent notices the difference and passes `tier`. The tier classifier lets the harness notice instead: before a subagent is dispatched, a cheap model rates the task as `light`, `medium` or `heavy`, and the rated tier can replace the profile's tier. It is on by default and works on every setup: it uses a classifier model when one is available, and otherwise asks the light-tier chat model of the current account, which can also rate a reasoning effort.
+A profile's tier is a fixed guess. The `critic` profile is `heavy`, so a review of a one-line rename and a review of a cache redesign both run on the `heavy` model unless the main agent notices the difference and passes `tier`. The tier classifier lets the harness notice instead: before a subagent is dispatched, a cheap model rates the task as `light`, `medium` or `heavy`, and the rated tier can replace the profile's tier. It is on by default and works on every setup: it uses a classifier model when one is available, and otherwise asks the light-tier chat model of the current account, which can also rate a reasoning effort.
 
 Set `subagents.tierClassifier` in [settings](settings.md#subagents):
 
@@ -56,11 +64,11 @@ Set `subagents.tierClassifier` in [settings](settings.md#subagents):
 
 **Two backends.** The *decision* backend asks a classifier model one score question and reads the probability of each level; it rates the tier only. The *chat* backend asks a chat model for a tier and a reasoning effort as one JSON object, `{"model": "heavy", "effort": "xhigh"}`. The decision backend is used whenever a classifier model is available. The chat backend is used only when the mode is not `off` and no classifier model is available, which is the case for a setup with neither an OpenAI API key account nor a Jev key. One task is never rated by both.
 
-**When it runs.** For each task, only when all of these hold: the mode is not `off`; the call passed neither `model` nor `tier` for the task, on the task or at the top level; and the agent profile does not pin a `model`. A task with its own `model` or `tier`, or a profile with a `model`, is never rated. A profile without a tier is rated like any other, and in `apply` mode the rated tier takes the place of "inherit the main agent's model". With `subagent`, the items of `tasks` and `chain` are rated at the same time, after any project agent approval and before the first one starts. A `chain` step is rated before its predecessors have run, so its `{previous}` placeholder is still in the task text. `assign_tasks` rates each task of the call on its own, so two tasks of one call can run at different tiers; a `model` or `tier` on the `assign_tasks` call, or `--planning-model`, applies to every task of the call and skips the rating.
+**When it runs.** For each task, only when all of these hold: the mode is not `off`; the call passed neither `model` nor `tier` for the task, on the task or at the top level; and the agent profile does not pin a `model`. A task with its own `model` or `tier`, or a profile with a `model`, is never rated; it is recorded as skipped (see **What is recorded** below). The bundled `worker` pins a model, so no worker is rated. A `model`, `tier` or `reasoningEffort` sent as an empty or blank string counts as not passed: some models fill every optional field and send `""` when they make no choice, so such a call is rated like one that left the field out. A profile without a tier is rated like any other, and in `apply` mode the rated tier takes the place of "inherit the main agent's model". With `subagent`, the items of `tasks` and `chain` are rated at the same time, after any project agent approval and before the first one starts. A `chain` step is rated before its predecessors have run, so its `{previous}` placeholder is still in the task text. `assign_tasks` always launches the bundled `worker`, which pins a model, so its tasks are not rated.
 
-**Which classifier.** The classifier models available to the session, with working credentials (see [classifier models](models.md#use-classifier-models)). `gpt-6-luna` is preferred, then a model whose ID contains `jev`, then the first other model. There is no setting for this. With none available, the chat backend rates instead.
+**Which classifier.** The classifier models available to the session, with working credentials (see [classifier models](models.md#use-classifier-models)). A model whose ID contains `jev` is preferred, then `gpt-6-luna`, then the first other model. A Jev account (`/accounts add jev`, see [Jev (TypeSafe) accounts](accounts.md#jev-typesafe-accounts)) therefore rates tasks first, and `gpt-6-luna` from an OpenAI API key is used when no Jev account is available. There is no setting for this. With none available, the chat backend rates instead.
 
-**Which chat model.** The light-tier model of the current serving account, found the way a `tier` is (see [Model tiers](#model-tiers)): `haiku` on a Claude account and `luna` on a ChatGPT account. It is asked for the lowest reasoning level it supports and for at most 100 output tokens. It starts no subagent, and its own request is not rated. If the account has no light-tier row, or a pool's serving account is not known yet, nothing is rated: no request is sent, nothing is recorded, and the profile's tier applies.
+**Which chat model.** The light-tier model of the current serving account, found the way a `tier` is (see [Model tiers](#model-tiers)): `haiku` on a Claude account and `luna` on a ChatGPT account. It is asked for the lowest reasoning level it supports and for at most 100 output tokens. It starts no subagent, and its own request is not rated. If the account has no light-tier row, or a pool's serving account is not known yet, nothing is rated: no request is sent, each task is recorded as skipped with reason `no-rater`, and the profile's tier applies.
 
 **The question.** The decision backend asks one `score` question, "How demanding is `task`?", with three levels in this order. The wording is the `tierLevels` list at the top of `src/extensions/subagent/tier-classifier.ts`, and a person should review it:
 
@@ -105,13 +113,19 @@ The chat backend's answer has no probability, so the 0.7 threshold does not appl
 - `model` is `light`, `medium`, `heavy` or `default`. A tier replaces the profile's tier like the decision backend's tier. `default` keeps the profile's tier.
 - `effort` is `low`, `medium`, `high`, `xhigh` or `default`. An effort replaces the effort of the tier row that selects the child's model, moved to the nearest level the model supports; it is never rejected. `default` keeps the row's effort. The effort applies only when a tier row selects the model, which is the profile's tier or the rated tier. A profile without a tier and without a rated tier inherits the main agent's model and effort as before, and the rated effort is not used. It never applies when the call passed `reasoningEffort`, which still wins and is still rejected when the model does not support it.
 
-For example, the `worker` profile is `medium`. The answer `{"model": "default", "effort": "low"}` starts it on the `medium` model at `low` instead of `xhigh`. The answer `{"model": "heavy", "effort": "default"}` starts it on the `heavy` model at that row's `xhigh`. With `reasoningEffort: "high"` in the call, both start at `high`. The decision backend rates no effort, so it never changes one.
+For example, take a profile with `tier: medium`. The answer `{"model": "default", "effort": "low"}` starts it on the `medium` model at `low` instead of `xhigh`. The answer `{"model": "heavy", "effort": "default"}` starts it on the `heavy` model at that row's `xhigh`. With `reasoningEffort: "high"` in the call, both start at `high`. The decision backend rates no effort, so it never changes one.
 
 **Reading the reply.** A model's output is untrusted input. The first JSON object in the reply is taken, so surrounding prose or a code fence is fine, and only the values listed above are accepted, in lower case. A missing field, another value or no object is a failed rating with reason `malformed`.
 
 **Fallbacks.** The classifier never blocks or fails a dispatch. The decision backend has one deadline of three seconds, combined with the tool call's abort signal, covering the lookup of the classifier and all the ratings of a call, which run concurrently. A lookup that fails or runs into that deadline counts as no classifier, and the chat backend then runs, with its own deadline of five seconds, combined with the abort signal, for all the chat ratings of the call. A timeout, an error result, a rejected call, an aborted call and a missing or malformed answer all dispatch with the profile's tier and the tier row's effort; so does an answer without per-level probabilities. `gpt-6-luna`, Jev on TypeSafe's API, and chat models served through the `llama-cpp-classify` adapter (see [llama.cpp](llama-cpp.md#classification)) report per-level probabilities. A System One service that leaves them out is recorded as `no-level-probabilities` and nothing is applied.
 
-**What is recorded.** Every rating and every failure is appended to the session as a custom entry of type `subagent-tier-classification`. It is not sent to any model. The entry holds the `backend` (`decision` or `chat`), the task's agent name, the profile's tier, the `provider/id` of the model that rated (a classifier model or the chat model, in `classifier`), the latency in milliseconds and the usage that model reported, and either:
+**What is recorded.** Unless the mode is `off`, every rating, every failure and every skipped task is appended to the session as a custom entry of type `subagent-tier-classification`, so a task without a rating always has a recorded reason. It is not sent to any model. Every entry holds the `mode`, the task's agent name in `agent` and the profile's tier in `profileTier`. A skipped task's entry holds only these and `outcome: "skipped"` with a `reason`:
+
+- `caller-model` or `caller-tier`: the call passed a `model` or `tier` for the task, or `--planning-model` set the model of an `assign_tasks` call;
+- `profile-model`: the agent profile pins a `model`;
+- `no-rater`: no classifier model was available and the account has no light-tier chat model, or a pool's serving account is not known yet.
+
+The entry of a rated task also holds the `backend` (`decision` or `chat`), the `provider/id` of the model that rated (a classifier model or the chat model, in `classifier`), the latency in milliseconds and the usage that model reported, and either:
 
 - `outcome: "classified"` from the decision backend, with `tier`, the three level `probabilities`, the averaged `score`, and `applied`, whether the rated tier replaced the profile's tier;
 - `outcome: "classified"` from the chat backend, with `tier` and `effort` as the model answered them, `default` included, and `applied`, an object `{ tier, effort }` that says which of the two were handed to the dispatch. The dispatch still applies its own rules to them, so a rated effort does not override `reasoningEffort`; or
@@ -123,7 +137,7 @@ To compare the rating with the tier that was used, read the entries of a session
 
 ```bash
 jq -c 'select(.type == "custom" and .customType == "subagent-tier-classification")
-  | .data | {backend, agent, used: .profileTier, rated: .tier, effort, probabilities, reason}' session.jsonl
+  | .data | {outcome, backend, agent, used: .profileTier, rated: .tier, effort, probabilities, reason}' session.jsonl
 ```
 
 Rows where `rated` is `heavy` and `used` is `light` or `medium` are the tasks the rating would have moved up. Count how often the two agree and, for the decision backend, how often the rated level had a probability of at least 0.7 before switching to `apply`.
@@ -162,7 +176,7 @@ For example, a context listing might contain:
 
 `turn: 2` includes the documentation milestone; `turn: 4` also includes the API result and the documentation task completed by the main agent. A successful planning worker completes its task immediately. Later orders become ready when all earlier tasks are done. The result checkpoint records what the worker reported.
 
-Omitting reasoning effort uses the tier's effort when a tier selected the model, and otherwise inherits the main agent's setting, adjusted to the selected model's supported levels. An explicitly unsupported effort is rejected. By default, broker workers use the account serving the parent. Selecting another model on the same pool still pins that account. An explicit different provider or account selects that route instead. Unknown parent affinity or a model unavailable on the parent account produces an error rather than silently choosing another account.
+Omitting reasoning effort uses the tier's effort when a tier selected the model, the profile's `effort` when its `model` did, and otherwise inherits the main agent's setting, adjusted to the selected model's supported levels. An explicitly unsupported effort is rejected. By default, broker workers use the account serving the parent. Selecting another model on the same pool still pins that account. When an API key account served a pool parent, which happens when the subscriptions were rate limited or failed, workers use the pool instead: the broker tries subscriptions first, and a worker pinned to the API key would stay on it and bill API prices. A subscription account that served the parent stays pinned, which keeps its prompt cache shared. An explicit different provider or account selects that route instead. Unknown parent affinity or a model unavailable on the parent account produces an error rather than silently choosing another account.
 
 ```json
 {
@@ -181,7 +195,7 @@ The model value above is a [family alias](#model-aliases). It resolves to the ne
 
 `search_models`, the worker coordination tools (`list_agents`, `send_agent_message`, `interrupt_agent`, `continue_agent`, `steer_agent`, `change_agent_model`), `get_subagent_context`, and `checkpoint_context` are active and callable from the start, but the main agent's requests leave their declarations out until its first `subagent`, `assign_tasks`, or `assign_task` call on the branch. That call, even a failed one, declares them from the next model call and lists them in its result. Workers declare their messaging tools from the start.
 
-Call `search_models` when choosing a subagent model. It searches the same configured chat-model scope used by dispatch: the current serving account for a pool (for `pool:claude` and `pool:all`, the account that answered last), or the pinned account or provider otherwise. Discovery is on demand; model catalogs are not added to the system prompt or refreshed through per-turn hooks.
+Call `search_models` when choosing a subagent model. It searches the same configured chat-model scope used by dispatch: the current serving account for a pool (for `pool:claude` and `pool:all`, the subscription account that answered last, or the pool itself when an API key account did), or the pinned account or provider otherwise. Discovery is on demand; model catalogs are not added to the system prompt or refreshed through per-turn hooks.
 
 `search_models({})` returns a compact, cost-ranked shortlist of five models. Each compact model has an exact `provider/model` `id`, `reasoningEfforts`, `contextWindow`, and `cost` with `input`, `output`, and `cacheRead` rates. Costs are USD per million tokens. A zero input and output cost sorts after known prices because zero may mean unknown, not free. Cost is only a price signal, not a capability guarantee; prefer economical models for bounded work, then judge suitability from the task.
 
@@ -292,7 +306,7 @@ Every subagent uses its own agent file body as its system prompt, followed by th
 
 A fresh worker's initial user message contains only its task. With a selected conversation cutoff, its first text block contains a stripped reference conversation and its second block contains the task. Stripping removes system messages, thinking, failed provider attempts, and worker reports of provider failures such as exhausted credits or capacity errors. It preserves user messages, assistant text, ordinary tool and command failures, and worker execution failures. Tool calls retain their names and bounded arguments. Each retained tool output keeps its first 200 characters with the number of omitted characters. The wrapper is `<parent_conversation note="The main agent's conversation, given for reference. Tool outputs are shortened.">`. The same history produces identical text.
 
-New planned workers use the bundled `worker` system prompt and its `medium` tier; `assign_tasks` accepts `model`, `tier`, and `reasoningEffort` for the whole batch. Assignments to existing workers preserve their original profile, tools, model, and conversation. Each assignment notification contains the objective, task details, and completed results from earlier orders. The full plan is included on its first delivery to a worker and again when its definition changes. A selected reference conversation precedes a new worker's assignment. Later assignments and continuations append prompts to the retained conversation.
+New planned workers use the bundled `worker` system prompt and its pinned model and effort; `assign_tasks` accepts `model`, `tier`, and `reasoningEffort` for the whole batch. Assignments to existing workers preserve their original profile, tools, model, and conversation. Each assignment notification contains the objective, task details, and completed results from earlier orders. The full plan is included on its first delivery to a worker and again when its definition changes. A selected reference conversation precedes a new worker's assignment. Later assignments and continuations append prompts to the retained conversation.
 
 Workers share the working directory with the main agent. Define task scope in descriptions and coordinate edits when delegating implementation. Use the [planning tools](planning.md) when work needs ordered phases or revisions. The general subagent tool reports results without changing planning task states.
 

@@ -73,12 +73,10 @@ export function isCacheWarmingReplayable(model: Model<Api>, options: SimpleStrea
 
 /**
  * The options of a refresh: the request's own, capped at one output token, without retries, and without replacing the
- * conversation's provider thread state (the refresh repeats the last request). Anthropic subscription requests read
- * `prewarm` and refresh the cache with `max_tokens: 0`, which bills no output; every other request generates the one
- * token.
+ * conversation's provider thread state (the refresh repeats the last request).
  */
 export function getCacheWarmingRequestOptions<T extends SimpleStreamOptions>(options: T, signal: AbortSignal): T {
-	return { ...options, maxTokens: 1, disableContinuation: true, prewarm: true, maxRetries: 0, signal };
+	return { ...options, maxTokens: 1, disableContinuation: true, maxRetries: 0, signal };
 }
 
 /** Decide whether refreshing the cache entry of a `promptTokens`-token request pays for itself in `phase`. */

@@ -2,7 +2,6 @@ import type { TelemetrySpan } from "@earendil-works/pi-telemetry";
 import type { AnthropicOptions } from "./api/anthropic-messages.ts";
 import type { AzureOpenAIResponsesOptions } from "./api/azure-openai-responses.ts";
 import type { BedrockOptions } from "./api/bedrock-converse-stream.ts";
-import type { AnthropicSlowModeHooks } from "./api/claude-subscription/slow-mode.ts";
 import type { GoogleOptions } from "./api/google-generative-ai.ts";
 import type { GoogleVertexOptions } from "./api/google-vertex.ts";
 import type { MistralOptions } from "./api/mistral-conversations.ts";
@@ -264,23 +263,6 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * state ignore it.
 	 */
 	disableContinuation?: boolean;
-	/**
-	 * Refresh the prompt cache without generating (Anthropic subscription requests only). The provider builds
-	 * the request exactly as it otherwise would, then sends it non-streaming with `max_tokens: 0`: the endpoint
-	 * reads the prompt, refreshes the cache at its breakpoints and returns usage with no output billed. The stream
-	 * emits `start` then `done` with empty content, stop reason `length` and that usage. A request the endpoint
-	 * rejects with `max_tokens: 0` (budget thinking, a forced `tool_choice`) is sent normally instead. Other
-	 * providers ignore the flag and generate normally, so callers also cap `maxTokens`.
-	 */
-	prewarm?: boolean;
-	/**
-	 * Slow mode of Anthropic subscription requests (Claude Code's `/low-priority`), off unless set. The caller owns
-	 * the state machine: while `isActive` says so the request carries `anthropic-usage-limit: slow`, `observe` hears
-	 * the slow-lane headers of each successful response, and `onFailure` decides whether a failure before any content
-	 * is retried, and after what capacity wait. Consulted only for requests to Anthropic's own API with a
-	 * subscription token; other providers and requests ignore it.
-	 */
-	anthropicSlowMode?: AnthropicSlowModeHooks;
 	/**
 	 * WebSocket connect timeout in milliseconds for providers that support
 	 * WebSocket transports. This covers the connection/open handshake only;

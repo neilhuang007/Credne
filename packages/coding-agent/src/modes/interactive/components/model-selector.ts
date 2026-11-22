@@ -166,11 +166,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private loadModelsFromSnapshot(): void {
-		const models = getModelSelectionChoices(this.modelRuntime.getAvailableSnapshot()).map((model) => ({
-			provider: model.provider,
-			id: model.id,
-			model,
-		}));
+		const models = getModelSelectionChoices(
+			this.modelRuntime.getAvailableSnapshot(),
+			this.currentModel?.provider,
+		).map((model) => ({ provider: model.provider, id: model.id, model }));
 		this.allModels = this.sortModels(models);
 		this.scopedModels = this.scopedModels.map((scoped) => {
 			const refreshed = this.modelRuntime.getModel(scoped.model.provider, scoped.model.id);

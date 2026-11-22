@@ -27,7 +27,6 @@ import type {
 	ApiStreamOptions,
 	AssistantImages,
 	AssistantMessage,
-	AssistantMessageEvent,
 	AssistantMessageEventStream,
 	ClassifierApi,
 	ClassifierContext,
@@ -57,7 +56,6 @@ import type {
 	Usage,
 } from "./types.ts";
 import { operationSignal, raceWithAbortSignal } from "./utils/abort.ts";
-import { getProviderHttpErrorDetails } from "./utils/diagnostics.ts";
 import { type ClientIdentity, getOpenCodeSessionHeaders, mergeClientIdentity } from "./utils/identity.ts";
 import {
 	assertChatModel,
@@ -889,20 +887,15 @@ class ModelsImpl implements MutableModels {
 	>(
 		model: TModel,
 		options: TOptions | undefined,
-		/** The access token the provider rejected; its stored OAuth credential is refreshed. */
-		rejectedAccessToken?: string,
 	): Promise<{
 		requestModel: TModel;
 		requestOptions: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
-		/** Where the credential came from, as `AuthResult.source` says. */
-		credentialSource: AuthResult["source"];
 	}> {
 		this.requireProvider(model);
 		const resolution = await this.getAuth(model, {
 			apiKey: options?.apiKey,
 			env: options?.env,
 			signal: options?.signal,
-			rejectedAccessToken,
 		});
 		if (!resolution) {
 			throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
@@ -930,71 +923,7 @@ class ModelsImpl implements MutableModels {
 			...(identity === undefined ? {} : { identity }),
 		} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 
-		return { requestModel, requestOptions, credentialSource: resolution.source };
-	}
-
-	/**
-	 * Runs one chat request with `start`. When the provider rejects a stored OAuth credential (HTTP 401 or 403) before
-	 * the reply began, the credential is refreshed once and the request runs again with the new token. A caller's own
-	 * `apiKey`, a rejection after the reply began, and a refresh that yields the same token fail as they did.
-	 */
-	private async *streamWithAuthRecovery<
-		TModel extends AnyModel,
-		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
-	>(
-		model: TModel,
-		options: TOptions | undefined,
-		start: (
-			requestModel: TModel,
-			requestOptions: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
-		) => AsyncIterable<AssistantMessageEvent>,
-	): AsyncGenerator<AssistantMessageEvent> {
-		const first = await this.applyAuth(model, options);
-		let rejection: AssistantMessageEvent | undefined;
-		const held: AssistantMessageEvent[] = [];
-		let began = false;
-		for await (const event of start(first.requestModel, first.requestOptions)) {
-			if (began) {
-				yield event;
-				continue;
-			}
-			if (event.type === "start") {
-				held.push(event);
-				continue;
-			}
-			if (event.type === "error" && isAuthRejection(event.error) && canRefreshAfterRejection(options, first)) {
-				rejection = event;
-				break;
-			}
-			began = true;
-			yield* held;
-			yield event;
-		}
-		if (!rejection) {
-			if (!began) yield* held;
-			return;
-		}
-		const retry = await this.reapplyAuthAfterRejection(model, options, first.requestOptions.apiKey);
-		if (!retry) {
-			yield rejection;
-			return;
-		}
-		yield* start(retry.requestModel, retry.requestOptions);
-	}
-
-	/** The request as it should run after a 401 or 403, or undefined when refreshing yields no new token. */
-	private async reapplyAuthAfterRejection<
-		TModel extends AnyModel,
-		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
-	>(model: TModel, options: TOptions | undefined, rejectedAccessToken: string | undefined) {
-		if (options?.signal?.aborted || rejectedAccessToken === undefined) return undefined;
-		try {
-			const retry = await this.applyAuth(model, options, rejectedAccessToken);
-			return retry.requestOptions.apiKey === rejectedAccessToken ? undefined : retry;
-		} catch {
-			// The refresh failed; the rejection itself is the better report.
-			return undefined;
-		}
+		return { requestModel, requestOptions };
 	}
 
 	stream<TApi extends Api>(
@@ -1007,12 +936,11 @@ class ModelsImpl implements MutableModels {
 			model,
 			async () => {
 				const provider = this.requireChatProvider(model);
-				return this.streamWithAuthRecovery(
+				const { requestModel, requestOptions } = await this.applyAuth(
 					model,
 					options as ModelsApiStreamOptions<Api> | undefined,
-					(requestModel, requestOptions) =>
-						provider.stream(requestModel, transcript, requestOptions as ApiStreamOptions<TApi>),
 				);
+				return provider.stream(requestModel, transcript, requestOptions as ApiStreamOptions<TApi>);
 			},
 			observeModelRequest(model, options, false),
 			options?.signal,
@@ -1033,9 +961,8 @@ class ModelsImpl implements MutableModels {
 			model,
 			async () => {
 				const provider = this.requireChatProvider(model);
-				return this.streamWithAuthRecovery(model, options, (requestModel, requestOptions) =>
-					provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions),
-				);
+				const { requestModel, requestOptions } = await this.applyAuth(model, options);
+				return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
 			},
 			observeModelRequest(model, options, false),
 			options?.signal,
@@ -1127,20 +1054,6 @@ class ModelsImpl implements MutableModels {
 			return classifierErrorResult(model, error, options?.signal?.aborted);
 		}
 	}
-}
-
-/** Whether a failed reply says the provider rejected the credential: HTTP 401 or 403. */
-function isAuthRejection(message: AssistantMessage): boolean {
-	const status = getProviderHttpErrorDetails(message)?.status;
-	return status === 401 || status === 403;
-}
-
-/** Only a stored OAuth credential can be refreshed; an `apiKey` the caller passed is the caller's to replace. */
-function canRefreshAfterRejection(
-	options: { apiKey?: string } | undefined,
-	attempt: { credentialSource: AuthResult["source"] },
-): boolean {
-	return options?.apiKey === undefined && attempt.credentialSource === "OAuth";
 }
 
 export function createModels(options?: CreateModelsOptions): MutableModels {

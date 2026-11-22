@@ -6,6 +6,7 @@ import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { type BrokerHandle, startBroker } from "../src/service.ts";
 import { array, object } from "../src/wire.ts";
+import { piBody, piEvents, piText } from "./fixtures.ts";
 
 async function fixture(upstream: (request: Request) => Promise<Response> | Response) {
 	const home = await mkdtemp(join(tmpdir(), "credne-providers-"));
@@ -74,6 +75,8 @@ test("provider discovery exposes only enrollable chat methods and requires the b
 		expect(byId.get("deepseek")).toEqual(["api-key"]);
 		expect(byId.get("openrouter")).toEqual(["api-key"]);
 		expect(byId.get("xai-oauth")).toEqual(["oauth"]);
+		// TypeSafe's models are classifiers, not chat models, yet its key is enrollable.
+		expect(providers).toContainEqual({ id: "typesafe", name: "TypeSafe", authMethods: ["api-key"] });
 		for (const id of [
 			"amazon-bedrock",
 			"azure",
@@ -127,6 +130,9 @@ test("OMP key enrollment validates via its own declared probe and keeps catalog 
 		const reference = getBundledModel("deepseek", String(models[0].id));
 		expect(models[0]).toMatchObject({
 			kind: "chat",
+			// The identity OMP resolves the model to, for callers that replay history under it.
+			provider: reference.provider,
+			api: reference.api,
 			displayName: reference.name,
 			inputModalities: reference.input,
 			maxCompletionTokens: reference.maxTokens,
@@ -176,14 +182,18 @@ test("Google model discovery and inference use different OMP-owned auth placemen
 		const models = array(object(await (await f.request(`/accounts/${account.key}/models`)).json()).models);
 		expect(models.map((model) => object(model).id)).toEqual([id]);
 		const reply = await f.request(
-			"/route/p.google/chat/completions",
-			{ model: id, max_tokens: 25, messages: [{ role: "user", content: "hello Google" }] },
+			"/route/p.google/pi/stream",
+			JSON.parse(
+				piBody(`google/${id}`, "google-session", {
+					context: { messages: [{ role: "user", content: "hello Google", timestamp: 1 }] },
+				}),
+			),
 			"POST",
 			{ "x-goog-api-key": "caller-key-must-not-be-used", cookie: "private-cookie" },
 		);
 		expect(reply.status).toBe(200);
 		expect(reply.headers.get("x-credne-account")).toBe(String(account.key));
-		expect(await reply.text()).toContain("Hello from OMP.");
+		expect(piText(await piEvents(reply))).toBe("Hello from OMP.");
 		expect(sent).toBe(1);
 	} finally {
 		await f.close();
@@ -278,9 +288,12 @@ test("OMP device login polls privately and the saved token serves a pinned reque
 			expect(output).not.toMatch(/private-device-code|TEST-123|private-refresh-token/);
 		}
 		await f.restart();
-		const route = await f.request(`/route/a.${object(status.account).key}/responses`, { model, input: "Hello" });
+		const route = await f.request(
+			`/route/a.${object(status.account).key}/pi/stream`,
+			JSON.parse(piBody(model, "grok-session")),
+		);
 		expect(route.status).toBe(200);
-		expect(await route.text()).toContain("Grok fixture reply");
+		expect(piText(await piEvents(route))).toBe("Grok fixture reply");
 	} finally {
 		release.resolve();
 		await f.close();

@@ -92,9 +92,15 @@ describe("planned worker request layout", () => {
 			harnesses.push(parent);
 			await parent.session.bindExtensions({});
 			parent.setResponses([
-				fauxAssistantMessage(fauxToolCall("assign_tasks", { revision: plan.revision, taskIds: [task.id] }), {
-					stopReason: "toolUse",
-				}),
+				// The bundled worker pins a Claude model that the faux provider does not serve, so the call names one it does.
+				fauxAssistantMessage(
+					fauxToolCall("assign_tasks", {
+						revision: plan.revision,
+						taskIds: [task.id],
+						model: parent.getModel().id,
+					}),
+					{ stopReason: "toolUse" },
+				),
 				fauxAssistantMessage("assigned"),
 			]);
 			await parent.session.prompt("Assign the API task.");

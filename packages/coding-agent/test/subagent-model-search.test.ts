@@ -98,7 +98,7 @@ function registerSearch(parent: Model<Api>, models: Model<Api>[]) {
 	registerModelSearch(pi, dispatch);
 	if (!tool) throw new Error("search_models was not registered");
 	const ctx = createContext(parent, models);
-	return { tool, ctx, hooks };
+	return { tool, ctx, hooks, dispatch };
 }
 
 async function search(registered: ReturnType<typeof registerSearch>, params: Record<string, unknown> = {}) {
@@ -130,7 +130,7 @@ async function establishPoolAccount(registered: ReturnType<typeof registerSearch
 beforeEach(() => {
 	agentDir = mkdtempSync(join(tmpdir(), "pi-model-search-"));
 	mkdirSync(join(agentDir, "accounts"), { recursive: true });
-	writeFileSync(join(agentDir, "accounts", "catalog.json"), JSON.stringify({ version: 2, accounts: [], pools: [] }));
+	writeFileSync(join(agentDir, "accounts", "catalog.json"), JSON.stringify({ version: 3, accounts: [], pools: [] }));
 	vi.stubEnv(ENV_AGENT_DIR, agentDir);
 });
 
@@ -300,27 +300,61 @@ describe("search_models", () => {
 		expect(explicitResult.models.map((entry) => entry.id)).toEqual(["other-provider/explicit-model"]);
 	});
 
-	it.each(["codex", "claude", "all"])("uses the account reported by the broker for pool:%s", async (pool) => {
-		const serving = model("served-model", { provider: "acct:serving-account" });
-		const poolModel = model("served-model", { provider: `pool:${pool}` });
+	function writeServingAccount(kind: "oauth" | "api-key"): void {
 		writeFileSync(
 			join(agentDir, "accounts", "catalog.json"),
 			JSON.stringify({
-				version: 2,
-				accounts: [{ id: "serving-account", key: "serving-key", provider: "codex", disabled: false, models: [] }],
+				version: 3,
+				accounts: [
+					{ id: "serving-account", key: "serving-key", provider: "codex", kind, disabled: false, models: [] },
+				],
 				pools: [],
 			}),
 		);
-		const registered = registerSearch(poolModel, [poolModel, serving]);
-		await establishPoolAccount(registered, "serving-key");
+	}
 
-		const current = output(await search(registered));
-		expect(current.provider).toBe("acct:serving-account");
-		expect(current.models.map((entry) => entry.id)).toEqual(["acct:serving-account/served-model"]);
+	it.each(["codex", "claude", "all"])(
+		"uses the subscription account reported by the broker for pool:%s",
+		async (pool) => {
+			const serving = model("served-model", { provider: "acct:serving-account" });
+			const poolModel = model("served-model", { provider: `pool:${pool}` });
+			writeServingAccount("oauth");
+			const registered = registerSearch(poolModel, [poolModel, serving]);
+			await establishPoolAccount(registered, "serving-key");
 
-		const unknown = registerSearch(poolModel, [poolModel, serving]);
+			const current = output(await search(registered));
+			expect(current.provider).toBe("acct:serving-account");
+			expect(current.models.map((entry) => entry.id)).toEqual(["acct:serving-account/served-model"]);
+			expect(registered.dispatch.resolve({}, registered.ctx).model).toBe("acct:serving-account/served-model");
+
+			const unknown = registerSearch(poolModel, [poolModel, serving]);
+			await expect(search(unknown)).rejects.toThrow(/serving account is unknown/i);
+			const explicit = output(await search(unknown, { provider: "acct:serving-account" }));
+			expect(explicit.provider).toBe("acct:serving-account");
+		},
+	);
+
+	it.each(["codex", "claude", "all"])(
+		"keeps children on pool:%s when an API key account served the parent, so the broker prefers subscriptions",
+		async (pool) => {
+			const serving = model("served-model", { provider: "acct:serving-account" });
+			const poolModel = model("served-model", { provider: `pool:${pool}` });
+			writeServingAccount("api-key");
+			const registered = registerSearch(poolModel, [poolModel, serving]);
+			await establishPoolAccount(registered, "serving-key");
+
+			const current = output(await search(registered));
+			expect(current.provider).toBe(`pool:${pool}`);
+			expect(current.models.map((entry) => entry.id)).toEqual([`pool:${pool}/served-model`]);
+			expect(registered.dispatch.resolve({}, registered.ctx).model).toBe(`pool:${pool}/served-model`);
+		},
+	);
+
+	it("still fails closed for an API key pool parent whose serving account is unknown", async () => {
+		const poolModel = model("served-model", { provider: "pool:claude" });
+		writeServingAccount("api-key");
+		const unknown = registerSearch(poolModel, [poolModel]);
+
 		await expect(search(unknown)).rejects.toThrow(/serving account is unknown/i);
-		const explicit = output(await search(unknown, { provider: "acct:serving-account" }));
-		expect(explicit.provider).toBe("acct:serving-account");
 	});
 });

@@ -6,7 +6,7 @@ import { MAIN_AGENT_PROMPT } from "../../core/main-agent-prompt.ts";
 import { truncateHead } from "../../core/tools/truncate.ts";
 import { type AgentConfig, discoverBundledAgents } from "../subagent/agents.ts";
 import { captureSubagentContext, listSubagentContext, turnSchema } from "../subagent/context.ts";
-import { createSubagentDispatch, reasoningEffortSchema } from "../subagent/dispatch.ts";
+import { createSubagentDispatch, dropBlankSelections, reasoningEffortSchema } from "../subagent/dispatch.ts";
 import { type ModelTier, modelTierSchema } from "../subagent/model-tiers.ts";
 import { type DispatchDefaults, getFinalOutput, type SingleResult } from "../subagent/runner.ts";
 import { type AssignmentInput, getWorkerTeam, revealTools, type WorkerTeam } from "../subagent/team.ts";
@@ -501,6 +501,8 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			reasoningEffort: Type.Optional(reasoningEffortSchema),
 			turn: Type.Optional(turnSchema),
 		}),
+		// A blank model also lets --planning-model apply, as an omitted one does.
+		prepareArguments: dropBlankSelections,
 		executionMode: "sequential",
 		async execute(_id, args, signal, _update, ctx) {
 			const current = requirePlan(args.revision);

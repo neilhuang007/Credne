@@ -3,7 +3,9 @@ import { chmod, mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/
 import { join } from "node:path";
 import { type Api, type AuthCredential, AuthStorage, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { fetchTypeSafeModels } from "@oh-my-pi/pi-catalog/discovery/typesafe";
 import { getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
+import type { ProviderDescriptor } from "@oh-my-pi/pi-catalog/provider-models";
 import { loadBrokerConfig } from "./config.ts";
 import { accountProvider, brokerProvider, unsupportedEnrollment, validateProviderKey } from "./providers.ts";
 import { array, object, stringArray, text, type WireObject } from "./wire.ts";
@@ -37,6 +39,8 @@ export interface Account {
 	provider: string;
 	family: string;
 	models: Model<Api>[];
+	/** What System One may ask this account: TypeSafe's Jev models, or OpenAI's GPT-6 Luna Decisions judge. */
+	judges: Model<Api>[];
 	cooldown: number;
 	lastStatus?: number;
 }
@@ -44,6 +48,7 @@ export interface AccountOptions {
 	home: string;
 	anthropicBaseUrl: string;
 	openaiBaseUrl: string;
+	typesafeBaseUrl: string;
 }
 
 export async function atomicJson(path: string, value: unknown): Promise<void> {
@@ -120,14 +125,38 @@ export function publicAccount(account: Account): Record<string, unknown> {
 		modelCount: account.models.length,
 	};
 }
+/** TypeSafe accounts answer System One classifier requests only; they never serve chat. */
+export const classifierAccount = (account: Account): boolean => account.provider === "typesafe";
+
+/** Statuses that bench an account until the provider's retry hint expires. */
+export const cooldownStatuses: readonly number[] = [429, 402, 503];
+
+/** Records a failed provider response and, for a cooldown status, benches the account until its retry hint. */
+export function recordFailure(account: Account, status: number, retryAfter?: string): void {
+	account.lastStatus = status;
+	if (!cooldownStatuses.includes(status)) return;
+	const seconds = Number(retryAfter);
+	const date = Date.parse(retryAfter ?? "");
+	account.cooldown =
+		Number.isFinite(seconds) && seconds > 0
+			? Date.now() + seconds * 1000
+			: Number.isFinite(date)
+				? date
+				: Date.now() + (status === 402 ? 3600000 : 60000);
+}
+
 export function publicModels(account: Account): Record<string, unknown>[] {
 	const knownChat = new Set(brokerProvider(account.provider)?.models.map((model) => model.id));
 	return account.models.map((model) => {
 		const { input, output, cacheRead, cacheWrite } = getEffectiveTokenCost(model.cost);
 		return {
 			id: model.id,
+			// The identity OMP resolves the model to. OMP replays signed thinking only for past assistant turns that
+			// carry it, so callers send history under these values.
+			provider: model.provider,
+			api: model.api,
 			displayName: model.name,
-			kind: knownChat.has(model.id) ? "chat" : undefined,
+			kind: classifierAccount(account) ? "classifier" : knownChat.has(model.id) ? "chat" : undefined,
 			contextLength: model.contextWindow,
 			maxCompletionTokens: model.maxTokens,
 			thinking: !!model.thinking,
@@ -136,6 +165,57 @@ export function publicModels(account: Account): Record<string, unknown>[] {
 			cost: { input, output, cacheRead, cacheWrite },
 		};
 	});
+}
+
+/** A System One model the bundled catalog lacks; it takes images like the bundled Jev rows, and TypeSafe refuses what it cannot read. */
+function typeSafeModel(id: string, baseUrl: string): Model<Api> {
+	return buildModel({
+		id,
+		name: id,
+		api: "typesafe",
+		provider: "typesafe",
+		baseUrl,
+		kind: "judge",
+		reasoning: false,
+		input: ["text", "image"],
+		supportsTools: false,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: null,
+		maxTokens: null,
+	});
+}
+
+const lunaId = "gpt-6-luna";
+
+/**
+ * OpenAI's Decisions API answers System One questions for GPT-6 Luna. OMP's catalog defines that judge as its own
+ * row (`gpt-6-luna-decisions`, wire id `gpt-6-luna`); an OpenAI key that lists the chat model serves it under the
+ * wire id, which is what System One callers name.
+ */
+function openaiJudges(record: AccountRecord, models: Model<Api>[]): Model<Api>[] {
+	const chat = models.find((model) => model.id === lunaId);
+	const judge = getBundledModels("openai").find((model) => model.id === `${lunaId}-decisions`);
+	if (record.provider !== "openai-api" || !chat || !judge) return [];
+	return [{ ...judge, id: lunaId, baseUrl: chat.baseUrl, headers: chat.headers }];
+}
+
+/** The `/v1` root of an Anthropic or OpenAI endpoint, from a base URL given with or without it. */
+function apiRoot(base: string): string {
+	const root = base.replace(/\/+$/, "");
+	return `${root}${root.endsWith("/v1") ? "" : "/v1"}`;
+}
+
+/** The model IDs a key's discovery returned, or the error its HTTP status explains when it returned none. */
+function discoveredIds(models: readonly { id: string }[] | null | undefined, status: number | undefined): string[] {
+	if (!models) {
+		if (status === undefined) throw new HttpError(400, "Key validation failed or timed out.");
+		throw new HttpError(
+			400,
+			status >= 400 ? `Key rejected (HTTP ${status}).` : "Provider returned invalid model data.",
+		);
+	}
+	if (!models.length) throw new HttpError(400, "Key has no accessible models.");
+	return models.map((model) => model.id);
 }
 
 /** Each store contains exactly one account. Provider retries cannot cross this boundary. */
@@ -228,7 +308,6 @@ export class Accounts {
 		if (!upstream?.[record.kind === "oauth" ? "oauth" : "key"])
 			throw new HttpError(400, unsupportedEnrollment(provider, record.kind));
 		const storage = await AuthStorage.create(join(this.options.home, "credentials", `${accountKey(record.id)}.db`), {
-			usageProviderResolver: () => undefined,
 			defaultReservePct: 0,
 		});
 		if (credential) await storage.credentials.set(provider, credential);
@@ -242,6 +321,11 @@ export class Accounts {
 		const known = legacy ? new Map(getBundledModels(provider).map((model) => [model.id, model])) : bundled;
 		const models = [...ids].flatMap((id) => {
 			const base = known.get(id);
+			// TypeSafe serves every model ID its account lists, including IDs the bundled catalog lacks.
+			if (provider === "typesafe") {
+				const baseUrl = this.options.typesafeBaseUrl;
+				return [base ? { ...base, baseUrl } : typeSafeModel(id, baseUrl)];
+			}
 			// Only legacy configurable providers accept custom model IDs; keep known auxiliary APIs intact.
 			if (!base && !legacy) return [];
 			const model: Model<Api> = base
@@ -265,18 +349,21 @@ export class Accounts {
 					});
 			model.provider = provider;
 			model.preferWebsockets = false;
+			// OMP sends a model's headers with its requests; configured routing headers ride on the model.
+			if (record.headers) model.headers = { ...model.headers, ...record.headers };
 			if (record.baseUrl && record.provider === "codex" && record.source === "config") {
 				// Legacy Codex API keys append /responses to the configured base, not /v1/responses.
 				model.baseUrl = record.baseUrl;
 			} else if (legacy && (record.baseUrl || provider === "anthropic" || provider === "openai")) {
-				const baseUrl = (
-					record.baseUrl ?? (provider === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl)
-				).replace(/\/+$/, "");
-				model.baseUrl = `${baseUrl}${baseUrl.endsWith("/v1") ? "" : "/v1"}`;
+				model.baseUrl = apiRoot(
+					record.baseUrl ??
+						(provider === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl),
+				);
 			}
 			return [model];
 		});
-		const account: Account = { record, storage, provider, family, models, cooldown: 0 };
+		const judges = provider === "typesafe" ? models : openaiJudges(record, models);
+		const account: Account = { record, storage, provider, family, models, judges, cooldown: 0 };
 		this.accounts.get(record.id)?.storage.close();
 		this.accounts.set(record.id, account);
 		await this.protectFiles(record.id);
@@ -302,16 +389,6 @@ export class Accounts {
 			.map((account) => account.record);
 		await atomicJson(this.metadataPath, { version: 2, accounts: records });
 	}
-	async credential(account: Account, signal?: AbortSignal): Promise<{ token: string; accountId?: string }> {
-		if (account.record.kind === "oauth") {
-			const credential = await account.storage.oauth.access(account.provider, undefined, { signal });
-			if (!credential) throw new HttpError(401, "Account sign-in must be renewed.");
-			return { token: credential.accessToken, accountId: credential.accountId };
-		}
-		const key = account.storage.credentials.get(account.provider);
-		if (key?.type !== "api_key") throw new HttpError(401, "Account credential is unavailable.");
-		return { token: key.key };
-	}
 	duplicate(record: AccountRecord, key?: string): void {
 		for (const existing of this.accounts.values()) {
 			if (existing.record.id === record.id)
@@ -321,55 +398,56 @@ export class Accounts {
 				throw new HttpError(409, `This API key is already added as ${existing.record.name}.`);
 		}
 	}
-	async listModels(record: AccountRecord, token: string, signal?: AbortSignal): Promise<string[]> {
-		const anthropic = !record.provider?.startsWith("openai");
-		const base = (record.baseUrl ?? (anthropic ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl)).replace(
-			/\/$/,
-			"",
+	/** Lists an Anthropic or OpenAI key's chat models through OMP's authenticated catalog discovery, sorted. */
+	async listModels(
+		record: AccountRecord,
+		native: string,
+		descriptor: ProviderDescriptor,
+		key: string,
+		signal: AbortSignal,
+	): Promise<string[]> {
+		const baseUrl = apiRoot(
+			record.baseUrl ?? (native === "anthropic" ? this.options.anthropicBaseUrl : this.options.openaiBaseUrl),
 		);
-		const headers: Record<string, string> = anthropic ? { "anthropic-version": "2023-06-01" } : {};
-		if (anthropic) headers["x-api-key"] = token;
-		else headers.authorization = `Bearer ${token}`;
-		const models: string[] = [];
-		let after: string | undefined;
-		for (let page = 0; page < 100; page++) {
-			const url = new URL(`${base}${base.endsWith("/v1") ? "" : "/v1"}/models`);
-			if (anthropic) {
-				url.searchParams.set("limit", "1000");
-				if (after) url.searchParams.set("after_id", after);
-			}
-			let response: Response;
-			try {
-				response = await fetch(url, {
-					headers,
-					redirect: "error",
-					signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
-				});
-			} catch {
-				throw new HttpError(400, "Key validation failed or timed out.");
-			}
-			if (!response.ok) {
-				await response.body?.cancel();
-				throw new HttpError(400, `Key rejected (HTTP ${response.status}).`);
-			}
-			const text = await boundedText(response, 2 * 1024 * 1024);
-			let data: WireObject;
-			try {
-				data = object(JSON.parse(text));
-			} catch {
-				throw new HttpError(400, "Provider returned invalid model data.");
-			}
-			if (!Array.isArray(data.data)) throw new HttpError(400, "Provider returned invalid model data.");
-			models.push(
-				...data.data.flatMap((model) => (typeof object(model).id === "string" ? [String(object(model).id)] : [])),
-			);
-			if (!anthropic || data.has_more !== true) break;
-			if (typeof data.last_id !== "string" || data.last_id === after)
-				throw new HttpError(400, "Provider model pagination did not finish.");
-			after = data.last_id;
-		}
-		if (!models.length) throw new HttpError(400, "Key has no accessible models.");
-		return [...new Set(models)].sort();
+		const origin = new URL(baseUrl).origin;
+		const deadline = AbortSignal.any([signal, AbortSignal.timeout(30000)]);
+		const reply: { status?: number } = {};
+		const rows = await descriptor
+			.createModelManagerOptions({
+				apiKey: key,
+				baseUrl,
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					// Discovery also reads public reference data; only the provider itself may see the key.
+					if (new URL(request.url).origin !== origin) throw new Error("Unexpected discovery endpoint.");
+					const response = await fetch(request, {
+						redirect: "error",
+						signal: AbortSignal.any([request.signal, deadline]),
+					});
+					reply.status = response.status;
+					return response;
+				},
+			})
+			.fetchDynamicModels?.();
+		// Discovery returns embedding, speech and judge models as chat rows; the catalog knows which they are.
+		const catalog = new Map(getBundledModels(native).map((model) => [model.id, model.kind]));
+		const chat = rows?.filter((row) => (row.kind ?? catalog.get(row.id) ?? "chat") === "chat");
+		return [...new Set(discoveredIds(chat, reply.status))].sort();
+	}
+	/** Lists a TypeSafe key's models through OMP's authenticated discovery, in the order TypeSafe reports them. */
+	async listTypeSafeModels(key: string, signal: AbortSignal): Promise<string[]> {
+		const reply: { status?: number } = {};
+		const models = await fetchTypeSafeModels({
+			apiKey: key,
+			baseUrl: this.options.typesafeBaseUrl,
+			signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+			fetch: async (input, init) => {
+				const response = await fetch(input, { ...init, redirect: "error" });
+				reply.status = response.status;
+				return response;
+			},
+		});
+		return discoveredIds(models, reply.status);
 	}
 	async addKey(input: WireObject, signal: AbortSignal): Promise<Account> {
 		const id = input.provider === undefined ? "anthropic" : text(input.provider)?.trim().toLowerCase();
@@ -388,7 +466,9 @@ export class Accounts {
 			createdAt: new Date().toISOString(),
 		};
 		this.duplicate(record, key);
-		if (upstream.key.kind === "legacy") record.models = await this.listModels(record, key, signal);
+		if (upstream.key.kind === "legacy")
+			record.models = await this.listModels(record, native, upstream.key.descriptor, key, signal);
+		else if (upstream.key.kind === "classifier") record.models = await this.listTypeSafeModels(key, signal);
 		else {
 			try {
 				const validated = await validateProviderKey(upstream, upstream.key, key, signal);

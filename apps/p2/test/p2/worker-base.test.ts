@@ -36,7 +36,7 @@ test("a fork's static graph has no provider SDK and no esbuild", () => {
 
 test("the OAuth flows and Bedrock are lazy chunks of the snapshot", () => {
 	const { chunks } = staticGraph(base.file());
-	for (const source of ["auth/oauth/radius.ts", "auth/oauth/anthropic.ts", "api/bedrock-converse-stream.ts"]) {
+	for (const source of ["auth/oauth/radius.ts", "auth/oauth/openai-codex.ts", "api/bedrock-converse-stream.ts"]) {
 		const holders = chunksWith(join(AI_SOURCE, source));
 		assert.equal(holders.length, 1, source);
 		assert.ok(!chunks.includes(holders[0]!), `${source} is imported statically`);

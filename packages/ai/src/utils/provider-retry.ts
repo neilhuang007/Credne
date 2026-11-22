@@ -1,5 +1,4 @@
-/** Longest server-requested retry wait honoured when the caller sets no limit. */
-export const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
+const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
 interface ProviderRetryOptions {
 	maxRetries?: number;
@@ -69,15 +68,13 @@ function getRetryDelayMs(error: ProviderError, retryIndex: number, maxRetryDelay
 	return exponentialDelay * (1 - Math.random() * 0.25);
 }
 
-/** An error that reports the request as aborted by the caller. */
-export function createAbortError(): Error {
+function createAbortError(): Error {
 	const error = new Error("Request aborted");
 	error.name = "AbortError";
 	return error;
 }
 
-/** Sleeps for `ms`, rejecting with an abort error as soon as `signal` aborts. */
-export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
 			reject(createAbortError());

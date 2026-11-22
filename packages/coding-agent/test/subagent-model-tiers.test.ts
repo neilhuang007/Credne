@@ -21,12 +21,12 @@ import { modelTierSchema } from "../src/extensions/subagent/model-tiers.ts";
 const parentProvider = "test-provider";
 const parentEffort = "low";
 
-function model(id: string, supportsXhigh = true): Model<Api> {
+function model(id: string, supportsXhigh = true, provider = parentProvider): Model<Api> {
 	return {
 		id,
 		name: id,
 		api: "openai-completions",
-		provider: parentProvider,
+		provider,
 		baseUrl: "https://provider.invalid/v1",
 		input: ["text"],
 		reasoning: true,
@@ -130,6 +130,82 @@ describe("tier resolution", () => {
 	});
 });
 
+describe("profile model and effort", () => {
+	const worker = discoverBundledAgents().find((agent) => agent.name === "worker")!;
+
+	it("runs the bundled worker on claude-opus-5-5 at xhigh, not at the parent's effort", () => {
+		expect(resolve(claudePool, {}, worker)).toEqual({
+			model: "test-provider/claude-opus-5-5",
+			thinkingLevel: "xhigh",
+		});
+	});
+
+	it("lets a call's reasoningEffort replace the profile's effort, and still rejects one the model lacks", () => {
+		expect(resolve(claudePool, { reasoningEffort: "high" }, worker).thinkingLevel).toBe("high");
+
+		const withoutXhigh = [model("parent"), model("claude-opus-5-5", false)];
+		expect(() => resolveOn(withoutXhigh, { reasoningEffort: "xhigh" }, worker)).toThrow(
+			/does not support reasoning effort xhigh/,
+		);
+	});
+
+	it("moves the profile's effort to the nearest level the model supports instead of rejecting it", () => {
+		const withoutXhigh = [model("parent"), model("claude-opus-5-5", false)];
+
+		expect(resolveOn(withoutXhigh, {}, worker).thinkingLevel).toBe("high");
+	});
+
+	it("lets a call's model or tier replace the profile's model together with its effort", () => {
+		expect(resolve(claudePool, { model: "haiku" }, worker)).toEqual({
+			model: "test-provider/claude-haiku-5-5",
+			thinkingLevel: parentEffort,
+		});
+		expect(resolve(claudePool, { tier: "light" }, worker)).toEqual({
+			model: "test-provider/claude-haiku-5-5",
+			thinkingLevel: "medium",
+		});
+	});
+
+	describe("when the current account does not serve the model", () => {
+		const gpt = [model("parent"), model("gpt-6.2-sol")];
+		const poolModel = (provider: string, id = "claude-opus-5-5") => model(id, true, provider);
+
+		it("resolves on a family pool, which wins over the global pool whatever their order", () => {
+			const models = [...gpt, poolModel("pool:all"), poolModel("pool:claude")];
+
+			expect(resolveOn(models, {}, worker)).toEqual({
+				model: "pool:claude/claude-opus-5-5",
+				thinkingLevel: "xhigh",
+			});
+			expect(resolveOn(models, {}, { model: "opus" }).model).toBe("pool:claude/claude-opus-5-5");
+		});
+
+		it("resolves on the global pool when no family pool serves the model", () => {
+			const models = [...gpt, poolModel("pool:codex", "gpt-6-luna"), poolModel("pool:all")];
+
+			expect(resolveOn(models, {}, worker).model).toBe("pool:all/claude-opus-5-5");
+		});
+
+		it("keeps the current account when it serves the model", () => {
+			const models = [...gpt, model("claude-opus-5-5"), poolModel("pool:claude")];
+
+			expect(resolveOn(models, {}, worker).model).toBe("test-provider/claude-opus-5-5");
+		});
+
+		it("fails with the unknown model error when no pool serves it either", () => {
+			expect(() => resolveOn([...gpt, poolModel("pool:codex", "gpt-6-luna")], {}, worker)).toThrow(
+				/Unknown subagent model "claude-opus-5-5".*search_models/,
+			);
+		});
+
+		it("does not widen a model chosen by the caller to the pools", () => {
+			const models = [...gpt, poolModel("pool:claude")];
+
+			expect(() => resolveOn(models, { model: "claude-opus-5-5" })).toThrow(/Unknown subagent model/);
+		});
+	});
+});
+
 describe("tier profiles and data", () => {
 	const directories: string[] = [];
 
@@ -146,8 +222,8 @@ describe("tier profiles and data", () => {
 		return root;
 	}
 
-	const agentFile = (name: string, tierLine: string) =>
-		`---\nname: ${name}\ndescription: Test agent ${name}\n${tierLine}\n---\nBody of ${name}\n`;
+	const agentFile = (name: string, frontmatterLine: string) =>
+		`---\nname: ${name}\ndescription: Test agent ${name}\n${frontmatterLine}\n---\nBody of ${name}\n`;
 
 	it("reads a tier from agent frontmatter and ignores values that are not tiers", () => {
 		const root = projectWithAgents({
@@ -167,10 +243,35 @@ describe("tier profiles and data", () => {
 		}
 	});
 
-	it("gives each bundled profile its default tier", () => {
-		const bundled = Object.fromEntries(discoverBundledAgents().map((agent) => [agent.name, agent.tier]));
+	it("reads an effort from agent frontmatter and ignores values that are not reasoning levels", () => {
+		const root = projectWithAgents({
+			valid: agentFile("valid", "effort: xhigh"),
+			unknown: agentFile("unknown", "effort: turbo"),
+			numeric: agentFile("numeric", "effort: 3"),
+			none: agentFile("none", ""),
+		});
 
-		expect(bundled).toEqual({ explorer: "light", worker: "medium", critic: "heavy", crazy: "heavy" });
+		const agents = discoverAgents(root, "project").agents;
+		const effortOf = (name: string) => agents.find((agent) => agent.name === name);
+
+		expect(effortOf("valid")?.effort).toBe("xhigh");
+		for (const name of ["unknown", "numeric", "none"]) {
+			expect(effortOf(name)).toBeDefined();
+			expect(effortOf(name)?.effort).toBeUndefined();
+		}
+	});
+
+	it("gives each bundled profile its default tier, and the worker a pinned model and effort instead", () => {
+		const bundled = discoverBundledAgents();
+		const byName = (name: string) => bundled.find((agent) => agent.name === name);
+
+		expect(Object.fromEntries(bundled.map((agent) => [agent.name, agent.tier]))).toEqual({
+			explorer: "light",
+			worker: undefined,
+			critic: "heavy",
+			crazy: "heavy",
+		});
+		expect(byName("worker")).toMatchObject({ model: "claude-opus-5-5", effort: "xhigh" });
 	});
 
 	it("only lists tier rows that name a valid tier, effort and existing alias", () => {

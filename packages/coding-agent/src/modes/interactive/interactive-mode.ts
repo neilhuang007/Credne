@@ -795,7 +795,12 @@ export class InteractiveMode {
 				const models =
 					this.session.scopedModels.length > 0
 						? this.session.scopedModels.map((s) => s.model)
-						: [...getModelSelectionChoices(this.session.modelRuntime.getAvailableSnapshot())];
+						: [
+								...getModelSelectionChoices(
+									this.session.modelRuntime.getAvailableSnapshot(),
+									this.session.model?.provider,
+								),
+							];
 				const matches = filterModelSelection(models, prefix, (model) => model, getModelSearchText);
 				return matches.length > 0
 					? matches.map((model) => ({
@@ -1177,9 +1182,6 @@ export class InteractiveMode {
 		}
 		if (this.renderer.mode === "fullscreen") this.showFullscreenModelScopeNotice();
 		this.ui.requestRender();
-		// Open the model API connection while the user reads the first frame. Deferred a turn of the event loop so
-		// the connection work never lands ahead of the first paint.
-		setImmediate(() => this.session.prewarmModelConnection());
 
 		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
 		// so slow downloads do not make startup appear frozen.
@@ -3349,9 +3351,6 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.sidePanel.scrollUp", () => this.sidePanel.scrollDiffPage(-1));
 
 		this.defaultEditor.onChange = (text: string) => {
-			// Typing signals an imminent turn; refresh the API connection now so the handshake overlaps composition
-			// instead of delaying the send. Throttled, and a no-op mid-turn.
-			if (text) this.session.prewarmModelConnection();
 			const wasBashMode = this.isBashMode;
 			this.isBashMode = text.trimStart().startsWith("!");
 			if (wasBashMode !== this.isBashMode) {
@@ -5568,7 +5567,12 @@ export class InteractiveMode {
 						session.scopedModels.map((scoped) => scoped.model),
 						"scoped",
 					)
-				: getExactModelSelectionMatches(searchTerm, session.modelRuntime.getAvailableSnapshot(), "all");
+				: getExactModelSelectionMatches(
+						searchTerm,
+						session.modelRuntime.getAvailableSnapshot(),
+						"all",
+						session.model?.provider,
+					);
 		const cachedMatches = findMatches();
 		if (cachedMatches.length === 1) return cachedMatches[0];
 		if (session.scopedModels.length > 0 || (USES_BROKER_AUTH && cachedMatches.length > 1)) return undefined;

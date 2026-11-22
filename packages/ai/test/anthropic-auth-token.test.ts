@@ -164,47 +164,6 @@ describe("Anthropic auth token env", () => {
 		expect(mockState.createParams?.system).toEqual([expect.objectContaining({ text: "System prompt." })]);
 	});
 
-	it("sends ANTHROPIC_OAUTH_TOKEN as a Claude subscription request, without the SDK", async () => {
-		const models = createModels({
-			authContext: {
-				env: async (name) => (name === "ANTHROPIC_OAUTH_TOKEN" ? "sk-ant-oat-test" : undefined),
-				fileExists: async () => false,
-			},
-		});
-		models.setProvider(anthropicProvider());
-		mockState.constructorOpts = undefined;
-		const sent: Headers[] = [];
-		const fetch: typeof globalThis.fetch = async (_input, init) => {
-			sent.push(new Headers(init?.headers));
-			return new Response(
-				[
-					{ type: "message_start", message: { id: "msg_test", model: "claude-test", usage: { input_tokens: 1 } } },
-					{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-					{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "answer" } },
-					{ type: "content_block_stop", index: 0 },
-					{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
-					{ type: "message_stop" },
-				]
-					.map(
-						(event) => `event: ${event.type}
-data: ${JSON.stringify(event)}
-
-`,
-					)
-					.join(""),
-				{ headers: { "content-type": "text/event-stream" } },
-			);
-		};
-
-		const result = await models.streamSimple(anthropicModel, context, { fetch }).result();
-
-		expect(result.stopReason).toBe("stop");
-		expect(mockState.constructorOpts).toBeUndefined();
-		expect(sent).toHaveLength(1);
-		expect(sent[0].get("authorization")).toBe("Bearer sk-ant-oat-test");
-		expect(sent[0].get("anthropic-beta")).toContain("oauth-2025-04-20");
-	});
-
 	it("lets explicit request headers override ANTHROPIC_AUTH_TOKEN", async () => {
 		const models = createModels({
 			authContext: {

@@ -10,9 +10,11 @@ import {
 	familyOf,
 	readCatalog,
 	sharedRouteFamily,
+	upstreamIdentity,
 	writeCatalog,
 } from "./catalog.ts";
 import type { BrokerAccount, BrokerClient } from "./client.ts";
+import type { OmpIdentityLookup } from "./omp-native.ts";
 import { type AccountProviderSpec, createAccountProvider, providerSpecs, type ServedByListener } from "./provider.ts";
 
 const catalogSources = new Map<string, ReadonlyMap<string, Model<Api>>>(
@@ -22,6 +24,12 @@ const catalogSources = new Map<string, ReadonlyMap<string, Model<Api>>>(
 	]),
 );
 
+/** The built-in classifier entries that account classifiers copy: gpt-6-luna for OpenAI keys, Jev for TypeSafe keys. */
+const catalogClassifiers = [
+	getBuiltinClassifierModel("openai", "gpt-6-luna"),
+	getBuiltinClassifierModel("typesafe", "jev-latest"),
+];
+
 /** Registers broker accounts and pools from the cached catalog before contacting the daemon. */
 export class AccountRegistry {
 	private readonly pi: ExtensionAPI;
@@ -30,6 +38,9 @@ export class AccountRegistry {
 	private readonly onServedBy: ServedByListener;
 	private catalog: AccountCatalog;
 	private specs: AccountProviderSpec[] = [];
+	/** oh-my-pi's identity of a model of any registered account or pool, read when a request is encoded. */
+	private readonly identify: OmpIdentityLookup = (providerId, modelId) =>
+		upstreamIdentity(this.provider(providerId)?.upstream, modelId);
 
 	constructor(pi: ExtensionAPI, client: BrokerClient, catalogPath: string, onServedBy: ServedByListener) {
 		this.pi = pi;
@@ -63,6 +74,11 @@ export class AccountRegistry {
 		return account && sharedRouteFamily(familyOf(account.provider));
 	}
 
+	/** Whether the cached catalog has an enabled account of the broker provider `provider`. */
+	hasEnabledAccount(provider: string): boolean {
+		return this.catalog.accounts.some((account) => account.provider === provider && !account.disabled);
+	}
+
 	/** The pinned-account provider whose broker key is `key`. */
 	accountByKey(key: string): AccountProviderSpec | undefined {
 		return this.specs.find((spec) => spec.target.type === "account" && spec.target.key === key);
@@ -84,7 +100,7 @@ export class AccountRegistry {
 				accounts,
 				accountModels,
 				(provider, id) => catalogSources.get(provider)?.get(id),
-				() => getBuiltinClassifierModel("openai", "gpt-6-luna"),
+				(provider, id) => catalogClassifiers.find((model) => model.provider === provider && model.id === id),
 			);
 			writeCatalog(this.catalogPath, this.catalog);
 			const previous = this.specs.map((spec) => spec.id);
@@ -117,7 +133,8 @@ export class AccountRegistry {
 		for (const spec of this.specs) {
 			if (!ids.has(spec.id)) this.pi.unregisterProvider(spec.id);
 		}
-		for (const spec of specs) this.pi.registerProvider(createAccountProvider(spec, this.client, this.onServedBy));
+		for (const spec of specs)
+			this.pi.registerProvider(createAccountProvider(spec, this.client, this.onServedBy, this.identify));
 		this.specs = specs;
 	}
 }

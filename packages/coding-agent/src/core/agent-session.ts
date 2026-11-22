@@ -39,7 +39,6 @@ import {
 	getSystemMessageText,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
-import { prewarmModelConnection } from "@earendil-works/pi-ai/api/claude-subscription/prewarm";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -73,7 +72,6 @@ import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
-import { getClientIdentity } from "./client-identity.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -1577,18 +1575,6 @@ export class AgentSession {
 		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
-	/**
-	 * Warms the active model's API connection while idle, so the next turn skips DNS, TCP and TLS. Acts only for a
-	 * model served by a Claude subscription (OAuth) credential: its requests go through the Claude Code transport
-	 * the warm-up shares sockets with, while API key requests use another one. Throttled and best effort; a no-op
-	 * mid-turn, where the pooled socket is busy and a warm-up would open a redundant one.
-	 */
-	prewarmModelConnection(): void {
-		const model = this.routedModel?.model ?? this.model;
-		if (!model || this.isStreaming || !this._modelRuntime.isUsingOAuth(model.provider)) return;
-		void prewarmModelConnection(model, { identity: getClientIdentity(this.settingsManager) });
-	}
-
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
 		return (
@@ -2844,8 +2830,6 @@ export class AgentSession {
 		source: "set" | "cycle" | "restore",
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
-		// Every model change passes here; the handshake overlaps the extension handlers below.
-		this.prewarmModelConnection();
 		await this._extensionRunner.emit({
 			type: "model_select",
 			model: nextModel,
@@ -2948,8 +2932,12 @@ export class AgentSession {
 		direction: "forward" | "backward",
 		options: ModelMutationOptions,
 	): Promise<ModelCycleResult | undefined> {
-		const availableModels = getAutomaticModelChoices(this._modelRuntime.getAvailableSnapshot());
 		const currentModel = this.model;
+		// From a pinned account the cycle starts at its row and still reaches the other choices.
+		const availableModels = getAutomaticModelChoices(
+			this._modelRuntime.getAvailableSnapshot(),
+			currentModel?.provider,
+		);
 		const currentIndex = availableModels.findIndex((m) => modelsAreEqual(m, currentModel));
 		const nextIndex = getNextCycleIndex(currentIndex, availableModels.length, direction);
 		if (nextIndex === undefined) return undefined;

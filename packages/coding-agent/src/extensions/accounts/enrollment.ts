@@ -67,6 +67,19 @@ const FAMILIAR_GROUPS: readonly AddGroup[] = [
 			},
 		],
 	},
+	{
+		id: "jev",
+		label: "Jev account",
+		ways: [
+			{
+				id: "jev-api-key",
+				label: "API key (TypeSafe API key)",
+				method: "api-key",
+				provider: "typesafe",
+				title: "TypeSafe",
+			},
+		],
+	},
 ];
 const OTHER = { id: "other", label: "Other providers" };
 const FAMILIAR_WAYS = FAMILIAR_GROUPS.flatMap((group) => group.ways);

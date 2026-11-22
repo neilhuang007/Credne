@@ -27,6 +27,8 @@
 
 - Removed the unused `mapStopReasonString` export from `@earendil-works/pi-ai/api/google-shared`
 - Removed the retired `deepseek-v3.2` and `deepseek-v4-flash` from the Qwen Token Plan Team providers; use `deepseek-v4-flash-0731` or `deepseek-v4.1-flash` ([#11773](https://github.com/earendil-works/pi/issues/11773))
+- Removed the Claude subscription transport (`@earendil-works/pi-ai/api/claude-subscription/*`): `anthropic-messages` no longer shapes requests as Claude Code for `sk-ant-oat` tokens, and the `prewarm` and `anthropicSlowMode` stream options and the `AnthropicSlow*` types are gone. Requests for Claude subscriptions go through the account broker, which does that shaping. The SSE reader the API-key path uses moved to `api/anthropic-sse.ts`
+- Removed pi's own Claude Pro/Max OAuth login: the `anthropic` provider has only API-key auth, and `OAuthAuth.toEnv`, `AuthResolutionOverrides.rejectedAccessToken`, the 401/403 credential refresh and retry in `Models`, and the `refreshStoredOAuthCredential` and `getProviderHttpErrorDetails` exports that existed for that login are gone
 
 ## [1.5.2] - 2026-11-10
 

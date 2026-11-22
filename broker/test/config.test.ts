@@ -1,12 +1,12 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { accountKey } from "../src/accounts.ts";
 import { BrokerConfigError, loadBrokerConfig } from "../src/config.ts";
 import { type BrokerHandle, startBroker } from "../src/service.ts";
 import { object } from "../src/wire.ts";
+import { fakeNetwork, fakeUpstream, piBody, refusal } from "./fixtures.ts";
 
 const configured = `
 routing:
@@ -49,27 +49,24 @@ const ids = [
 	"config-openai-2aea2960365f3a45d8c9200d",
 ];
 
-test("config accounts retain legacy pins, separate header variants and use their original endpoints", async () => {
+test("config accounts keep legacy pins, and their endpoints and headers reach the provider through OMP", async () => {
 	const home = await mkdtemp(join(tmpdir(), "credne-config-"));
 	const configPath = join(home, "config.yaml");
 	let broker: BrokerHandle | undefined;
-	const requests: { url: string; body: Record<string, unknown>; headers: Headers }[] = [];
-	const network: { fetch: FetchImpl } = globalThis;
-	const realFetch = globalThis.fetch;
-	const transport = spyOn(network, "fetch").mockImplementation(async (input, init) => {
-		const request = new Request(input, init);
-		const url = new URL(request.url);
-		if (url.hostname === "127.0.0.1") return realFetch(request);
-		if (!["claude.example", "codex.example", "openai.example"].includes(url.hostname))
-			throw new Error("Unexpected network request");
-		requests.push({ url: url.href, body: object(await request.json()), headers: request.headers });
-		return Response.json({ error: { message: "A fixture failure" } }, { status: 429 });
-	});
+	// Local origins stand in for the hosts: OMP's Anthropic transport only dials HTTPS hosts itself.
+	const upstream = fakeUpstream(() => refusal(400, "A fixture failure"));
+	const network = fakeNetwork();
 	try {
 		await writeFile(configPath, configured, { mode: 0o600 });
 		const config = await loadBrokerConfig(home);
 		expect(config.routing).toEqual({ strategy: "fill-first", affinity: false, retries: 0 });
 		expect(config.accounts.map((account) => account.id)).toEqual(ids);
+		const local = configured
+			.replace("https://claude.example", upstream.origin)
+			.replace("https://codex.example", upstream.origin)
+			.replace("https://openai.example", upstream.origin);
+		await writeFile(configPath, local, { mode: 0o600 });
+		const localIds = (await loadBrokerConfig(home)).accounts.map((account) => account.id);
 		broker = await startBroker({ home, idleTimeout: 0 });
 		if (!broker) throw new Error("No test broker");
 		const request = (path: string, body?: unknown) =>
@@ -80,40 +77,47 @@ test("config accounts retain legacy pins, separate header variants and use their
 			});
 		const publicList = await (await request("/accounts")).text();
 		expect(publicList).not.toMatch(/same-fixture|codex-fixture|openai-fixture/);
-		for (const [index, route, model] of [
-			[0, "v1/messages", "claude-north"],
-			[1, "v1/messages", "claude-south"],
-			[3, "responses", "gpt-test"],
-			[4, "decisions", "gpt-6-luna"],
+		const systemOne = {
+			model: "gpt-6-luna",
+			state: "hello",
+			questions: { easy: { type: "noul", instructions: "Hi?" } },
+		};
+		for (const [index, route, body] of [
+			[0, "pi/stream", JSON.parse(piBody("anthropic/claude-north", "north"))],
+			[1, "pi/stream", JSON.parse(piBody("anthropic/claude-south", "south"))],
+			[3, "pi/stream", JSON.parse(piBody("openai/gpt-test", "codex"))],
+			[4, "systemone", systemOne],
 		] as const) {
-			const key = accountKey(ids[index]);
-			const response = await request(
-				`/route/a.${key}/${route}`,
-				route === "v1/messages"
-					? { model, max_tokens: 20, messages: [{ role: "user", content: "hello" }] }
-					: { model, input: "hello" },
-			);
-			expect(response.status).toBe(429);
+			const key = accountKey(localIds[index]);
+			const response = await request(`/route/a.${key}/${route}`, body);
 			expect(response.headers.get("x-credne-account")).toBe(key);
-			await response.body?.cancel();
+			// A pinned stream answers at once; the provider request follows as the body is read.
+			await response.text();
 		}
 		expect(
-			requests.map(({ url, body, headers }) => [url, body.model, headers.get("x-route"), headers.get("x-existing")]),
+			upstream.calls.map(({ path, body, headers }) => [
+				path,
+				object(JSON.parse(body)).model,
+				headers.get("x-route"),
+				headers.get("x-existing"),
+			]),
 		).toEqual([
-			["https://claude.example/custom/v1/messages?beta=true", "claude-north", "north", "foo"],
-			["https://claude.example/custom/v1/messages?beta=true", "claude-south", "south", null],
-			["https://codex.example/gateway/responses", "gpt-test", null, null],
-			["https://openai.example/v1/decisions", "gpt-6-luna", "decisions", null],
+			["/custom/v1/messages", "claude-north", "north", "foo"],
+			["/custom/v1/messages", "claude-south", "south", null],
+			["/gateway/responses", "gpt-test", null, null],
+			// OMP's System One route sends no model headers, so the configured routing header does not apply to it.
+			["/v1/decisions", "gpt-6-luna", null, null],
 		]);
-		expect(requests[0].headers.get("x-api-key")).toBe("same-fixture");
-		expect(requests[2].headers.get("authorization")).toBe("Bearer codex-fixture");
-		expect(requests[3].headers.get("authorization")).toBe("Bearer openai-fixture");
+		expect(upstream.calls[0].headers.get("x-api-key")).toBe("same-fixture");
+		expect(upstream.calls[2].headers.get("authorization")).toBe("Bearer codex-fixture");
+		expect(upstream.calls[3].headers.get("authorization")).toBe("Bearer openai-fixture");
 	} finally {
 		await broker?.close();
-		transport.mockRestore();
+		network.restore();
+		await upstream.server.stop(true);
 		await rm(home, { recursive: true, force: true });
 	}
-}, 10000);
+}, 20000);
 
 test("incompatible config options fail closed without exposing values", async () => {
 	const home = await mkdtemp(join(tmpdir(), "credne-bad-config-"));

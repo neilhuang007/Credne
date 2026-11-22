@@ -4,10 +4,14 @@ import { getAgentDir, getPackageDir, getRuntimePackageDir } from "../../config.t
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import { isToolCallEventType } from "../../core/extensions/types.ts";
 import { resolveToCwd } from "../../core/tools/path-utils.ts";
+import { TYPESAFE_PROVIDER } from "./catalog.ts";
 import { BrokerClient, locateBrokerBinary } from "./client.ts";
 import { ACCOUNT_SUBCOMMANDS, type AccountCommandDeps, runAccountCommand, showModels } from "./commands.ts";
 import { ADD_ARGUMENTS } from "./enrollment.ts";
 import { AccountRegistry } from "./registry.ts";
+
+const NO_JEV_ACCOUNT_WARNING =
+	"No Jev account. Add one with /accounts add jev; decisions fall back to gpt-6-luna or the session model.";
 
 export function createAccountBrokerClient(agentDir = getAgentDir()): BrokerClient {
 	return new BrokerClient({
@@ -48,6 +52,14 @@ export default function accountsExtension(pi: ExtensionAPI, agentDir = getAgentD
 	});
 	const deps: AccountCommandDeps = { pi, client, registry };
 
+	// Jev rates delegated tasks, but a harness without it still works, so this only warns, once per process.
+	let hasWarnedAboutJev = false;
+	const warnIfNoJevAccount = (ctx: ExtensionContext): void => {
+		if (hasWarnedAboutJev || !ctx.hasUI || registry.hasEnabledAccount(TYPESAFE_PROVIDER)) return;
+		hasWarnedAboutJev = true;
+		ctx.ui.notify(NO_JEV_ACCOUNT_WARNING, "warning");
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		servedBy.clear();
 		showCurrentAccount(ctx);
@@ -56,6 +68,7 @@ export default function accountsExtension(pi: ExtensionAPI, agentDir = getAgentD
 			if (!(await client.connectExisting())) return;
 			await registry.sync(ctx);
 			showCurrentAccount(ctx);
+			warnIfNoJevAccount(ctx);
 		})().catch(() => {});
 	});
 

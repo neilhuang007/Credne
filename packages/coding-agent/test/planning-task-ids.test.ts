@@ -30,7 +30,15 @@ describe("planning task IDs", () => {
 						{ stopReason: "toolUse" },
 					);
 				},
-				fauxAssistantMessage(fauxToolCall(name, { revision: 1, taskIds: ["1", "1"] }), { stopReason: "toolUse" }),
+				// The bundled worker pins a Claude model that the faux provider does not serve, so assign_tasks gets one it does.
+				fauxAssistantMessage(
+					fauxToolCall(name, {
+						revision: 1,
+						taskIds: ["1", "1"],
+						...(name === "assign_tasks" ? { model: harness.getModel().id } : {}),
+					}),
+					{ stopReason: "toolUse" },
+				),
 				fauxAssistantMessage("done"),
 			]);
 			await harness.session.prompt("Check duplicate task IDs.");

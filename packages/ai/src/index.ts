@@ -6,14 +6,6 @@
 export type { AnthropicEffort, AnthropicOptions, AnthropicThinkingDisplay } from "./api/anthropic-messages.ts";
 export type { AzureOpenAIResponsesOptions } from "./api/azure-openai-responses.ts";
 export type { BedrockOptions, BedrockThinkingDisplay } from "./api/bedrock-converse-stream.ts";
-export type {
-	AnthropicSlowModeFailure,
-	AnthropicSlowModeHooks,
-	AnthropicSlowModeRetry,
-	AnthropicSlowModeSignal,
-	AnthropicSlowOffer,
-	AnthropicSlowStatus,
-} from "./api/claude-subscription/slow-mode.ts";
 export type { GoogleOptions } from "./api/google-generative-ai.ts";
 export type { GoogleApiThinkingLevel, ResolvedGoogleThinkingLevel } from "./api/google-shared.ts";
 export type { GoogleVertexOptions } from "./api/google-vertex.ts";
@@ -26,7 +18,6 @@ export type { PiMessagesEvent, PiMessagesOptions, PiMessagesRewriteImpact } from
 export * from "./auth/context.ts";
 export * from "./auth/credential-store.ts";
 export * from "./auth/helpers.ts";
-export { refreshStoredOAuthCredential } from "./auth/resolve.ts";
 export * from "./auth/types.ts";
 export * from "./cache-warming.ts";
 export type {

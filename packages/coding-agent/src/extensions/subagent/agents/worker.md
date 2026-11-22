@@ -2,7 +2,8 @@
 name: worker
 description: General-purpose implementation agent. It should reason during implementation within the scope assigned by the main agent.
 tools: read, bash, edit, write, tool_search
-tier: medium
+model: claude-opus-5-5
+effort: xhigh
 ---
 
 # Subagent guidelines

@@ -540,6 +540,7 @@ function buildSessionOptions(
 			cliThinking: parsed.thinking,
 			inlineApiKey: Boolean(parsed.apiKey),
 			scopedModels,
+			defaultProvider: settingsManager.getDefaultProvider(),
 			modelRuntime,
 		});
 		if (resolved.warning) {
@@ -878,9 +879,12 @@ export async function main(args: string[], options?: MainOptions) {
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
 		const { scopedModels, diagnostics: modelScopeDiagnostics } =
 			modelPatterns && modelPatterns.length > 0
-				? await resolveModelScopeWithDiagnostics(modelPatterns, modelRuntime, {
-						signal: AbortSignal.timeout(15_000),
-					})
+				? await resolveModelScopeWithDiagnostics(
+						modelPatterns,
+						modelRuntime,
+						{ signal: AbortSignal.timeout(15_000) },
+						settingsManager.getDefaultProvider(),
+					)
 				: { scopedModels: [], diagnostics: [] };
 		// Returned as diagnostics instead of printed: this factory runs again on /new, /resume and /fork,
 		// while the interactive TUI draws on the terminal (#11264).

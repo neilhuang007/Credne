@@ -65,8 +65,6 @@ export function buildBaseOptions(
 		cacheRetention: options?.cacheRetention,
 		sessionId: options?.sessionId,
 		disableContinuation: options?.disableContinuation,
-		prewarm: options?.prewarm,
-		anthropicSlowMode: options?.anthropicSlowMode,
 		headers: options?.headers,
 		identity: options?.identity,
 		onPayload: options?.onPayload,

@@ -545,25 +545,6 @@ describe("Anthropic message threads", () => {
 		expect(gateway.requests[0].betas).not.toContain(THREADS_BETA);
 	});
 
-	it("prefixes tool names on the wire and decodes them across turns with OAuth", async () => {
-		const h = harness();
-		h.queue.push((request) =>
-			reply(request, { id: "msg_oauth", toolCalls: [{ id: "toolu_1", name: "_read", input: { value: "x" } }] }),
-		);
-		const options: AnthropicOptions = { apiKey: "sk-ant-oat-test" };
-		// Subscription requests thread only on Claude 4.5 and newer.
-		const model = { ...baseModel, id: "claude-sonnet-4-5" };
-		const messages = [user("read it")];
-		const first = await say(h, messages, { model, tools: [tool("read")], options });
-		expect((h.requests[0].body.tools as Array<{ name: string }>).map((definition) => definition.name)).toEqual([
-			"_read",
-		]);
-		expect(first.content.find((block) => block.type === "toolCall")).toMatchObject({ name: "read" });
-		messages.push(toolResult("toolu_1", "read"));
-		await say(h, messages, { model, tools: [tool("read")], options });
-		expect(threadOf(h.requests[1])).toEqual({ type: "continue", previous_message_id: "msg_oauth" });
-	});
-
 	it("sends cache warming replays without a thread and keeps the conversation's thread", async () => {
 		const h = harness();
 		const messages = [user("first")];

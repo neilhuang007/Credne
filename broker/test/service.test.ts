@@ -4,40 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startBroker } from "../src/service.ts";
 import { array, object } from "../src/wire.ts";
+import { anthropicReply, piBody, piEvents, piText, refusal } from "./fixtures.ts";
 
 const cleanup: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
 	for (const close of cleanup.splice(0).reverse()) await close();
 });
-function events(content: Record<string, unknown>[], stop = "end_turn"): Response {
-	const frames: [string, unknown][] = [
-		[
-			"message_start",
-			{
-				type: "message_start",
-				message: {
-					id: "msg_test",
-					type: "message",
-					role: "assistant",
-					model: "claude-test",
-					content: [],
-					usage: { input_tokens: 4, output_tokens: 0 },
-				},
-			},
-		],
-	];
-	for (const [index, block] of content.entries()) {
-		frames.push(["content_block_start", { type: "content_block_start", index, content_block: block }]);
-		frames.push(["content_block_stop", { type: "content_block_stop", index }]);
-	}
-	frames.push(
-		["message_delta", { type: "message_delta", delta: { stop_reason: stop }, usage: { output_tokens: 2 } }],
-		["message_stop", { type: "message_stop" }],
-	);
-	return new Response(frames.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join(""), {
-		headers: { "content-type": "text/event-stream" },
-	});
-}
 async function fixture(options: { idleTimeout?: number; maxConcurrency?: number } = {}) {
 	const home = await mkdtemp(join(tmpdir(), "credne-broker-"));
 	cleanup.push(() => rm(home, { recursive: true, force: true }));
@@ -58,36 +30,10 @@ async function fixture(options: { idleTimeout?: number; maxConcurrency?: number 
 			received.push({ key, headers: request.headers, body });
 			for (const arrival of arrivals) arrival();
 			request.signal.addEventListener("abort", () => aborted.resolve(), { once: true });
-			if (key === rejected)
-				return Response.json(
-					{ error: { message: "rate limited secret-sk-ant-A cbk-do-not-leak" } },
-					{ status: 429, headers: { "retry-after": "60" } },
-				);
+			// OMP would wait out the provider's hint; this answer tells it to give up at once.
+			if (key === rejected) return refusal(429, "rate limited", { "retry-after": "60", "x-should-retry": "false" });
 			if (held) await held;
-			if (array(body.tools).some((tool) => object(tool).type === "web_search_20250305"))
-				return events([
-					{ type: "server_tool_use", id: "srv_1", name: "web_search", input: { query: "query" } },
-					{
-						type: "web_search_tool_result",
-						tool_use_id: "srv_1",
-						content: [
-							{
-								type: "web_search_result",
-								title: "Source",
-								url: "https://example.com",
-								encrypted_content: "opaque",
-							},
-						],
-					},
-					{ type: "text", text: "Search result." },
-				]);
-			return events(
-				[
-					{ type: "text", text: "Visible answer." },
-					{ type: "tool_use", id: "tool_1", name: "read", input: { path: "x" } },
-				],
-				"tool_use",
-			);
+			return anthropicReply("Visible answer.", { id: "tool_1", name: "read", input: { path: "x" } });
 		},
 	});
 	cleanup.push(async () => upstream.stop(true));
@@ -124,17 +70,12 @@ async function fixture(options: { idleTimeout?: number; maxConcurrency?: number 
 				...Object.fromEntries(new Headers(init.headers)),
 			},
 		});
-	const send = (target: string, body: Record<string, unknown> = {}, headers?: HeadersInit) =>
-		request(`/route/${target}/v1/messages`, {
+	const send = (target: string, session = "conversation", headers?: HeadersInit, init: RequestInit = {}) =>
+		request(`/route/${target}/pi/stream`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify({
-				model: "claude-test",
-				max_tokens: 128,
-				messages: [{ role: "user", content: "hello" }],
-				stream: false,
-				...body,
-			}),
+			body: piBody("anthropic/claude-test", session),
+			...init,
 		});
 	const waitForCalls = async (count: number) => {
 		if (received.length >= count) return;
@@ -157,6 +98,7 @@ async function fixture(options: { idleTimeout?: number; maxConcurrency?: number 
 		received,
 		waitForCalls,
 		aborted: aborted.promise,
+		accounts: async () => array(object(await (await request("/accounts")).json()).accounts).map(object),
 		reject: (key?: string) => {
 			rejected = key;
 		},
@@ -167,22 +109,28 @@ async function fixture(options: { idleTimeout?: number; maxConcurrency?: number 
 }
 
 describe("shared broker public contract", () => {
-	test("streaming pinned rate limits retain status and pool retries before any frame is emitted", async () => {
+	test("a pinned limit is recorded without a failover; a pool moves on before any frame is emitted", async () => {
 		const f = await fixture();
-		const accounts = array(object(await (await f.request("/accounts")).json()).accounts).map(object);
+		const accounts = await f.accounts();
 		f.reject("secret-sk-ant-A");
-		const pinned = await f.send(`a.${accounts[0].key}`, { stream: true });
-		expect(pinned.status).toBe(429);
-		expect(pinned.headers.get("retry-after")).toBe("60");
-		expect(await pinned.text()).not.toContain("message_start");
+		const pinned = await f.send(`a.${accounts[0].key}`);
+		expect(pinned.status).toBe(200);
+		expect(pinned.headers.get("x-credne-account")).toBe(String(accounts[0].key));
+		expect((await piEvents(pinned)).at(-1)).toMatchObject({ type: "error" });
 		expect(f.received.every((call) => call.key === "secret-sk-ant-A")).toBe(true);
+		// The limit benches the account; a pinned request is then refused without a call.
+		const cooling = await f.send(`a.${accounts[0].key}`);
+		expect(cooling.status).toBe(429);
+		expect(cooling.headers.get("retry-after")).not.toBeNull();
+		expect(f.received).toHaveLength(1);
 		await f.request(`/accounts/${accounts[0].key}/reset`, { method: "POST" });
-		const pooled = await f.send("p.claude", { stream: true });
+		const pooled = await f.send("p.claude", "pooled");
 		expect(pooled.status).toBe(200);
 		expect(pooled.headers.get("x-credne-account")).toBe(String(accounts[1].key));
-		const wire = await pooled.text();
-		expect(wire).toContain("tool_use");
-		expect(wire).not.toContain("rate limited");
+		const events = await piEvents(pooled);
+		expect(piText(events)).toBe("Visible answer.");
+		// The refused account's attempt never reached the caller.
+		expect(events.some((event) => event.type === "error")).toBe(false);
 	}, 20000);
 
 	test("malformed management JSON is a caller error", async () => {
@@ -194,29 +142,31 @@ describe("shared broker public contract", () => {
 		}
 	});
 
-	test("gateway sends only selected key, keeps tools, and never falls back from a pin", async () => {
+	test("gateway sends only the selected key, keeps tools, and never falls back from a pin", async () => {
 		const f = await fixture();
-		const accounts = array(object(await (await f.request("/accounts")).json()).accounts).map(object);
+		const accounts = await f.accounts();
 		const key = String(accounts[0].key);
-		const good = await f.send(`a.${key}`, {}, { cookie: "caller-cookie", "x-api-key": f.broker.state.token });
+		const good = await f.send(`a.${key}`, "conversation", {
+			cookie: "caller-cookie",
+			"x-api-key": f.broker.state.token,
+		});
 		expect(good.status).toBe(200);
 		expect(good.headers.get("x-credne-account")).toBe(key);
-		const payload = object(await good.json());
-		expect(JSON.stringify(payload)).toContain("tool_use");
+		const events = await piEvents(good);
+		expect(JSON.stringify(events)).toContain("toolCall");
 		expect(f.received[0].key).toBe("secret-sk-ant-A");
 		expect(f.received[0].headers.get("cookie")).toBeNull();
-		expect(f.received[0].headers.get("authorization")).toBeNull();
+		// OMP sends an API key both ways; the caller's broker token is in neither.
+		expect(f.received[0].headers.get("authorization")).toBe("Bearer secret-sk-ant-A");
 		f.reject("secret-sk-ant-A");
 		const pinned = await f.send(`a.${key}`);
 		const error = await pinned.text();
-		expect(pinned.status).toBe(429);
-		expect(pinned.headers.get("retry-after")).toBe("60");
 		expect(error).not.toContain("secret-sk-ant");
 		expect(error).not.toContain(f.broker.state.token);
 		expect(f.received.every((call) => call.key === "secret-sk-ant-A")).toBe(true);
-		const pooled = await f.send("p.claude");
+		const pooled = await f.send("p.claude", "another");
 		expect(pooled.status).toBe(200);
-		await pooled.body?.cancel();
+		expect(piText(await piEvents(pooled))).toBe("Visible answer.");
 		expect(f.received.at(-1)?.key).toBe("secret-sk-ant-B");
 	}, 20000);
 
@@ -232,24 +182,16 @@ describe("shared broker public contract", () => {
 				})
 			).status,
 		).toBe(404);
+		// The chat protocols OMP's pi-native route replaced are not exposed.
+		for (const path of ["/v1/messages", "/responses", "/chat/completions", "/decisions"]) {
+			const gone = await f.request(`/route/p.claude${path}`, { method: "POST", body: "{}" });
+			expect(gone.status).toBe(404);
+			await gone.body?.cancel();
+		}
 		const publicText = await (await f.request("/accounts")).text();
 		expect(publicText).not.toContain("secret-sk-ant");
 		expect(object(await (await f.request("/health")).json()).backend).toBe("oh-my-pi");
 	});
-
-	test("native hosted search is a real upstream tool and retains native search result blocks", async () => {
-		const f = await fixture();
-		const accounts = array(object(await (await f.request("/accounts")).json()).accounts).map(object);
-		const response = await f.send(`a.${accounts[0].key}`, {
-			tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
-			tool_choice: { type: "tool", name: "web_search" },
-		});
-		expect(response.status).toBe(200);
-		const payload = await response.text();
-		expect(payload).toContain("web_search_tool_result");
-		expect(payload).toContain("https://example.com");
-		expect(object(array(f.received[0].body.tools)[0]).type).toBe("web_search_20250305");
-	}, 20000);
 
 	test("validation, duplicate concurrency, disable/reset/delete, and owner-only discovery", async () => {
 		const f = await fixture();
@@ -273,41 +215,19 @@ describe("shared broker public contract", () => {
 		if (process.platform !== "win32") expect((await stat(join(f.home, "broker.json"))).mode & 0o777).toBe(0o600);
 	});
 
-	test("sessions remain affine; pool account changes rewrite private reasoning without dropping tools", async () => {
+	test("a conversation stays on its account until that account is unavailable", async () => {
 		const f = await fixture();
-		const headers = { "x-session-affinity": "conversation-one" };
-		const first = await f.send("p.claude", {}, headers);
+		const first = await f.send("p.claude", "conversation-one");
 		const firstKey = first.headers.get("x-credne-account");
 		await first.body?.cancel();
-		const second = await f.send("p.claude", {}, headers);
+		const second = await f.send("p.claude", "conversation-one");
 		expect(second.headers.get("x-credne-account")).toBe(firstKey);
 		await second.body?.cancel();
 		await f.request(`/accounts/${firstKey}/disable`, { method: "POST" });
-		const next = await f.send(
-			"p.claude",
-			{
-				thinking: { type: "enabled", budget_tokens: 1024 },
-				messages: [
-					{ role: "user", content: "question" },
-					{
-						role: "assistant",
-						content: [
-							{ type: "thinking", thinking: "private summary", signature: "signed-by-other-account" },
-							{ type: "text", text: "visible history" },
-							{ type: "tool_use", id: "old_tool", name: "read", input: {} },
-						],
-					},
-					{ role: "user", content: [{ type: "tool_result", tool_use_id: "old_tool", content: "result" }] },
-				],
-			},
-			headers,
-		);
+		const next = await f.send("p.claude", "conversation-one");
 		expect(next.status).toBe(200);
+		expect(next.headers.get("x-credne-account")).not.toBe(firstKey);
 		await next.body?.cancel();
-		const wire = JSON.stringify(f.received.at(-1)?.body);
-		expect(wire).not.toContain("signed-by-other-account");
-		expect(wire).toContain("visible history");
-		expect(wire).toContain("old_tool");
 	});
 
 	test("live daemon is shared and discovery removed only on owner shutdown", async () => {
@@ -317,37 +237,32 @@ describe("shared broker public contract", () => {
 		expect(await Bun.file(join(f.home, "broker.json")).exists()).toBe(false);
 	});
 
-	test("streaming retains tool framing and client cancellation reaches upstream", async () => {
+	test("streaming retains tool framing and client cancellation reaches the provider", async () => {
 		const f = await fixture({ maxConcurrency: 1 });
-		const accounts = array(object(await (await f.request("/accounts")).json()).accounts).map(object);
-		const response = await f.send(`a.${accounts[0].key}`, { stream: true });
+		const accounts = await f.accounts();
+		const response = await f.send(`a.${accounts[0].key}`);
 		expect(response.headers.get("content-type")).toContain("text/event-stream");
-		const wire = await response.text();
-		expect(wire).toContain("content_block_start");
-		expect(wire).toContain("tool_use");
-		expect(wire).toContain("message_stop");
+		const events = await piEvents(response);
+		expect(events.map((event) => event.type)).toEqual(
+			expect.arrayContaining(["start", "text_delta", "toolcall_end", "done"]),
+		);
 		const hold = Promise.withResolvers<void>();
 		f.hold(hold.promise);
 		const abort = new AbortController();
-		const pending = f.request(`/route/a.${accounts[0].key}/v1/messages`, {
-			method: "POST",
-			signal: abort.signal,
-			body: JSON.stringify({
-				model: "claude-test",
-				max_tokens: 32,
-				messages: [{ role: "user", content: "wait" }],
-				stream: true,
-			}),
-		});
-		void pending.catch(() => {});
+		// A pinned stream answers at once; its frames follow the provider.
+		const pending = await f.send(`a.${accounts[0].key}`, "waiting", undefined, { signal: abort.signal });
 		await f.waitForCalls(2);
 		abort.abort();
 		await f.aborted;
 		hold.resolve();
-		await expect(pending).rejects.toThrow();
+		await pending.body?.cancel().catch(() => {});
+		// The cancelled request released its slot: the one-request limit still admits the next.
+		f.hold(undefined);
+		const next = await f.send(`a.${accounts[0].key}`, "after");
+		expect(piText(await piEvents(next))).toBe("Visible answer.");
 	}, 20000);
 
-	test("idle expiry does not terminate an active upstream request", async () => {
+	test("idle expiry does not terminate an active provider request", async () => {
 		const f = await fixture({ idleTimeout: 100 });
 		const hold = Promise.withResolvers<void>();
 		f.hold(hold.promise);
@@ -359,6 +274,6 @@ describe("shared broker public contract", () => {
 		hold.resolve();
 		const finished = await response;
 		expect(finished.status).toBe(200);
-		await finished.body?.cancel();
+		expect(piText(await piEvents(finished))).toBe("Visible answer.");
 	}, 20000);
 });

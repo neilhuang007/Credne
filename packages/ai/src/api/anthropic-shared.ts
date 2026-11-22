@@ -1,6 +1,5 @@
-// Parts of the Anthropic Messages implementation that the API-key path (anthropic-messages.ts) and the Claude
-// subscription path (claude-subscription/) both use: the compat defaults, tool call id and stop reason mapping, and
-// the mapping of simple stream options.
+// Parts of the Anthropic Messages implementation (anthropic-messages.ts) that do not depend on its stream state: the
+// compat defaults, tool call id and stop reason mapping, and the mapping of simple stream options.
 
 import type {
 	BetaStopReason,

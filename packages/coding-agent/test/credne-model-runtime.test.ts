@@ -1,8 +1,13 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ClassifierModel, createProvider, InMemoryCredentialStore, type Model } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import {
+	type ClassifierApi,
+	type ClassifierModel,
+	createProvider,
+	InMemoryCredentialStore,
+	type Model,
+} from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as configSource from "../src/config.ts";
 import { ENV_AGENT_DIR } from "../src/config.ts";
@@ -13,9 +18,11 @@ import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type * as brokerSource from "../src/extensions/accounts/client.ts";
 import { BrokerClient } from "../src/extensions/accounts/client.ts";
+import { OMP_NATIVE_API, ompNativeStreams } from "../src/extensions/accounts/omp-native.ts";
 import { createAccountProvider } from "../src/extensions/accounts/provider.ts";
 import { createLlamaProvider } from "../src/extensions/llama/provider.ts";
 import { migrateAuthToAuthJson } from "../src/migrations.ts";
+import { ompTurn, sseResponse } from "./omp-native-test-utils.ts";
 
 vi.mock("../src/config.ts", async (importOriginal) => ({
 	...(await importOriginal<typeof configSource>()),
@@ -28,11 +35,11 @@ vi.mock("../src/extensions/accounts/client.ts", async (importOriginal) => ({
 }));
 
 const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-const model: Model<"openai-completions"> = {
+const model: Model<typeof OMP_NATIVE_API> = {
 	id: "chat-test",
 	name: "Chat test",
 	provider: "acct:openai-test",
-	api: "openai-completions",
+	api: OMP_NATIVE_API,
 	baseUrl: "https://ignored.invalid/v1",
 	contextWindow: 10_000,
 	maxTokens: 100,
@@ -40,16 +47,24 @@ const model: Model<"openai-completions"> = {
 	input: ["text"],
 	cost,
 };
-const classifier: ClassifierModel<"openai-decisions"> = {
+const classifier: ClassifierModel<"typesafe-system-one"> = {
 	type: "classifier",
 	id: "gpt-6-luna",
 	name: "Luna",
 	provider: model.provider,
-	api: "openai-decisions",
+	api: "typesafe-system-one",
 	baseUrl: model.baseUrl,
 	input: ["text"],
 	cost,
 	contextWindow: 10_000,
+};
+const jevClassifier: ClassifierModel<"typesafe-system-one"> = {
+	...classifier,
+	id: "jev-latest",
+	name: "Jev",
+	api: "typesafe-system-one",
+	input: ["text", "image"],
+	compat: { imageInput: "assets", sendImageOptInHeader: true },
 };
 const brokerUrl = "http://127.0.0.1:12345";
 const route = `${brokerUrl}/credne/v1/route/a.QWNjb3VudA`;
@@ -70,7 +85,7 @@ afterEach(() => {
 	rmSync(agentDir, { recursive: true, force: true });
 });
 
-function brokerProvider() {
+function brokerProvider(classifiers: ClassifierModel<ClassifierApi>[] = [classifier]) {
 	const client = new BrokerClient({ home: agentDir, locateBinary: () => undefined });
 	vi.spyOn(client, "connect").mockResolvedValue({ url: brokerUrl, token: "broker-token", pid: 1 });
 	return createAccountProvider(
@@ -80,7 +95,7 @@ function brokerProvider() {
 			target: { type: "account", key: "QWNjb3VudA" },
 			disabled: false,
 			models: [model],
-			classifiers: [classifier],
+			classifiers,
 		},
 		client,
 	);
@@ -156,9 +171,7 @@ describe("Credne broker authentication", () => {
 		runtime.registerNativeProvider(brokerProvider(), "builtin:accounts");
 		await runtime.refresh();
 		expect(await runtime.getAvailableOfType("classifier")).toEqual([classifier]);
-		fetchBroker.mockResolvedValue(
-			Response.json({ answers: [{ type: "predicate", name: "approved", probability: 0.9 }] }),
-		);
+		fetchBroker.mockResolvedValue(Response.json({ answers: { approved: { type: "noul", noul: 0.9 } } }));
 		const fetch = captureFetch(() => Response.json({}));
 		const result = await runtime.classify({ ...classifier, baseUrl: "https://caller.invalid" }, classifierContext, {
 			fetch,
@@ -172,10 +185,84 @@ describe("Credne broker authentication", () => {
 		expect(fetchBroker).toHaveBeenCalledOnce();
 		const [url, init] = fetchBroker.mock.calls[0]!;
 		const headers = new Headers(init?.headers);
-		expect(String(url)).toBe(`${route}/decisions`);
+		expect(String(url)).toBe(`${route}/systemone`);
 		expect(headers.get("authorization")).toBe("Bearer broker-token");
 		expect(headers.has("x-api-key")).toBe(false);
 		expect(headers.get("x-test")).toBe("ok");
+		expect(JSON.parse(await new Response(init?.body).text())).toMatchObject({ model: "gpt-6-luna" });
+	});
+
+	it("streams chat through the trusted account adapter to the broker route, ignoring caller-supplied credentials and routes", async () => {
+		const runtime = await ModelRuntime.create({ modelsPath: null });
+		runtime.registerNativeProvider(brokerProvider(), "builtin:accounts");
+		await runtime.refresh();
+		fetchBroker.mockImplementation(async () =>
+			sseResponse(ompTurn({ model: model.id }).start().text("hello").done("stop", { input: 3, output: 1 }).sse(), {
+				headers: { "x-credne-account": "QWNjb3VudA" },
+			}),
+		);
+		const fetch = captureFetch(() => Response.json({}));
+		const onResponse = vi.fn();
+		const message = await runtime.completeSimple(
+			{ ...model, baseUrl: "https://caller.invalid" },
+			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
+			{
+				fetch,
+				apiKey: "caller-key",
+				headers: { Authorization: "Bearer caller-key", "x-api-key": "caller-key", "x-test": "ok" },
+				transformHeaders: (headers) => ({ ...headers, authorization: "Bearer transform-key" }),
+				onResponse,
+			},
+		);
+
+		expect(message).toMatchObject({ stopReason: "stop", content: [{ type: "text", text: "hello" }] });
+		expect(fetch).not.toHaveBeenCalled();
+		expect(fetchBroker).toHaveBeenCalledOnce();
+		const [url, init] = fetchBroker.mock.calls[0]!;
+		const headers = new Headers(init?.headers);
+		expect(String(url)).toBe(`${route}/pi/stream`);
+		expect(headers.get("authorization")).toBe("Bearer broker-token");
+		expect(headers.has("x-api-key")).toBe(false);
+		// Caller headers are provider-request headers, which oh-my-pi sends; the hop to the broker carries none.
+		expect(headers.has("x-test")).toBe(false);
+		const body = JSON.parse(await new Response(init?.body).text()) as {
+			modelId: string;
+			options: { headers?: Record<string, string> };
+		};
+		expect(body.modelId).toBe("chat-test");
+		expect(body.options.headers).toEqual({ "x-test": "ok" });
+		expect(onResponse).toHaveBeenCalledWith(
+			{ status: 200, headers: expect.objectContaining({ "x-credne-account": "QWNjb3VudA" }) },
+			expect.objectContaining({ provider: model.provider, id: model.id }),
+		);
+	});
+
+	it("routes a Jev classifier to the broker's systemone path and keeps the image opt-in header", async () => {
+		const runtime = await ModelRuntime.create({ modelsPath: null });
+		runtime.registerNativeProvider(brokerProvider([jevClassifier]), "builtin:accounts");
+		await runtime.refresh();
+		expect(await runtime.getAvailableOfType("classifier")).toEqual([jevClassifier]);
+		fetchBroker.mockResolvedValue(Response.json({ answers: { approved: { type: "noul", noul: 0.9 } } }));
+		const fetch = captureFetch(() => Response.json({}));
+		const context = {
+			...classifierContext,
+			images: [{ type: "image" as const, data: "aGk=", mimeType: "image/png" }],
+		};
+		const result = await runtime.classify({ ...jevClassifier, baseUrl: "https://caller.invalid" }, context, {
+			fetch,
+			apiKey: "caller-key",
+			headers: { Authorization: "Bearer caller-key" },
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(fetch).not.toHaveBeenCalled();
+		expect(fetchBroker).toHaveBeenCalledOnce();
+		const [url, init] = fetchBroker.mock.calls[0]!;
+		const headers = new Headers(init?.headers);
+		expect(String(url)).toBe(`${route}/systemone`);
+		expect(headers.get("authorization")).toBe("Bearer broker-token");
+		expect(headers.get("typesafe-danger-zone-images")).toBe("true");
+		expect(JSON.parse(await new Response(init?.body).text())).toMatchObject({ model: "jev-latest" });
 	});
 
 	it("fails closed if an account provider resolves no loopback route", async () => {
@@ -184,7 +271,7 @@ describe("Credne broker authentication", () => {
 			createProvider({
 				id: model.provider,
 				models: [model],
-				api: openAICompletionsApi(),
+				api: ompNativeStreams(() => undefined),
 				auth: {
 					apiKey: { name: "Invalid", resolve: async () => ({ auth: { apiKey: "bad", baseUrl: model.baseUrl } }) },
 				},
@@ -209,7 +296,7 @@ describe("Credne broker authentication", () => {
 			writeFileSync(
 				join(explicitDir, "accounts", "catalog.json"),
 				JSON.stringify({
-					version: 2,
+					version: 3,
 					accounts: [
 						{
 							id: "openai-test",

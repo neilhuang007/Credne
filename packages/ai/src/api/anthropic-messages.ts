@@ -62,8 +62,7 @@ import {
 	mapStopReason,
 	normalizeToolCallId,
 } from "./anthropic-shared.ts";
-import { iterateAnthropicEvents } from "./claude-subscription/sse.ts";
-import { isClaudeSubscriptionRequest, streamClaudeSubscription } from "./claude-subscription/stream.ts";
+import { iterateAnthropicEvents } from "./anthropic-sse.ts";
 import {
 	getJsonSchemaToolParameters,
 	prefersJsonSchemaStrictSampling,
@@ -560,7 +559,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	context: TranscriptContext,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
-	if (isClaudeSubscriptionRequest(model, options)) return streamClaudeSubscription(model, context, options);
 	const stream = new AssistantMessageEventStream();
 	const compat = getAnthropicCompat(model);
 	const normalizedContext = resolveTranscript(context, compat.supportsMidConvoSystemMessages);

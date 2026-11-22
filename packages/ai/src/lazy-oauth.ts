@@ -10,7 +10,6 @@ import { registerBundledOAuthFlowLoaders } from "./auth/oauth/load.ts";
  */
 export function registerLazyOAuthFlows(): void {
 	registerBundledOAuthFlowLoaders({
-		anthropic: async () => (await import("./auth/oauth/anthropic.ts")).anthropicOAuth,
 		openaiCodex: async () => (await import("./auth/oauth/openai-codex.ts")).openaiCodexOAuth,
 		openaiChatGPT: async () => (await import("./auth/oauth/openai-chatgpt.ts")).openaiChatGPTOAuth,
 		githubCopilot: async () => (await import("./auth/oauth/github-copilot.ts")).githubCopilotOAuth,

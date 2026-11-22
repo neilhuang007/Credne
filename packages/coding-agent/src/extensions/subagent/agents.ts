@@ -4,9 +4,11 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { Value } from "typebox/value";
 import { CONFIG_DIR_NAME, getAgentDir, getBundledAgentsDir } from "../../config.ts";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
+import { reasoningEffortSchema } from "./dispatch.ts";
 import { type ModelTier, modelTierSchema } from "./model-tiers.ts";
 
 export type AgentScope = "user" | "project" | "both";
@@ -16,6 +18,8 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	/** Reasoning effort that goes with `model`; without it the child inherits the main agent's effort. */
+	effort?: ThinkingLevel;
 	/** Default capability tier; dispatch maps it to a model and reasoning effort. */
 	tier?: ModelTier;
 	systemPrompt: string;
@@ -41,6 +45,7 @@ type AgentFrontmatter = {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	effort?: unknown;
 	tier?: unknown;
 };
 
@@ -102,7 +107,8 @@ function loadAgentsFromDir(dir: string, source: AgentConfig["source"]): AgentCon
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
-			// Frontmatter is file input: an unknown tier is ignored rather than dropping the agent.
+			// Frontmatter is file input: an unknown effort or tier is ignored rather than dropping the agent.
+			effort: Value.Check(reasoningEffortSchema, frontmatter.effort) ? frontmatter.effort : undefined,
 			tier: Value.Check(modelTierSchema, frontmatter.tier) ? frontmatter.tier : undefined,
 			systemPrompt: body,
 			source,

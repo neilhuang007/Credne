@@ -1,11 +1,16 @@
 import { type Api, createProvider, type Model } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
+import { type AutocompleteProvider, setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as configSource from "../src/config.ts";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
-import { resolveCliModel, resolveModelScopeFromModels } from "../src/core/model-resolver.ts";
+import {
+	findInitialModel,
+	getExactModelSelectionMatches,
+	resolveCliModel,
+	resolveModelScopeFromModels,
+} from "../src/core/model-resolver.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -28,6 +33,7 @@ const codexPool = "pool:codex";
 const account = "acct:codex-work";
 const local = "llama.cpp";
 const shared = "shared-model";
+const astra = "gpt-6.2-astra";
 
 function model(provider: string, id: string): Model<"openai-completions"> {
 	return {
@@ -46,6 +52,24 @@ function model(provider: string, id: string): Model<"openai-completions"> {
 
 let runtime: ModelRuntime;
 
+function registerRoute(provider: string, ids: readonly string[]) {
+	runtime.registerNativeProvider(
+		createProvider({
+			id: provider,
+			models: ids.map((id) => model(provider, id)),
+			api: openAICompletionsApi(),
+			auth: {
+				apiKey: {
+					name: "Faux",
+					check: async () => ({ type: "api_key", source: "test" }),
+					resolve: async () => ({ auth: {}, source: "test" }),
+				},
+			},
+		}),
+		provider === local ? "builtin:llama.cpp" : "builtin:accounts",
+	);
+}
+
 beforeEach(async () => {
 	initTheme("dark");
 	setKeybindings(new KeybindingsManager());
@@ -60,21 +84,7 @@ beforeEach(async () => {
 		[globalPool, [sol, olderSol, "vendor/qualified-id:tag"]],
 		[local, ["local-model"]],
 	] as const) {
-		runtime.registerNativeProvider(
-			createProvider({
-				id: provider,
-				models: ids.map((id) => model(provider, id)),
-				api: openAICompletionsApi(),
-				auth: {
-					apiKey: {
-						name: "Faux",
-						check: async () => ({ type: "api_key", source: "test" }),
-						resolve: async () => ({ auth: {}, source: "test" }),
-					},
-				},
-			}),
-			provider === local ? "builtin:llama.cpp" : "builtin:accounts",
-		);
+		registerRoute(provider, ids);
 	}
 	await runtime.refresh({ allowNetwork: false });
 });
@@ -115,10 +125,34 @@ type ModelCommandContext = {
 	maybeWarnAboutAnthropicSubscriptionAuth: () => void;
 };
 
+type AutocompleteContext = {
+	session: AgentSession;
+	settingsManager: { getEnableSkillCommands: () => boolean };
+	skillCommands: Map<string, string>;
+	sessionManager: { getCwd: () => string };
+	fdPath: null;
+};
+
 const interactive = InteractiveMode.prototype as unknown as {
 	findExactModelMatch: ModelCommandContext["findExactModelMatch"];
 	handleModelCommand(this: ModelCommandContext, searchTerm: string): Promise<void>;
+	createBaseAutocompleteProvider(this: AutocompleteContext): AutocompleteProvider;
 };
+
+async function modelCompletions(session: AgentSession, prefix: string): Promise<string[]> {
+	const context: AutocompleteContext = {
+		session,
+		settingsManager: { getEnableSkillCommands: () => false },
+		skillCommands: new Map(),
+		sessionManager: { getCwd: () => process.cwd() },
+		fdPath: null,
+	};
+	const text = `/model ${prefix}`;
+	const suggestions = await interactive.createBaseAutocompleteProvider
+		.call(context)
+		.getSuggestions([text], 0, text.length, { signal: new AbortController().signal });
+	return suggestions?.items.map((item) => item.value) ?? [];
+}
 
 function modelCommand(session: AgentSession) {
 	const context: ModelCommandContext = {
@@ -152,6 +186,30 @@ describe("Credne model picker", () => {
 		}
 	});
 
+	it("shows the pinned account's rows in place of the pool rows it serves, and keeps the other choices", async () => {
+		const { session } = await newSession({ model: runtime.getModel(account, sol) });
+		const { selector, render, onSelect } = makePicker(session);
+		const other = makePicker(session, olderSol);
+		try {
+			const output = render();
+			expect(output).toContain(`✓ ${sol} [${account}]`);
+			expect(output).not.toContain(`${sol} [${globalPool}]`);
+			expect(output).not.toMatch(/\[acct:openai-metered\]|\[pool:codex\]|\[pool:openai\]/);
+			expect(output).toContain(`${olderSol} [${globalPool}]`);
+			expect(output).toContain(`${shared} [pool:alpha]`);
+			expect(output).toContain("local-model [llama.cpp]");
+			selector.handleInput("\r");
+			expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: account, id: sol }));
+			// A row the account does not serve is the way off the pin.
+			other.selector.handleInput("\r");
+			expect(other.onSelect).toHaveBeenCalledWith(expect.objectContaining({ provider: globalPool, id: olderSol }));
+		} finally {
+			selector.dispose();
+			other.selector.dispose();
+			session.dispose();
+		}
+	});
+
 	it("ranks an exact ID or alias above older IDs in search results", async () => {
 		const { session } = await newSession({ model: runtime.getModel(globalPool, olderSol) });
 		try {
@@ -181,8 +239,8 @@ describe("Credne model picker", () => {
 });
 
 describe("Credne model command", () => {
-	it("persists an unqualified alias and exact ID as the canonical pool selection", async () => {
-		const { session } = await newSession({ model: runtime.getModel(account, sol) });
+	it("persists an unqualified alias and exact ID as the canonical pool selection on a pool session", async () => {
+		const { session } = await newSession({ model: runtime.getModel(globalPool, olderSol) });
 		try {
 			const { context, run } = modelCommand(session);
 			for (const query of ["sOL", sol]) {
@@ -199,6 +257,63 @@ describe("Credne model command", () => {
 			}
 		} finally {
 			session.dispose();
+		}
+	});
+
+	it("keeps a pinned account for an unqualified alias and exact ID, and persists it", async () => {
+		const { session } = await newSession({ model: runtime.getModel(account, sol) });
+		try {
+			const { context, run } = modelCommand(session);
+			for (const query of ["sOL", sol]) {
+				await run(query);
+				expect(context.showError).not.toHaveBeenCalled();
+				expect(context.showModelSelector).not.toHaveBeenCalled();
+				expect(session.model).toMatchObject({ provider: account, id: sol });
+				expect(session.settingsManager.getDefaultProvider()).toBe(account);
+				expect(session.settingsManager.getDefaultModel()).toBe(sol);
+				expect(session.sessionManager.getEntries().findLast(({ type }) => type === "model_change")).toMatchObject({
+					provider: account,
+					modelId: sol,
+				});
+			}
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("leaves the pin for an ID or alias the account does not serve and for an explicit pool", async () => {
+		registerRoute(globalPool, [sol, olderSol, astra]);
+		await runtime.refresh({ allowNetwork: false });
+		for (const [query, id] of [
+			[olderSol, olderSol],
+			["astra", astra],
+			[`${globalPool}/${sol}`, sol],
+		]) {
+			const { session } = await newSession({ model: runtime.getModel(account, sol) });
+			try {
+				await modelCommand(session).run(query);
+				expect(session.model).toMatchObject({ provider: globalPool, id });
+				expect(session.settingsManager.getDefaultProvider()).toBe(globalPool);
+			} finally {
+				session.dispose();
+			}
+		}
+	});
+
+	it("completes only the pinned account's rows for the IDs it serves", async () => {
+		const { session: pinned } = await newSession({ model: runtime.getModel(account, sol) });
+		const { session: pooled } = await newSession();
+		try {
+			const pinnedValues = await modelCompletions(pinned, "sol");
+			expect(pinnedValues[0]).toBe(`${account}/${sol}`);
+			expect(pinnedValues).toContain(`${globalPool}/${olderSol}`);
+			expect(pinnedValues).not.toContain(`${globalPool}/${sol}`);
+			const pooledValues = await modelCompletions(pooled, "sol");
+			expect(pooledValues[0]).toBe(`${globalPool}/${sol}`);
+			expect(pooledValues.filter((value) => value.startsWith("acct:"))).toEqual([]);
+		} finally {
+			pinned.dispose();
+			pooled.dispose();
 		}
 	});
 
@@ -285,7 +400,92 @@ describe("Credne CLI model selection", () => {
 	});
 });
 
+describe("Credne startup selection on a pinned account", () => {
+	it("resolves a bare ID or alias to the saved account for the IDs it serves", () => {
+		for (const [cliModel, provider, id, thinkingLevel] of [
+			[sol, account, sol, undefined],
+			["SOL:high", account, sol, "high"],
+			[olderSol, globalPool, olderSol, undefined],
+			["vendor/qualified-id:tag", globalPool, "vendor/qualified-id:tag", undefined],
+			["local-model", local, "local-model", undefined],
+			[`${globalPool}/${sol}`, globalPool, sol, undefined],
+		] as const) {
+			const result = resolveCliModel({ cliModel, defaultProvider: account, modelRuntime: runtime });
+			expect(result.error).toBeUndefined();
+			expect(result.model).toMatchObject({ provider, id });
+			expect(result.thinkingLevel).toBe(thinkingLevel);
+		}
+		expect(
+			resolveCliModel({ cliModel: sol, defaultProvider: globalPool, modelRuntime: runtime }).model,
+		).toMatchObject({
+			provider: globalPool,
+		});
+		expect(resolveCliModel({ cliModel: shared, defaultProvider: account, modelRuntime: runtime }).error).toContain(
+			"ambiguous",
+		);
+	});
+
+	it("keeps bare scope patterns on the saved account for the IDs it serves", () => {
+		const models = runtime.getAvailableSnapshot();
+		const { scopedModels, diagnostics } = resolveModelScopeFromModels(
+			[sol, "vendor/qualified-id:tag", "*sol*"],
+			models,
+			account,
+		);
+		expect(scopedModels.map(({ model }) => `${model.provider}/${model.id}`)).toEqual([
+			`${account}/${sol}`,
+			`${globalPool}/vendor/qualified-id:tag`,
+			`${globalPool}/${olderSol}`,
+		]);
+		expect(diagnostics).toEqual([]);
+	});
+
+	it("falls back to the saved account's first model, not the global pool", async () => {
+		const options = { scopedModels: [], isContinuing: false, defaultModelId: "missing-model", modelRuntime: runtime };
+		expect((await findInitialModel({ ...options, defaultProvider: account })).model).toMatchObject({
+			provider: account,
+			id: sol,
+		});
+		expect((await findInitialModel({ ...options, defaultProvider: "acct:removed" })).model?.provider).toBe(
+			globalPool,
+		);
+	});
+});
+
+describe("Credne pinned account resolution", () => {
+	it("answers an alias from the pinned account before another family target only the pool serves", () => {
+		const models = [
+			model(account, "gemini-3.8-flash"),
+			model(globalPool, "deepseek-flash"),
+			model(globalPool, "gemini-3.8-flash"),
+		];
+		expect(getExactModelSelectionMatches("flash", models, "all", account)).toEqual([models[0]]);
+		expect(getExactModelSelectionMatches("flash", models, "all")).toEqual([models[1]]);
+		expect(getExactModelSelectionMatches("deepseek-flash", models, "all", account)).toEqual([models[1]]);
+	});
+
+	it("does not pin for a pool provider or a scoped list", () => {
+		const models = runtime.getAvailableSnapshot();
+		expect(getExactModelSelectionMatches("sol", models, "all", globalPool)).toMatchObject([{ provider: globalPool }]);
+		const scoped = [runtime.getModel(globalPool, sol)!];
+		expect(getExactModelSelectionMatches("sol", scoped, "scoped", account)).toEqual(scoped);
+	});
+});
+
 describe("Credne session selection", () => {
+	it("cycles from the pinned account's row, then through the other choices", async () => {
+		const { session } = await newSession({ model: runtime.getModel(account, sol) });
+		try {
+			const forward = await session.cycleModel("forward", { persist: true });
+			expect(forward?.model).toMatchObject({ provider: globalPool, id: olderSol });
+			expect(session.settingsManager.getDefaultProvider()).toBe(globalPool);
+			const back = await session.cycleModel("backward");
+			expect(back?.model).toMatchObject({ provider: globalPool, id: sol });
+		} finally {
+			session.dispose();
+		}
+	});
+
 	it("defaults and cycles through global models and local models, never physical accounts", async () => {
 		const { session } = await newSession();
 		try {

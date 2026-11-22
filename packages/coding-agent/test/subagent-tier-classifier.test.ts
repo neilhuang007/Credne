@@ -1,5 +1,5 @@
 // Covers the tier classifier in subagent and planned dispatch: when it runs, with which backend, what it is sent, which tier and effort it picks, and how every failure falls back.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -15,7 +15,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, type Mock, type MockInstance, vi } from "vitest";
-import { CONFIG_DIR_NAME } from "../src/config.ts";
+import { CONFIG_DIR_NAME, getBundledAgentsDir } from "../src/config.ts";
 import type {
 	ExtensionAPI,
 	ExtensionFactory,
@@ -199,8 +199,25 @@ function agentFile(name: string, frontmatter: string[]): string {
 	);
 }
 
-function createFixture(extension: ExtensionFactory): Fixture {
+// The shipped profiles, read before any test points the package directory elsewhere.
+const shippedAgentsDir = getBundledAgentsDir();
+
+/**
+ * Points the bundled profiles at a copy of the shipped ones whose worker has a tier and no model. The shipped worker
+ * pins a model and is never rated, and `assign_tasks` always launches the bundled worker, so rating tests need this stand-in.
+ */
+function stubRatedWorker(directory: string): void {
+	const packageDir = join(directory, "package");
+	const bundledDir = join(packageDir, "src", "extensions", "subagent", "agents");
+	cpSync(shippedAgentsDir, bundledDir, { recursive: true });
+	writeFileSync(join(bundledDir, "worker.md"), agentFile("worker", ["tier: medium"]));
+	vi.stubEnv("PI_PACKAGE_DIR", packageDir);
+}
+
+/** `rated` runs a worker that has only a tier; `shipped` keeps the bundled worker, which pins its model. */
+function createFixture(extension: ExtensionFactory, worker: "rated" | "shipped" = "rated"): Fixture {
 	const directory = mkdtempSync(join(tmpdir(), "pi-tier-classifier-"));
+	if (worker === "rated") stubRatedWorker(directory);
 	const agentsDir = join(directory, CONFIG_DIR_NAME, "agents");
 	mkdirSync(agentsDir, { recursive: true });
 	writeFileSync(join(agentsDir, "pinned.md"), agentFile("pinned", ["model: sonnet", "tier: light"]));
@@ -269,6 +286,7 @@ function createFixture(extension: ExtensionFactory): Fixture {
 
 async function disposeFixture(fixture: Fixture): Promise<void> {
 	await fixture.team.dispose();
+	vi.unstubAllEnvs();
 	rmSync(fixture.directory, { recursive: true, force: true });
 }
 
@@ -311,17 +329,11 @@ describe("tier classifier in the subagent tool", () => {
 		await disposeFixture(f);
 	});
 
-	/** Runs the subagent tool in the background against project and bundled agents. */
+	/** Runs the subagent tool in the background against project and bundled agents, preparing the arguments as the agent loop does. */
 	async function dispatch(params: Record<string, unknown>, signal?: AbortSignal) {
-		await f.tools
-			.get("subagent")!
-			.execute(
-				"call",
-				{ agentScope: "project", confirmProjectAgents: false, background: true, ...params },
-				signal,
-				undefined,
-				f.ctx,
-			);
+		const tool = f.tools.get("subagent")!;
+		const sent = { agentScope: "project", confirmProjectAgents: false, background: true, ...params };
+		await tool.execute("call", tool.prepareArguments!(sent), signal, undefined, f.ctx);
 		return routes(f);
 	}
 
@@ -417,9 +429,9 @@ describe("tier classifier in the subagent tool", () => {
 
 	describe("when it does not run", () => {
 		it.each([
-			["an explicit model", { model: "haiku" }],
-			["an explicit tier", { tier: "light" }],
-		])("skips a task with %s, on the item and at the top level", async (_name, choice) => {
+			["an explicit model", { model: "haiku" }, "caller-model"],
+			["an explicit tier", { tier: "light" }, "caller-tier"],
+		])("skips a task with %s, on the item and at the top level, and records why", async (_name, choice, reason) => {
 			f.mode = "apply";
 			f.available = [];
 			await dispatch({ agent: "worker", task: "Fix the parser", ...choice });
@@ -429,10 +441,11 @@ describe("tier classifier in the subagent tool", () => {
 			expect(f.classify).not.toHaveBeenCalled();
 			expect(f.streamSimple).not.toHaveBeenCalled();
 			expect(f.getAvailableOfType).not.toHaveBeenCalled();
-			expect(f.appendEntry).not.toHaveBeenCalled();
+			const skipped = { mode: "apply", agent: "worker", profileTier: "medium", outcome: "skipped", reason };
+			expect(recorded(f)).toEqual([skipped, skipped, skipped]);
 		});
 
-		it("skips a profile that pins a model, even when it also has a tier", async () => {
+		it("skips a profile that pins a model, even when it also has a tier, and records why", async () => {
 			f.mode = "apply";
 			f.available = [];
 			const dispatched = await dispatch({ agent: "pinned", task: "Redesign the cache" });
@@ -440,6 +453,15 @@ describe("tier classifier in the subagent tool", () => {
 			expect(f.classify).not.toHaveBeenCalled();
 			expect(f.streamSimple).not.toHaveBeenCalled();
 			expect(dispatched[0].model).toBe("test-provider/claude-sonnet-5-5");
+			expect(recorded(f)).toEqual([
+				{ mode: "apply", agent: "pinned", profileTier: "light", outcome: "skipped", reason: "profile-model" },
+			]);
+		});
+
+		it("records skips in shadow mode too", async () => {
+			await dispatch({ agent: "worker", task: "Fix the parser", tier: "light" });
+
+			expect(recorded(f)).toEqual([expect.objectContaining({ mode: "shadow", reason: "caller-tier" })]);
 		});
 
 		it("still classifies when only the reasoning effort is chosen", async () => {
@@ -448,6 +470,51 @@ describe("tier classifier in the subagent tool", () => {
 
 			expect(f.classify).toHaveBeenCalledOnce();
 			expect(dispatched).toEqual([{ model: heavyRoute.model, thinkingLevel: "high" }]);
+		});
+	});
+
+	describe("blank selections", () => {
+		// A model that fills every optional field sends "" for a choice it does not want to make.
+		const blank = { model: "", tier: "", reasoningEffort: " " };
+
+		it("treats a blank model, tier or reasoningEffort as not chosen, at the top level and on items", async () => {
+			f.mode = "apply";
+
+			expect(await dispatch({ agent: "worker", task: "Redesign the cache", ...blank })).toEqual([heavyRoute]);
+			expect(
+				await dispatch({ ...blank, tasks: [{ agent: "worker", task: "Redesign the cache", ...blank }] }),
+			).toEqual([heavyRoute, heavyRoute]);
+			expect(
+				await dispatch({ chain: [{ agent: "worker", task: "Redesign the cache", ...blank }], background: false }),
+			).toEqual([heavyRoute, heavyRoute, heavyRoute]);
+
+			expect(f.classify).toHaveBeenCalledTimes(3);
+			expect(recorded(f).map((entry) => entry.outcome)).toEqual(["classified", "classified", "classified"]);
+		});
+
+		it("leaves the sent arguments as they are, and returns them unchanged when nothing is blank", () => {
+			const prepare = f.tools.get("subagent")!.prepareArguments!;
+			const sent = {
+				agent: "worker",
+				task: "Fix the parser",
+				...blank,
+				tasks: [{ agent: "worker", task: "Rename a variable", tier: "", model: "haiku" }],
+			};
+			const original = structuredClone(sent);
+
+			expect(prepare(sent)).toEqual({
+				agent: "worker",
+				task: "Fix the parser",
+				tasks: [{ agent: "worker", task: "Rename a variable", model: "haiku" }],
+			});
+			expect(sent).toEqual(original);
+			const chosen = {
+				agent: "worker",
+				task: "Fix the parser",
+				model: "haiku",
+				tasks: [{ agent: "worker", task: "x" }],
+			};
+			expect(prepare(chosen)).toBe(chosen);
 		});
 	});
 
@@ -557,16 +624,33 @@ describe("tier classifier in the subagent tool", () => {
 	describe("choice of classifier", () => {
 		const calledWith = () => f.classify.mock.calls.map(([model]) => `${model.provider}/${model.id}`);
 
-		it("prefers gpt-6-luna over a Jev model, and a Jev model over any other", async () => {
-			f.available = [clef, jev, luna];
+		it("prefers a Jev model over gpt-6-luna, and gpt-6-luna over any other", async () => {
+			f.available = [clef, luna, jev];
 			await dispatch({ agent: "worker", task: "Fix the parser" });
-			f.available = [clef, jev];
+			f.available = [clef, luna];
 			await dispatch({ agent: "worker", task: "Fix the parser" });
 			f.available = [clef];
 			await dispatch({ agent: "worker", task: "Fix the parser" });
 
-			expect(calledWith()).toEqual(["openai/gpt-6-luna", "typesafe/jev-latest", "openrouter/cloudflare/clef"]);
+			expect(calledWith()).toEqual(["typesafe/jev-latest", "openai/gpt-6-luna", "openrouter/cloudflare/clef"]);
 			expect(recorded(f).map((entry) => entry.classifier)).toEqual(calledWith());
+		});
+
+		it("picks the Jev classifier of a TypeSafe account over gpt-6-luna of an OpenAI key account, which it uses without one", async () => {
+			const accountJev = classifierModel("acct:typesafe-work", "jev-latest");
+			const accountLuna = classifierModel("acct:openai-api-key-work", "gpt-6-luna");
+			f.available = [clef, accountLuna, accountJev];
+			await dispatch({ agent: "worker", task: "Fix the parser" });
+			f.available = [clef, accountJev];
+			await dispatch({ agent: "worker", task: "Fix the parser" });
+			f.available = [clef, accountLuna];
+			await dispatch({ agent: "worker", task: "Fix the parser" });
+
+			expect(calledWith()).toEqual([
+				"acct:typesafe-work/jev-latest",
+				"acct:typesafe-work/jev-latest",
+				"acct:openai-api-key-work/gpt-6-luna",
+			]);
 		});
 
 		it("takes the first of equally ranked models", async () => {
@@ -642,16 +726,18 @@ Answer default for a field when the task does not clearly fit one value.`;
 				expect(recorded(f)[0]).toMatchObject({ agent: "critic", classifier: `test-provider/${lightModelId}` });
 			});
 
-			it("rates nothing, and records nothing, when the account has no light-tier model", async () => {
+			it("rates nothing, and records the skip, when the account has no light-tier model", async () => {
 				f.models.splice(f.models.indexOf(lightModel()), 1);
 
 				expect(await dispatch(task)).toEqual([mediumRoute]);
 
 				expect(f.streamSimple).not.toHaveBeenCalled();
-				expect(f.appendEntry).not.toHaveBeenCalled();
+				expect(recorded(f)).toEqual([
+					{ mode: "apply", agent: "worker", profileTier: "medium", outcome: "skipped", reason: "no-rater" },
+				]);
 			});
 
-			it("rates nothing, and records nothing, when the serving account is unknown", async () => {
+			it("rates nothing, and records the skip, when the serving account is unknown", async () => {
 				const unknownAccount = {
 					models: () => {
 						throw new Error("The parent pool's serving account is unknown.");
@@ -665,19 +751,20 @@ Answer default for a field when the task does not clearly fit one value.`;
 				expect(await classifyTiers(f.pi, unknownAccount, [request], f.ctx, undefined)).toEqual([undefined]);
 
 				expect(f.streamSimple).not.toHaveBeenCalled();
-				expect(f.appendEntry).not.toHaveBeenCalled();
+				expect(recorded(f)).toEqual([expect.objectContaining({ outcome: "skipped", reason: "no-rater" })]);
 			});
 
 			it("is off when the mode is off, and skips the tasks the classifier skips", async () => {
 				f.mode = "off";
 				await dispatch(task);
+				expect(f.appendEntry).not.toHaveBeenCalled();
 				f.mode = "apply";
 				await dispatch({ ...task, tier: "light" });
 				await dispatch({ ...task, model: "haiku" });
 				await dispatch({ agent: "pinned", task: task.task });
 
 				expect(f.streamSimple).not.toHaveBeenCalled();
-				expect(f.appendEntry).not.toHaveBeenCalled();
+				expect(recorded(f).map((entry) => entry.reason)).toEqual(["caller-tier", "caller-model", "profile-model"]);
 			});
 		});
 
@@ -1067,7 +1154,8 @@ Answer default for a field when the task does not clearly fit one value.`;
 			for (const release of releases) release();
 
 			expect(await pending).toEqual([heavyRoute, lightRoute, mediumRoute]);
-			expect(f.appendEntry).toHaveBeenCalledTimes(2);
+			// The skip is recorded while the call starts, before the two ratings come back.
+			expect(recorded(f).map((entry) => entry.outcome)).toEqual(["skipped", "classified", "classified"]);
 		});
 
 		it("rates every step of a chain before the first one starts", async () => {
@@ -1128,11 +1216,16 @@ describe("tier classifier in assign_tasks", () => {
 		await disposeFixture(f);
 	});
 
-	/** Assigns tasks of the plan created in `beforeEach`, as the main agent does. */
+	/** Assigns tasks of the plan created in `beforeEach`, as the main agent does, preparing the arguments as the agent loop does. */
 	async function assign(taskIds: string[], extra: Record<string, unknown> = {}) {
-		return await f.tools
-			.get("assign_tasks")!
-			.execute("assign", { revision: 1, taskIds, ...extra }, undefined, undefined, f.ctx);
+		const tool = f.tools.get("assign_tasks")!;
+		return await tool.execute(
+			"assign",
+			tool.prepareArguments!({ revision: 1, taskIds, ...extra }),
+			undefined,
+			undefined,
+			f.ctx,
+		);
 	}
 
 	it("sends the objective, the step names and the task's own details, and no other step's details", async () => {
@@ -1270,14 +1363,31 @@ describe("tier classifier in assign_tasks", () => {
 	});
 
 	it.each([
-		["a model", { model: "haiku" }],
-		["a tier", { tier: "light" }],
-	])("applies %s chosen for the call to every task and skips the rating", async (_name, choice) => {
+		["a model", { model: "haiku" }, "caller-model"],
+		["a tier", { tier: "light" }, "caller-tier"],
+	])("applies %s chosen for the call to every task and records the skipped rating", async (_name, choice, reason) => {
 		await assign(["1", "2"], choice);
 
 		expect(f.classify).not.toHaveBeenCalled();
-		expect(f.appendEntry.mock.calls.filter(([type]) => type === tierClassificationEntryType)).toEqual([]);
+		const skipped = { mode: "apply", agent: "worker", profileTier: "medium", outcome: "skipped", reason };
+		expect(recorded(f)).toEqual([skipped, skipped]);
 		expect(new Set(routes(f).map((route) => route.model)).size).toBe(1);
+	});
+
+	it("treats a blank model, tier or reasoningEffort as not chosen and rates every task", async () => {
+		await assign(["1", "2"], { model: "", tier: "", reasoningEffort: "" });
+
+		expect(f.classify).toHaveBeenCalledTimes(2);
+		expect(routes(f)).toEqual([heavyRoute, heavyRoute]);
+	});
+
+	it("lets --planning-model apply when the call's model is blank", async () => {
+		vi.mocked(f.pi.getFlag).mockImplementation((name) => (name === "planning-model" ? "haiku" : undefined));
+
+		await assign(["1"], { model: " " });
+
+		expect(routes(f).map((route) => route.model)).toEqual([lightRoute.model]);
+		expect(recorded(f)).toEqual([expect.objectContaining({ outcome: "skipped", reason: "caller-model" })]);
 	});
 
 	it("falls back to the profile's tier for every task when the classifier fails", async () => {
@@ -1303,5 +1413,63 @@ describe("tier classifier in assign_tasks", () => {
 
 		await expect(pending).rejects.toThrow("Task assignment aborted before starting");
 		expect(f.spawn).not.toHaveBeenCalled();
+	});
+});
+
+describe("the shipped worker profile", () => {
+	// It pins claude-opus-5-5 at xhigh, so the classifier has nothing to decide; the parent's effort is "low".
+	const pinnedRoute = { model: "test-provider/claude-opus-5-5", thinkingLevel: "xhigh" };
+	let f: Fixture;
+
+	afterEach(async () => {
+		await disposeFixture(f);
+	});
+
+	/** No rater is asked; each of the `count` worker tasks is recorded as skipped for its pinned profile model. */
+	function expectOnlySkipped(count: number) {
+		expect(f.getAvailableOfType).not.toHaveBeenCalled();
+		expect(f.classify).not.toHaveBeenCalled();
+		expect(f.streamSimple).not.toHaveBeenCalled();
+		const skipped = { mode: "apply", agent: "worker", outcome: "skipped", reason: "profile-model" };
+		expect(recorded(f)).toEqual(Array.from({ length: count }, () => skipped));
+	}
+
+	it("is not rated by the subagent tool in apply mode, with or without a classifier model", async () => {
+		f = createFixture(subagentExtension, "shipped");
+		f.mode = "apply";
+		for (const available of [[luna], []]) {
+			f.available = available;
+			await f.tools
+				.get("subagent")!
+				.execute(
+					"call",
+					{ agentScope: "project", background: true, agent: "worker", task: "Redesign the cache" },
+					undefined,
+					undefined,
+					f.ctx,
+				);
+		}
+
+		expect(routes(f)).toEqual([pinnedRoute, pinnedRoute]);
+		expectOnlySkipped(2);
+	});
+
+	it("is not rated by assign_tasks in apply mode", async () => {
+		f = createFixture(planningExtension, "shipped");
+		f.mode = "apply";
+		const tasks = [
+			{ name: "Search schema", order: 1, description: "Define the search result" },
+			{ name: "Search API", order: 1, description: "Implement product search over the schema" },
+		];
+		await f.tools
+			.get("create_plan")!
+			.execute("plan", { objective: "Searchable product catalog", tasks }, undefined, undefined, f.ctx);
+
+		await f.tools
+			.get("assign_tasks")!
+			.execute("assign", { revision: 1, taskIds: ["1", "2"] }, undefined, undefined, f.ctx);
+
+		expect(routes(f)).toEqual([pinnedRoute, pinnedRoute]);
+		expectOnlySkipped(2);
 	});
 });

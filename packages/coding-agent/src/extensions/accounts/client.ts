@@ -66,9 +66,13 @@ export type BrokerUsage =
 /** A model an account or pool can serve, as reported by the broker. */
 export interface BrokerModel {
 	id: string;
-	/** The broker's bundled catalog confirms this is a chat model. */
-	kind?: "chat";
+	/** The broker's bundled catalog confirms a chat model, or the broker serves it as a classifier. */
+	kind?: "chat" | "classifier";
 	displayName?: string;
+	/** oh-my-pi's provider for the model on this account (`anthropic`, `openai-codex`, `openai`). */
+	provider?: string;
+	/** oh-my-pi's API for the model on this account (`anthropic-messages`, `openai-codex-responses`, `openai-responses`). */
+	api?: string;
 	contextLength?: number;
 	maxCompletionTokens?: number;
 	thinking: boolean;
@@ -177,8 +181,8 @@ export class BrokerClient {
 	}
 
 	/**
-	 * Base URL of a target. It serves every protocol: Pi's adapters append `/v1/messages`, `/responses`
-	 * or `/chat/completions`, so one pool can mix Claude and GPT models.
+	 * Base URL of a target. Chat appends `/pi/stream` (oh-my-pi's pi-native protocol) and classifiers append
+	 * `/systemone`, so one pool can mix Claude and GPT models: oh-my-pi speaks each provider's wire.
 	 */
 	routeBaseUrl(connection: BrokerConnection, target: BrokerTarget): string {
 		const segment = target.type === "account" ? `a.${target.key}` : `p.${encodeURIComponent(target.name)}`;
@@ -585,6 +589,10 @@ function parseKind(value: unknown): BrokerAccountKind {
 	return value === "api-key" || value === "api-credits" ? value : "oauth";
 }
 
+function parseModelKind(value: unknown): BrokerModel["kind"] {
+	return value === "chat" || value === "classifier" ? value : undefined;
+}
+
 function parseModelCost(data: unknown): ModelCostRates | undefined {
 	const input = optionalNumber(data, "input");
 	const output = optionalNumber(data, "output");
@@ -603,8 +611,10 @@ function parseModels(data: unknown): BrokerModel[] {
 		return [
 			{
 				id,
-				kind: field(entry, "kind") === "chat" ? "chat" : undefined,
+				kind: parseModelKind(field(entry, "kind")),
 				displayName: optionalString(entry, "displayName"),
+				provider: optionalString(entry, "provider"),
+				api: optionalString(entry, "api"),
 				contextLength: optionalNumber(entry, "contextLength"),
 				maxCompletionTokens: optionalNumber(entry, "maxCompletionTokens"),
 				thinking: field(entry, "thinking") === true,

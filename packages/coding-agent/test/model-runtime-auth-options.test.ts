@@ -88,7 +88,7 @@ describe("ModelRuntime auth options", () => {
 				}),
 				expect.objectContaining({
 					type: "oauth",
-					provider: expect.objectContaining({ id: "anthropic", name: "Anthropic" }),
+					provider: expect.objectContaining({ id: "github-copilot", name: "GitHub Copilot" }),
 				}),
 				expect.objectContaining({
 					type: "api_key",
@@ -108,7 +108,7 @@ describe("ModelRuntime auth options", () => {
 	it("attaches the provider's active auth status to every method option", async () => {
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory({
-				anthropic: {
+				openai: {
 					type: "oauth",
 					access: "access",
 					refresh: "refresh",
@@ -118,18 +118,18 @@ describe("ModelRuntime auth options", () => {
 			modelsPath: null,
 		});
 
-		const options = authOptions(runtime).filter((option) => option.provider.id === "anthropic");
+		const options = authOptions(runtime).filter((option) => option.provider.id === "openai");
 		expect(options).toHaveLength(2);
-		expect(await runtime.checkAuth("anthropic")).toMatchObject({ type: "oauth" });
+		expect(await runtime.checkAuth("openai")).toMatchObject({ type: "oauth" });
 	});
 
 	it("distinguishes subscription OAuth from generic OAuth sign-in", async () => {
 		const runtime = await ModelRuntime.create({
 			credentials: AuthStorage.inMemory({
-				anthropic: {
+				"openai-codex": {
 					type: "oauth",
-					access: "anthropic-access",
-					refresh: "anthropic-refresh",
+					access: "codex-access",
+					refresh: "codex-refresh",
 					expires: Date.now() + 60 * 60_000,
 				},
 				openrouter: {
@@ -148,8 +148,8 @@ describe("ModelRuntime auth options", () => {
 			modelsPath: null,
 		});
 
-		expect(runtime.isUsingOAuth("anthropic")).toBe(true);
-		expect(runtime.isUsingSubscription("anthropic")).toBe(true);
+		expect(runtime.isUsingOAuth("openai-codex")).toBe(true);
+		expect(runtime.isUsingSubscription("openai-codex")).toBe(true);
 		expect(runtime.isUsingOAuth("openrouter")).toBe(true);
 		expect(runtime.isUsingSubscription("openrouter")).toBe(false);
 		expect(runtime.isUsingOAuth("radius")).toBe(true);

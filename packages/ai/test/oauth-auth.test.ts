@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
-import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import { githubCopilotOAuth } from "../src/auth/oauth/github-copilot.ts";
 import { kimiCodingOAuth } from "../src/auth/oauth/kimi-coding.ts";
 import { openaiChatGPTOAuth } from "../src/auth/oauth/openai-chatgpt.ts";
@@ -9,7 +8,6 @@ import { openRouterOAuth } from "../src/auth/oauth/openrouter.ts";
 import { xaiOAuth } from "../src/auth/oauth/xai.ts";
 import { createModels } from "../src/models.ts";
 import * as extensionOAuthCompatibility from "../src/oauth.ts";
-import { anthropicProvider } from "../src/providers/anthropic.ts";
 import { githubCopilotProvider } from "../src/providers/github-copilot.ts";
 import { openaiProvider } from "../src/providers/openai.ts";
 
@@ -30,22 +28,10 @@ describe.sequential("OAuthAuth adapters", () => {
 	});
 
 	it("identifies only subscription-backed OAuth flows as subscriptions", () => {
-		for (const oauth of [
-			anthropicOAuth,
-			openaiChatGPTOAuth,
-			openaiCodexOAuth,
-			githubCopilotOAuth,
-			kimiCodingOAuth,
-			xaiOAuth,
-		]) {
+		for (const oauth of [openaiChatGPTOAuth, openaiCodexOAuth, githubCopilotOAuth, kimiCodingOAuth, xaiOAuth]) {
 			expect(oauth.isSubscription).toBe(true);
 		}
 		expect(openRouterOAuth.isSubscription).not.toBe(true);
-	});
-
-	it("anthropic toAuth derives the api key from the access token", async () => {
-		const auth = await anthropicOAuth.toAuth({ type: "oauth", access: "token", refresh: "r", expires: 0 });
-		expect(auth).toEqual({ apiKey: "token" });
 	});
 
 	it("OpenAI exposes ChatGPT OAuth alongside API-key auth", () => {
@@ -99,24 +85,6 @@ describe.sequential("OAuthAuth adapters", () => {
 		expect(individual.baseUrl).toBe("https://api.individual.githubcopilot.com");
 	});
 
-	it("anthropic refresh exchanges the refresh token and returns a typed credential", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () =>
-				jsonResponse({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 3600 }),
-			),
-		);
-
-		const refreshed = await anthropicOAuth.refresh(
-			{ type: "oauth", access: "old", refresh: "old-r", expires: 0 },
-			neverAbortedSignal,
-		);
-		expect(refreshed.type).toBe("oauth");
-		expect(refreshed.access).toBe("new-access");
-		expect(refreshed.refresh).toBe("new-refresh");
-		expect(refreshed.expires).toBeGreaterThan(Date.now());
-	});
-
 	it("github-copilot refresh preserves the enterprise domain", async () => {
 		const fetchedUrls: string[] = [];
 		const fetchMock = vi.fn(async (input: unknown) => {
@@ -146,24 +114,6 @@ describe.sequential("OAuthAuth adapters", () => {
 });
 
 describe("OAuth through Models.getAuth (lazy load chain)", () => {
-	it("resolves stored anthropic oauth credentials via the lazy flow import", async () => {
-		const credentials = new InMemoryCredentialStore();
-		await credentials.modify("anthropic", async () => ({
-			type: "oauth",
-			access: "oauth-access-token",
-			refresh: "r",
-			// Keep this beyond getAuth()'s refresh window.
-			expires: Date.now() + 10 * 60_000,
-		}));
-		const models = createModels({ credentials });
-		models.setProvider(anthropicProvider());
-
-		const model = models.getModels("anthropic")[0];
-		const result = await models.getAuth(model.provider);
-		expect(result?.auth.apiKey).toBe("oauth-access-token");
-		expect(result?.source).toBe("OAuth");
-	});
-
 	it("resolves stored github-copilot oauth credentials including per-credential baseUrl", async () => {
 		const access = "tid=abc;exp=123;proxy-ep=proxy.business.githubcopilot.com;rest";
 		const credentials = new InMemoryCredentialStore();

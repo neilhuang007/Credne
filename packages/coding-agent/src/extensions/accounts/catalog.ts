@@ -9,6 +9,7 @@ import type {
 	ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 import type { BrokerAccount, BrokerAccountKind, BrokerModel } from "./client.ts";
+import { OMP_NATIVE_API, type OmpIdentity } from "./omp-native.ts";
 
 /** Prefix of providers that pin one broker account. */
 export const ACCOUNT_PROVIDER_PREFIX = "acct:";
@@ -34,12 +35,43 @@ export const BROKER_PLACEHOLDER_URL = "http://127.0.0.1/credne-broker";
 
 /** Broker provider key of OpenAI API keys. ChatGPT subscriptions are `codex`. */
 const OPENAI_API_PROVIDER = "openai-api";
-/** The only model of OpenAI's Decisions API. */
-const DECISIONS_MODEL_ID = "gpt-6-luna";
-/** Pi's built-in provider whose catalog entry describes the Decisions model. */
-const DECISIONS_CATALOG_PROVIDER = "openai";
-/** The classifier API the broker's decisions route speaks. */
-const DECISIONS_API = "openai-decisions";
+/** Broker provider key of TypeSafe (Jev) API keys. */
+export const TYPESAFE_PROVIDER = "typesafe";
+/** The only classifier of an OpenAI API key: the model of OpenAI's Decisions API. */
+const LUNA_MODEL_ID = "gpt-6-luna";
+/** The API of every account classifier: the broker's `systemone` route speaks TypeSafe's System One wire. */
+const SYSTEM_ONE_API = "typesafe-system-one";
+
+/** Which broker models of an API-key provider are classifiers, and the Pi catalog entry that describes them. */
+interface ClassifierSource {
+	/** Pi's built-in provider and model whose entry the classifiers copy for cost, limits and input. */
+	catalogProvider: string;
+	catalogModelId: string;
+	/** The API of that entry, which is not the route's: luna's entry is Decisions. An entry with another API is not used. */
+	catalogApi: ClassifierApi;
+	serves(model: BrokerModel): boolean;
+}
+
+const CLASSIFIER_SOURCES = new Map<string, ClassifierSource>([
+	[
+		OPENAI_API_PROVIDER,
+		{
+			catalogProvider: "openai",
+			catalogModelId: LUNA_MODEL_ID,
+			catalogApi: "openai-decisions",
+			serves: (model) => model.id === LUNA_MODEL_ID,
+		},
+	],
+	[
+		TYPESAFE_PROVIDER,
+		{
+			catalogProvider: "typesafe",
+			catalogModelId: "jev-latest",
+			catalogApi: SYSTEM_ONE_API,
+			serves: (model) => model.kind === "classifier",
+		},
+	],
+]);
 
 /** A broker account as cached for synchronous provider registration at startup. No secrets. */
 export interface CachedAccount {
@@ -52,7 +84,9 @@ export interface CachedAccount {
 	plan?: string;
 	disabled: boolean;
 	models: Model<Api>[];
-	/** Classifier models the broker serves for this account: the Decisions model of an OpenAI API key. */
+	/** oh-my-pi's provider and API for each model ID the broker reported them for. */
+	upstream?: Record<string, OmpIdentity>;
+	/** Classifier models the broker serves for this account: gpt-6-luna of an OpenAI API key, the Jev models of a TypeSafe key. */
 	classifiers?: ClassifierModel<ClassifierApi>[];
 }
 
@@ -62,21 +96,28 @@ export interface CachedPool {
 	name: string;
 	accountCount: number;
 	models: Model<Api>[];
-	/** Classifier models the broker serves for this pool: `pool:openai` offers the Decisions model. */
+	/**
+	 * oh-my-pi's provider and API for each model ID whose serving accounts all share one. An ID that different
+	 * accounts serve through different providers, such as a GPT model on a ChatGPT subscription and an OpenAI key,
+	 * has none: the pool does not know which one answers.
+	 */
+	upstream?: Record<string, OmpIdentity>;
+	/** Classifier models the broker serves for this pool: `pool:openai` offers gpt-6-luna, `pool:typesafe` the Jev models. */
 	classifiers?: ClassifierModel<ClassifierApi>[];
 }
 
 /**
  * Last known accounts and their Pi models. Pi registers one provider per entry from this file
  * before the broker is contacted, so sessions that selected an account or pool restore it on startup.
+ * Version 3 stores chat models on the `omp-native` API; older files name APIs the providers no longer serve.
  */
 export interface AccountCatalog {
-	version: 2;
+	version: 3;
 	accounts: CachedAccount[];
 	pools: CachedPool[];
 }
 
-export const EMPTY_CATALOG: AccountCatalog = { version: 2, accounts: [], pools: [] };
+export const EMPTY_CATALOG: AccountCatalog = { version: 3, accounts: [], pools: [] };
 
 /** Catalog file contents, or an empty catalog when the file is missing, outdated or unreadable. */
 export function readCatalog(path: string): AccountCatalog {
@@ -89,7 +130,7 @@ export function readCatalog(path: string): AccountCatalog {
 	// The file is written by this extension, but may be from another version or hand-edited.
 	if (typeof data !== "object" || data === null) return EMPTY_CATALOG;
 	const catalog = data as Partial<AccountCatalog>;
-	if (catalog.version !== 2 || !Array.isArray(catalog.accounts) || !Array.isArray(catalog.pools)) {
+	if (catalog.version !== 3 || !Array.isArray(catalog.accounts) || !Array.isArray(catalog.pools)) {
 		return EMPTY_CATALOG;
 	}
 	const accounts = catalog.accounts
@@ -101,17 +142,40 @@ export function readCatalog(path: string): AccountCatalog {
 				Array.isArray(entry.models) &&
 				entry.kind !== "api-credits",
 		)
-		.map((entry) => ({ ...entry, classifiers: readClassifiers(entry.classifiers) }));
+		.map((entry) => ({
+			...entry,
+			upstream: readUpstream(entry.upstream),
+			classifiers: readClassifiers(entry.classifiers),
+		}));
 	// Older catalogs omitted pool:all and pool:claude when they were served locally.
-	return { version: 2, accounts, pools: buildPools(accounts) };
+	return { version: 3, accounts, pools: buildPools(accounts) };
 }
 
-/** The classifier models of a catalog file entry that this version serves. Files from before classifiers have none. */
+/** The identities of a catalog file entry that are well formed. Files from before the broker reported them have none. */
+function readUpstream(value: unknown): Record<string, OmpIdentity> | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const entries = Object.entries(value).flatMap(([modelId, identity]: [string, Partial<OmpIdentity> | null]) =>
+		typeof identity?.provider === "string" && typeof identity.api === "string"
+			? [[modelId, { provider: identity.provider, api: identity.api }] as const]
+			: [],
+	);
+	return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+/** The identity of `modelId` in an `upstream` table. Model IDs come from the broker, so inherited keys do not count. */
+export function upstreamIdentity(
+	upstream: Readonly<Record<string, OmpIdentity>> | undefined,
+	modelId: string,
+): OmpIdentity | undefined {
+	return upstream && Object.hasOwn(upstream, modelId) ? upstream[modelId] : undefined;
+}
+
+/** The classifier models of a catalog file entry that this version serves. Entries of other APIs, such as Decisions, are dropped. */
 function readClassifiers(value: unknown): ClassifierModel<ClassifierApi>[] | undefined {
 	if (!Array.isArray(value)) return undefined;
 	return value.filter(
 		(entry): entry is ClassifierModel<ClassifierApi> =>
-			entry?.type === "classifier" && entry.api === DECISIONS_API && typeof entry.id === "string",
+			entry?.type === "classifier" && entry.api === SYSTEM_ONE_API && typeof entry.id === "string",
 	);
 }
 
@@ -148,14 +212,6 @@ export function sharedRouteFamily(family: string): string {
 	return family === "xai-oauth" ? "xai" : family;
 }
 
-/** Pi API adapter used for a model family. */
-export function apiForFamily(family: string): Api {
-	if (family === "claude") return "anthropic-messages";
-	if (family === "codex" || family === "openai") return "openai-responses";
-	// Other providers go through the daemon's Chat Completions gateway.
-	return "openai-completions";
-}
-
 /** Pi's built-in providers whose catalog describes the same upstream models. */
 const CATALOG_SOURCES = new Map<string, readonly string[]>([
 	["claude", ["anthropic"]],
@@ -187,6 +243,7 @@ export function familyTitle(family: string): string {
 	if (family === "claude") return "Claude";
 	if (family === "codex") return "ChatGPT Codex";
 	if (family === "openai") return "OpenAI API";
+	if (family === TYPESAFE_PROVIDER) return "TypeSafe";
 	return family.charAt(0).toUpperCase() + family.slice(1);
 }
 
@@ -197,8 +254,9 @@ export function poolDisplayName(pool: Pick<CachedPool, "name" | "accountCount">)
 
 /**
  * Build the catalog from broker data, using Pi's model metadata where available. Each family with
- * an enabled account gets a broker pool, as does the union of all families. OpenAI API keys and
- * their family pool also offer the Decisions classifier if the key lists it.
+ * an enabled account gets a broker pool, as does the union of all families. OpenAI API keys offer the
+ * gpt-6-luna classifier if the key lists it, and TypeSafe keys offer their Jev classifiers instead of
+ * chat models. Each family pool offers the classifiers of its accounts.
  */
 export function buildCatalog(
 	brokerAccounts: readonly BrokerAccount[],
@@ -209,6 +267,7 @@ export function buildCatalog(
 	const accounts = brokerAccounts.filter((account) => account.kind !== "api-credits");
 	const cachedAccounts = accounts.map((account): CachedAccount => {
 		const providerId = accountProviderId(account.id);
+		const served = chatModels(account, accountModels, lookup);
 		return {
 			id: account.id,
 			key: account.key,
@@ -218,14 +277,13 @@ export function buildCatalog(
 			email: account.email,
 			plan: account.plan,
 			disabled: account.disabled,
-			models: chatModels(account, accountModels, lookup).map((model) =>
-				toPiModel(providerId, familyOf(account.provider), model, lookup),
-			),
-			classifiers: decisionsClassifiers(providerId, account, accountModels, lookupClassifier),
+			models: served.map((model) => toPiModel(providerId, familyOf(account.provider), model, lookup)),
+			upstream: accountUpstream(served),
+			classifiers: accountClassifiers(providerId, account, accountModels, lookupClassifier),
 		};
 	});
 
-	return { version: 2, accounts: cachedAccounts, pools: buildPools(cachedAccounts) };
+	return { version: 3, accounts: cachedAccounts, pools: buildPools(cachedAccounts) };
 }
 
 function buildPools(accounts: readonly CachedAccount[]): CachedPool[] {
@@ -235,15 +293,45 @@ function buildPools(accounts: readonly CachedAccount[]): CachedPool[] {
 	return [ALL_POOL, ...families].map((name) => {
 		const members = name === ALL_POOL ? enabled : enabled.filter((account) => familyOf(account.provider) === name);
 		const provider = poolProviderId(name);
-		// The broker's Decisions route is restricted to pinned OpenAI API keys and their family pool.
-		const classifiers = name === "openai" ? members.find((account) => account.classifiers)?.classifiers : undefined;
+		// The broker's classifier routes are restricted to pinned API keys and their family pool, never pool:all.
+		const classifiers = name === ALL_POOL ? undefined : members.find((account) => account.classifiers)?.classifiers;
+		const models = poolModels(provider, members);
 		return {
 			name,
 			accountCount: members.length,
-			models: poolModels(provider, members),
+			models,
+			upstream: poolUpstream(members, models),
 			classifiers: classifiers?.map((model) => ({ ...model, provider })),
 		};
 	});
+}
+
+/** The identities the broker reported for the models of an account. A model it reported none for has no entry. */
+function accountUpstream(models: readonly BrokerModel[]): Record<string, OmpIdentity> | undefined {
+	const entries = models.flatMap((model) =>
+		model.provider !== undefined && model.api !== undefined
+			? [[model.id, { provider: model.provider, api: model.api }] as const]
+			: [],
+	);
+	return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+/** The identity of each pool model that every account serving it reports, and reports the same. */
+function poolUpstream(
+	members: readonly CachedAccount[],
+	models: readonly Model<Api>[],
+): Record<string, OmpIdentity> | undefined {
+	const entries = models.flatMap(({ id }) => {
+		const identities = members
+			.filter((account) => account.models.some((model) => model.id === id))
+			.map((account) => upstreamIdentity(account.upstream, id));
+		const [first] = identities;
+		const isShared = identities.every(
+			(identity) => identity?.provider === first?.provider && identity?.api === first?.api,
+		);
+		return first && isShared ? [[id, first] as const] : [];
+	});
+	return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
 function poolModels(provider: string, members: readonly CachedAccount[]): Model<Api>[] {
@@ -299,7 +387,7 @@ function chatModels(
 	accountModels: ReadonlyMap<string, readonly BrokerModel[]>,
 	lookup: CatalogLookup,
 ): readonly BrokerModel[] {
-	const models = accountModels.get(account.key) ?? [];
+	const models = (accountModels.get(account.key) ?? []).filter((model) => model.kind !== "classifier");
 	// OpenAI lists image, audio and embedding IDs too. Either catalog can positively identify a chat model.
 	return account.provider === OPENAI_API_PROVIDER
 		? models.filter((model) => model.kind === "chat" || lookup("openai", model.id))
@@ -307,35 +395,41 @@ function chatModels(
 }
 
 /**
- * The Decisions classifier of a pinned OpenAI API key that lists the model. The Decisions API
- * rejects ChatGPT sign-in credentials. The model uses Pi's built-in cost and limits.
+ * The classifiers of a pinned API-key account: gpt-6-luna of an OpenAI key that lists it, or the Jev
+ * models of a TypeSafe key. Only API keys qualify; OpenAI's Decisions API, which serves luna, rejects
+ * ChatGPT sign-in credentials. Each model uses the built-in entry's cost, limits and input, and the
+ * System One API of the broker route.
  */
-function decisionsClassifiers(
+function accountClassifiers(
 	providerId: string,
 	account: BrokerAccount,
 	accountModels: ReadonlyMap<string, readonly BrokerModel[]>,
 	lookupClassifier: ClassifierLookup | undefined,
 ): ClassifierModel<ClassifierApi>[] | undefined {
-	if (
-		account.provider !== OPENAI_API_PROVIDER ||
-		account.kind !== "api-key" ||
-		!(accountModels.get(account.key) ?? []).some((model) => model.id === DECISIONS_MODEL_ID)
-	)
-		return undefined;
-	const known = lookupClassifier?.(DECISIONS_CATALOG_PROVIDER, DECISIONS_MODEL_ID);
-	if (known?.api !== DECISIONS_API) return undefined;
-	return [{ ...known, provider: providerId, baseUrl: BROKER_PLACEHOLDER_URL }];
+	const source = CLASSIFIER_SOURCES.get(account.provider);
+	if (!source || account.kind !== "api-key") return undefined;
+	const known = lookupClassifier?.(source.catalogProvider, source.catalogModelId);
+	if (known?.api !== source.catalogApi) return undefined;
+	const served = (accountModels.get(account.key) ?? []).filter(source.serves);
+	if (served.length === 0) return undefined;
+	return served.map((model) => ({
+		...known,
+		id: model.id,
+		name: model.displayName ?? (model.id === known.id ? known.name : model.id),
+		api: SYSTEM_ONE_API,
+		provider: providerId,
+		baseUrl: BROKER_PLACEHOLDER_URL,
+	}));
 }
 
 function toPiModel(providerId: string, family: string, model: BrokerModel, lookup: CatalogLookup): Model<Api> {
-	const api = apiForFamily(family);
 	const known = (CATALOG_SOURCES.get(family) ?? [family]).map((source) => lookup(source, model.id)).find(Boolean);
 	const input: Model<Api>["input"] =
 		known?.input ?? (model.inputModalities?.includes("image") ? ["text", "image"] : ["text"]);
 	const piModel: Model<Api> = {
 		id: model.id,
 		name: known?.name ?? model.displayName ?? model.id,
-		api,
+		api: OMP_NATIVE_API,
 		provider: providerId,
 		baseUrl: BROKER_PLACEHOLDER_URL,
 		reasoning: known?.reasoning ?? model.thinking,
@@ -351,8 +445,6 @@ function toPiModel(providerId: string, family: string, model: BrokerModel, looku
 	if (known?.samplingParams) piModel.samplingParams = known.samplingParams;
 	if (known?.samplingParamsByThinkingLevel)
 		piModel.samplingParamsByThinkingLevel = known.samplingParamsByThinkingLevel;
-	const compat = brokerCompat(api, known?.compat);
-	if (compat) piModel.compat = compat;
 	return piModel;
 }
 
@@ -366,30 +458,4 @@ function brokerThinkingLevelMap(model: BrokerModel): ThinkingLevelMap | undefine
 		if (level !== "off") map[level] = levels.includes(level) ? level : null;
 	}
 	return map;
-}
-
-/**
- * Compatibility flags for the daemon's protocol gateway. Pi sends a portable request shape; the
- * daemon's provider adapters apply upstream-specific options. Anthropic message threads stay off:
- * their server-side continuation state is bound to one account. Session affinity headers let pools
- * keep a conversation on one account.
- */
-function brokerCompat(api: Api, known: Model<Api>["compat"]): Model<Api>["compat"] {
-	const source = (known ?? {}) as Record<string, unknown>;
-	if (api === "anthropic-messages") {
-		const kept = pick(source, ["forceAdaptiveThinking", "supportsStrictTools", "supportsTemperature"]);
-		return { ...kept, supportsMessageThreads: false, sendSessionAffinityHeaders: true } as Model<Api>["compat"];
-	}
-	if (api === "openai-responses") {
-		return pick(source, ["supportsMidConvoSystemMessages"]) as Model<Api>["compat"];
-	}
-	return undefined;
-}
-
-function pick(source: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
-	const result: Record<string, unknown> = {};
-	for (const key of keys) {
-		if (source[key] !== undefined) result[key] = source[key];
-	}
-	return result;
 }

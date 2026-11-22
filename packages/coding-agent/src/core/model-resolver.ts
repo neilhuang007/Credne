@@ -18,7 +18,12 @@ import { isBrokerProvider } from "../extensions/accounts/catalog.ts";
 import { resolveModelAlias } from "../extensions/subagent/model-aliases.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
-import { GLOBAL_BROKER_PROVIDER, getAutomaticModelChoices, getModelSelectionChoices } from "./model-selection.ts";
+import {
+	GLOBAL_BROKER_PROVIDER,
+	getAutomaticModelChoices,
+	getModelSelectionChoices,
+	getPinnedAccountModels,
+} from "./model-selection.ts";
 
 /** Default chat model IDs for providers with built-in chat models. */
 export const defaultModelPerProvider: Partial<Record<KnownProvider, string>> = {
@@ -74,17 +79,22 @@ export interface ScopedModel {
 
 type ModelSelectionScope = "all" | "scoped";
 
-/** Finds exact IDs and broker aliases for the model command and picker, without choosing between tied routes. */
+/**
+ * Finds exact IDs and broker aliases for the model command and picker, without choosing between tied routes.
+ * `pinned` is the provider in effect: an account it names keeps the IDs and aliases it serves.
+ */
 export function getExactModelSelectionMatches(
 	text: string,
 	models: readonly Model<Api>[],
 	scope: ModelSelectionScope,
+	pinned?: string,
 ): readonly Model<Api>[] {
 	const result = resolveModelSelectionReference(
 		{ text, thinkingSuffix: "none", fuzzy: false },
 		models,
 		() => true,
 		scope,
+		pinned,
 	);
 	if (result.status === "resolved") return [result.model];
 	return result.status === "ambiguous" ? result.candidates : [];
@@ -95,6 +105,7 @@ function resolveModelSelectionReference(
 	models: readonly Model<Api>[],
 	usable: (provider: string) => boolean,
 	scope: ModelSelectionScope,
+	pinned?: string,
 ): ModelReferenceResult {
 	if (!USES_BROKER_AUTH) return resolveModelReference(request, models, usable);
 	const text = request.text.trim();
@@ -102,8 +113,16 @@ function resolveModelSelectionReference(
 	const provider = request.provider ?? (named && isBrokerProvider(named) ? named : undefined);
 	// A broker qualifier outside the scope is not a bare model ID or a search on another route.
 	if (!provider && text.includes("/") && isBrokerProvider(text.toLowerCase())) return { status: "not-found" };
-	const choices = scope === "scoped" || provider ? models : getModelSelectionChoices(models);
-	return resolveModelReference({ ...request, provider, aliases: "broker" }, choices, usable);
+	const brokerRequest: ModelReferenceRequest = { ...request, provider, aliases: "broker" };
+	if (scope === "scoped" || provider) return resolveModelReference(brokerRequest, models, usable);
+	// An alias names the first model of its family that is served, which may be one only the pool has.
+	// The pinned account answers exact IDs and aliases first; a miss falls through to the shared choices.
+	const accountModels = getPinnedAccountModels(models, pinned);
+	if (accountModels.length > 0) {
+		const accountResult = resolveModelReference({ ...brokerRequest, fuzzy: false }, accountModels, usable);
+		if (accountResult.status === "resolved") return accountResult;
+	}
+	return resolveModelReference(brokerRequest, getModelSelectionChoices(models, pinned), usable);
 }
 
 /*
@@ -383,11 +402,13 @@ export interface ResolveModelScopeResult {
  * Resolve scope patterns (`--models`, `enabledModels`) to models with optional thinking levels.
  *
  * Every model in `models` is usable, so credentials cannot choose between providers offering the same
- * id. Pi adds them all with a warning. Credne requires a qualifier to scope an ambiguous ID.
+ * id. Pi adds them all with a warning. Credne requires a qualifier to scope an ambiguous ID. `pinned` is
+ * the provider in effect: an `acct:` provider keeps the bare patterns on that account for the IDs it serves.
  */
 export function resolveModelScopeFromModels(
 	patterns: string[],
 	models: readonly Model<Api>[],
+	pinned?: string,
 ): ResolveModelScopeResult {
 	const scopedModels: ScopedModel[] = [];
 	const diagnostics: ModelScopeDiagnostic[] = [];
@@ -408,7 +429,7 @@ export function resolveModelScopeFromModels(
 		});
 	};
 
-	const choices = getModelSelectionChoices(models);
+	const choices = getModelSelectionChoices(models, pinned);
 	for (const pattern of patterns) {
 		// A qualified glob can intentionally restrict a billing route (e.g. acct:claude-*/*).
 		const providerPattern = pattern.slice(0, Math.max(0, pattern.lastIndexOf("/")));
@@ -443,7 +464,7 @@ export function resolveModelScopeFromModels(
 						minimatch(m.id, globPattern, { nocase: true }),
 				);
 				// A bare glob must not make an ambiguous family route the startup selection.
-				if (modelFirst) matches = getAutomaticModelChoices(matches);
+				if (modelFirst) matches = getAutomaticModelChoices(matches, pinned);
 			}
 			if (matches.length === 0) noMatch(pattern);
 			for (const model of matches) add(model, thinkingLevel);
@@ -477,8 +498,9 @@ export async function resolveModelScopeWithDiagnostics(
 	patterns: string[],
 	modelRuntime: ModelRuntime,
 	options?: AuthOperationOptions,
+	pinned?: string,
 ): Promise<ResolveModelScopeResult> {
-	return resolveModelScopeFromModels(patterns, await modelRuntime.getAvailable(undefined, options));
+	return resolveModelScopeFromModels(patterns, await modelRuntime.getAvailable(undefined, options), pinned);
 }
 
 export interface ResolveCliModelResult {
@@ -511,9 +533,11 @@ export function resolveCliModel(options: {
 	inlineApiKey?: boolean;
 	/** In Credne, a bare reference must not broaden a configured scope to all accounts. */
 	scopedModels?: readonly ScopedModel[];
+	/** Saved default provider. In Credne, an `acct:` one keeps a bare reference on that account for the IDs it serves. */
+	defaultProvider?: string;
 	modelRuntime: ModelRuntime;
 }): ResolveCliModelResult {
-	const { cliProvider, cliModel, cliThinking, inlineApiKey, scopedModels, modelRuntime } = options;
+	const { cliProvider, cliModel, cliThinking, inlineApiKey, scopedModels, defaultProvider, modelRuntime } = options;
 
 	if (!cliModel) {
 		return { model: undefined, warning: undefined, error: undefined };
@@ -551,6 +575,7 @@ export function resolveCliModel(options: {
 		// An inline key goes to whichever provider is selected, so stored credentials must not choose it
 		inlineApiKey ? () => false : (providerId) => modelRuntime.hasConfiguredAuth(providerId),
 		scope ? "scoped" : "all",
+		defaultProvider,
 	);
 	if (result.status === "resolved") {
 		return { model: result.model, thinkingLevel: result.thinkingLevel, warning: result.warning, error: undefined };
@@ -656,8 +681,8 @@ export async function findInitialModel(options: {
 		}
 	}
 
-	// 3. Try first available model with valid credentials
-	const availableModels = getAutomaticModelChoices(modelRuntime.getAvailableSnapshot());
+	// 3. Try first available model with valid credentials, preferring the saved default's account
+	const availableModels = getAutomaticModelChoices(modelRuntime.getAvailableSnapshot(), defaultProvider);
 
 	if (availableModels.length > 0) {
 		// Try to find a default model from known providers

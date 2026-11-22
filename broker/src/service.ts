@@ -1,13 +1,14 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { TYPESAFE_DEFAULT_BASE_URL } from "@oh-my-pi/pi-catalog/discovery/typesafe";
 import { lock } from "proper-lockfile";
 import { Accounts, atomicJson, boundedText, HttpError, publicAccount, publicModels } from "./accounts.ts";
-import { decisionsError } from "./decisions.ts";
 import { Gateway, protocolError } from "./gateway.ts";
+import { keyRouteError } from "./key-route.ts";
 import { Logins } from "./logins.ts";
 import { publicProviders } from "./providers.ts";
-import { fetchAccountUsage } from "./usage.ts";
+import { accountUsage } from "./usage.ts";
 import { object, text } from "./wire.ts";
 
 export interface BrokerOptions {
@@ -16,6 +17,7 @@ export interface BrokerOptions {
 	maxConcurrency?: number;
 	anthropicBaseUrl?: string;
 	openaiBaseUrl?: string;
+	typesafeBaseUrl?: string;
 	version?: string;
 }
 export interface BrokerState {
@@ -138,7 +140,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 		pid: process.pid,
 		url: "",
 		token: `cbk_${randomBytes(32).toString("hex")}`,
-		brokerVersion: options.version ?? process.env.CREDNE_BROKER_VERSION ?? "0.1.4",
+		brokerVersion: options.version ?? process.env.CREDNE_BROKER_VERSION ?? "0.1.5",
 		upstreamVersion: "19.0.0",
 		backend: "oh-my-pi",
 		startedAt: new Date().toISOString(),
@@ -182,6 +184,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 			home,
 			anthropicBaseUrl: options.anthropicBaseUrl ?? "https://api.anthropic.com",
 			openaiBaseUrl: options.openaiBaseUrl ?? "https://api.openai.com",
+			typesafeBaseUrl: options.typesafeBaseUrl ?? TYPESAFE_DEFAULT_BASE_URL,
 		});
 		await accounts.load();
 		gateway = new Gateway(accounts, options.maxConcurrency ?? 0);
@@ -266,21 +269,14 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 							path,
 						);
 						const loginMatch = /^\/logins\/([A-Za-z0-9_-]+)(?:\/(callback|acknowledge))?$/.exec(path);
-						const routeMatch =
-							/^\/route\/([^/]+)(\/v1\/messages|\/responses|\/chat\/completions|\/decisions)$/.exec(path);
+						const routeMatch = /^\/route\/([^/]+)(\/pi\/stream|\/systemone)$/.exec(path);
 						if (accountMatch) {
 							const account = store.get(accountMatch[1]);
 							const action = accountMatch[2];
 							if (request.method === "GET" && action === "models")
 								response = Response.json({ models: publicModels(account) });
 							else if (request.method === "GET" && action === "usage")
-								response = Response.json(
-									await fetchAccountUsage(
-										{ kind: account.record.kind, provider: account.record.provider ?? "" },
-										() => store.credential(account, request.signal),
-										request.signal,
-									),
-								);
+								response = Response.json(await accountUsage(account, request.signal));
 							else if (request.method === "POST" && action && ["disable", "enable", "reset"].includes(action)) {
 								await store.mutate(account, action);
 								response = Response.json({ account: publicAccount(account) });
@@ -353,16 +349,8 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 								? "Request cancelled."
 								: "Broker request failed.";
 					if (url.pathname.includes("/route/")) {
-						if (url.pathname.endsWith("/decisions")) return decisionsError(status, message);
-						return protocolError(
-							status,
-							message,
-							url.pathname.endsWith("/v1/messages")
-								? "anthropic"
-								: url.pathname.endsWith("/responses")
-									? "responses"
-									: "chat",
-						);
+						if (url.pathname.endsWith("/systemone")) return keyRouteError(status, message);
+						return protocolError(status, message);
 					}
 					return Response.json({ error: message }, { status });
 				} finally {

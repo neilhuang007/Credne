@@ -6,14 +6,12 @@ import {
 	type FetchFunction,
 	type Model,
 	type Provider,
+	type ProviderClassifier,
 	type ProviderResponse,
 	type ProviderStreams,
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
-import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { openAIDecisionsApi } from "@earendil-works/pi-ai/api/openai-decisions.lazy";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
 import {
 	type AccountCatalog,
 	accountDisplayName,
@@ -23,6 +21,7 @@ import {
 	poolProviderId,
 } from "./catalog.ts";
 import { type BrokerClient, type BrokerTarget, fetchBroker } from "./client.ts";
+import { OMP_NATIVE_API, type OmpIdentity, type OmpIdentityLookup, ompNativeStreams } from "./omp-native.ts";
 
 /** Response header naming the account that served a request, base64url encoded. */
 export const ACCOUNT_HEADER = "x-credne-account";
@@ -35,7 +34,9 @@ export interface AccountProviderSpec {
 	/** Disabled accounts stay registered so sessions that used them fail with a clear reason. */
 	disabled: boolean;
 	models: Model<Api>[];
-	/** Classifier models served through this entry's broker route, for example the Decisions model of an OpenAI API key. */
+	/** oh-my-pi's provider and API for the models of this entry, by model ID. Absent for an ID with none. */
+	upstream?: Record<string, OmpIdentity>;
+	/** Classifier models served through this entry's broker route, for example the gpt-6-luna model of an OpenAI API key. */
 	classifiers?: ClassifierModel<ClassifierApi>[];
 }
 
@@ -52,6 +53,7 @@ export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
 				target: { type: "pool", name: pool.name },
 				disabled: false,
 				models: pool.models,
+				upstream: pool.upstream,
 				classifiers: pool.classifiers,
 			}),
 		),
@@ -62,6 +64,7 @@ export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
 				target: { type: "account", key: account.key },
 				disabled: account.disabled,
 				models: account.models,
+				upstream: account.upstream,
 				classifiers: account.classifiers,
 			}),
 		),
@@ -69,21 +72,24 @@ export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
 }
 
 /**
- * A Pi provider backed by the account broker. Requests use Pi's own native API adapters, so
- * streaming, tool calls, reasoning and usage parsing are unchanged; only the endpoint and the
- * credential differ. The credential is the broker's per-run token, never a provider secret. Classifier
- * models post to the route's `decisions` path, which the broker forwards to OpenAI's Decisions API.
+ * A Pi provider backed by the account broker. Chat requests go to the route's `pi/stream` path in
+ * oh-my-pi's pi-native protocol, and the broker's oh-my-pi runtime shapes, authenticates and sends them
+ * (see `omp-native.ts`). Classifier models post to the route's `systemone` path, System One's wire, which
+ * the broker serves for TypeSafe keys and, through oh-my-pi's judgment client, for OpenAI's gpt-6-luna.
+ * The credential is the broker's per-run token, never a provider secret. `identify` finds oh-my-pi's provider and
+ * API for the models of any account or pool, since a session's earlier turns can come from another one; without
+ * it, earlier turns keep Pi's identity and oh-my-pi replays their reasoning as plain text.
  */
 export function createAccountProvider(
 	spec: AccountProviderSpec,
 	client: BrokerClient,
 	onServedBy?: ServedByListener,
+	identify: OmpIdentityLookup = () => undefined,
 ): Provider {
 	const report = (response: ProviderResponse) => {
 		const key = response.headers[ACCOUNT_HEADER];
 		if (key) onServedBy?.(spec.id, key);
 	};
-	const decisions = openAIDecisionsApi();
 	return createProvider({
 		id: spec.id,
 		name: spec.name,
@@ -104,19 +110,10 @@ export function createAccountProvider(
 			},
 		},
 		models: [...spec.models, ...(spec.classifiers ?? [])],
-		// A pool may mix APIs (Claude and GPT models), so every adapter is available.
-		api: {
-			"anthropic-messages": observed(anthropicMessagesApi(), report),
-			"openai-responses": observed(openAIResponsesApi(), report),
-			"openai-completions": observed(openAICompletionsApi(), report),
-		},
+		// One API for every model: a pool may mix Claude and GPT models, and oh-my-pi speaks each provider's wire.
+		api: { [OMP_NATIVE_API]: observed(ompNativeStreams(identify), report) },
 		// A classification may be served by another pool account than the chat, so it must not move the footer.
-		classifiers: {
-			"openai-decisions": {
-				classify: (model, context, options) =>
-					decisions.classify(model, context, { ...options, fetch: fetchInference }),
-			},
-		},
+		classifiers: { "typesafe-system-one": viaLoopback(typesafeSystemOneApi()) },
 	});
 }
 
@@ -134,6 +131,13 @@ function observed(streams: ProviderStreams, report: (response: ProviderResponse)
 	return {
 		stream: (model, context, options) => streams.stream(model, context, withReport(options)),
 		streamSimple: (model, context, options) => streams.streamSimple(model, context, withReport(options)),
+	};
+}
+
+/** A classifier API whose requests only go to the loopback broker route. */
+function viaLoopback(classifier: ProviderClassifier): ProviderClassifier {
+	return {
+		classify: (model, context, options) => classifier.classify(model, context, { ...options, fetch: fetchInference }),
 	};
 }
 

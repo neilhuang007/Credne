@@ -1,6 +1,12 @@
 # Multiple Accounts
 
-The built-in `accounts` extension connects several accounts per provider, for example two Claude subscriptions, a Claude API key and a ChatGPT subscription. Two terminals can use different accounts at the same time. Claude and ChatGPT subscriptions, Anthropic API keys and OpenAI API keys all authenticate and send requests through `credne-broker`, a shared Bun daemon backed by [oh-my-pi AI](https://github.com/can1357/oh-my-pi/tree/main/packages/ai). Credne keeps sessions, prompts, tools and the agent loop. The daemon design is described in `broker/README.md` in the repository.
+The built-in `accounts` extension connects several accounts per provider, for example two Claude subscriptions, a Claude API key and a ChatGPT subscription. Two terminals can use different accounts at the same time. Claude and ChatGPT subscriptions, Anthropic API keys and OpenAI API keys all authenticate and send requests through `credne-broker`, a shared Bun daemon backed by [oh-my-pi AI](https://github.com/can1357/oh-my-pi/tree/main/packages/ai). Credne keeps sessions, prompts, tools and the agent loop; oh-my-pi owns every provider request. The daemon design is described in `broker/README.md` in the repository.
+
+## How requests are sent
+
+Credne does not build provider requests. It posts each chat request to `/credne/v1/route/<target>/pi/stream` in oh-my-pi's own pi-native protocol, the one oh-my-pi's client uses to reach its auth gateway. The body holds the model ID, the system prompt, the messages with their earlier reasoning and signatures, the tool declarations, and the request options: reasoning level, output limit, temperature, session ID, cache retention and similar. oh-my-pi then reshapes the request for the account's provider (for a Claude subscription, Claude Code's request shaping), authenticates it and sends it. It streams its own events back, which Credne shows as an ordinary reply: text, reasoning and tool-call deltas, token usage with cache reads and writes, and the stop reason.
+
+The session ID keeps one conversation on one pool account, so its prompt cache stays warm. Connection settings that apply to the hop between oh-my-pi and the provider (timeouts, retries, WebSocket preferences) are oh-my-pi's to decide and are not sent. Costs in the footer and the accounts panel are priced from Pi's catalog entry for the model and the token counts oh-my-pi reports.
 
 ## Setup
 
@@ -47,17 +53,9 @@ If you used a `claude-sub:<id>` provider, sign in again with `/accounts add clau
 
 Claude Console browser sign-in (`/accounts add claude-api-credits`) is no longer supported. Existing Console credentials are left untouched and are not used by the broker. To use Anthropic's API, add a Console API key with `/accounts add claude-api-key`.
 
-## Subscription web search
-
-Ask Credne to “search the web for the current Node.js LTS release and cite the release page.” The built-in `web_search` tool sends only its query to hosted web search. It follows Claude Code's WebSearch design: a separate request on the subscription's light-tier model runs the provider's hosted search (up to 8 searches on Claude) and briefly summarizes the results. The tool returns each search's links and that summary, and the main model cites the links it uses. Pass `allowed_domains` or `blocked_domains` to restrict results; Claude filters them at the provider, while ChatGPT search is told the restriction and its links are filtered locally. Add a subscription once with `/accounts add codex` or `/accounts add claude-subscription`. Searches consume provider usage and require a model and plan with hosted search enabled.
-
-Both Claude and ChatGPT hosted searches use a broker subscription. A session pinned to a subscription searches with that account only. A pool searches with a compatible subscription that offers the session's model and can try the next eligible subscription after a rate limit. Searches use the account's light-tier model when available (see [Model tiers](subagents.md#model-tiers)). API keys and public search engines are not automatic fallbacks.
-
-This needs no second login, bridge model or shared credentials. If you prefer a community extension, one that registers `web_search` replaces the built-in. For a separate keyless service, configure it explicitly using [MCP](mcp.md). The bundled explorer and deep-research (`crazy`) profiles include `web_search`; add the tool to `tools:` in a custom profile to enable it there.
-
 ## Accounts and providers
 
-In Credne, `/model` normally shows the model rather than one copy per account. A bare model ID, or a recognized model-family alias such as `sonnet`, selects the available model and saves its routed ID, not the account that happens to answer. When unrelated providers use the same ID and the broker cannot establish that they are the same model, choose the provider pool explicitly.
+In Credne, `/model` normally shows the model rather than one copy per account. A bare model ID, or a recognized model-family alias such as `sonnet`, selects the available model and saves its routed ID, not the account that happens to answer. A session pinned to an account stays on it (see [Pinned accounts](#pinned-accounts)). When unrelated providers use the same ID and the broker cannot establish that they are the same model, choose the provider pool explicitly.
 
 To choose the payer instead of using pooled routing, use `/accounts switch` or an explicit `acct:<id>/<model>` selection. For example, `--model acct:claude-api-work/claude-sonnet-4-5` pins the session when that account and model are registered. A deliberate account restriction is never widened to the global pool by an alias.
 
@@ -92,6 +90,10 @@ Priority does not change the model or override a deliberate billing choice: `poo
 
 A session on `acct:<id>` is pinned to one account. Every request uses that account. When it is rate-limited, out of quota or rejected, Pi reports the error with the account name and the provider's retry time, and it never moves the session to another account. Use a pool when you want failover, and a pinned account when you need a specific account.
 
+A pinned session keeps its account for every model the account serves. The `/model` picker and completions list the account's rows instead of the pool rows for those models, and `/model <id or alias>` and Ctrl+P choose them as `acct:<id>/<model>`, so the selection and the saved default stay on the account. An alias such as `sonnet` is matched against the account's models first. At startup the saved default account does the same for a bare `--model`, `--models` or `enabledModels` entry.
+
+Models the account does not serve are still listed from the pools and local providers. To leave the account, choose one of those, enter an explicit `pool:<name>/<model>`, or run `/accounts switch`.
+
 ## Decision model through an OpenAI API key
 
 OpenAI's Decisions API classifies a state with structured questions, which Credne uses for rating and routing decisions. It accepts only an OpenAI API key, not a ChatGPT sign-in. An OpenAI API-key account in the broker can provide a `gpt-6-luna` classifier without exposing its key to Credne.
@@ -105,9 +107,24 @@ Each of these appears in `ctx.modelRegistry.getAvailableOfType("classifier")` an
 
 An account or pool offers the classifier only when an enabled OpenAI API key lists `gpt-6-luna` in its models. ChatGPT subscriptions, Claude accounts, `pool:codex`, `pool:claude` and `pool:all` do not offer it. The classifier copies its cost and limits from the built-in `openai` entry, so session costs use the same Decisions rate (input tokens only). The key's own OpenAI project is billed.
 
-Requests use the same loopback connection and per-run token as chat. Pi posts to `/credne/v1/route/<target>/decisions`, and the broker sends the body to `/v1/decisions` with the account's key and returns OpenAI's status and body unchanged. A target that is not an OpenAI API key is refused with HTTP 400 and nothing is sent. The footer is not updated by a classification, because `pool:openai` may serve it with another key than the chat.
+Requests use the same loopback connection and per-run token as chat, and the same System One wire as Jev (below). Pi posts to `/credne/v1/route/<target>/systemone` with `"model": "gpt-6-luna"`. The broker's oh-my-pi runtime answers it as a System One judgment and sends it to OpenAI's Decisions API with the account's key. A target that is not an OpenAI API key is refused and nothing is sent. The footer is not updated by a classification, because `pool:openai` may serve it with another key than the chat.
 
-The classifier is registered with the other models of the account from the catalog (`catalog.json`), so it is there at startup. The catalog refreshes when the broker is running at session start and after `/accounts` actions. Rebuild and restart the broker after updating (see Setup): a broker from before this feature answers the route with HTTP 404.
+The classifier is registered with the other models of the account from the catalog (`catalog.json`), so it is there at startup. The catalog refreshes when the broker is running at session start and after `/accounts` actions. Rebuild and restart the broker after updating (see Setup): a broker from before this change answers the route with HTTP 404, and a catalog written by an earlier version, which named Decisions as the API, is rebuilt.
+
+## Jev (TypeSafe) accounts
+
+Jev is TypeSafe's classifier model. Credne uses it to rate delegated tasks for the [subagent tier classifier](subagents.md#tier-classifier), ahead of `gpt-6-luna`. Add a TypeSafe API key with `/accounts add jev` (or `/accounts add typesafe`): name the account, then paste the key. The broker checks the key against TypeSafe's model list before it stores the account.
+
+A TypeSafe account has no chat models, so it never adds models to a model list or to `pool:all`. It offers the Jev models its key lists as classifiers, which appear in `ctx.modelRegistry.getAvailableOfType("classifier")` and work with `classify()`:
+
+| Provider | Classifier | Served by |
+| --- | --- | --- |
+| `acct:<id>` of a TypeSafe key | The Jev models the key lists, for example `jev-latest` | That key, never another account. |
+| `pool:typesafe` | The same models | An enabled TypeSafe key. |
+
+Requests use the same loopback connection and per-run token as chat. Pi posts to `/credne/v1/route/<target>/systemone`, and the broker's oh-my-pi runtime forwards the System One request to TypeSafe with the account's key, including the `TypeSafe-Danger-Zone-Images` header that image input needs. The classifier copies its limits and input types from the built-in `typesafe` entry, which prices it at zero.
+
+Jev is part of the intended setup, but Credne works without it. At session start in interactive mode, once Credne has refreshed the account list from the running broker, it shows one warning if no enabled TypeSafe account exists: `No Jev account. Add one with /accounts add jev; decisions fall back to gpt-6-luna or the session model.` The warning is shown once per Credne process. It never prompts or blocks. Without a Jev account, an OpenAI API key that lists `gpt-6-luna` rates tasks; with neither, the session's chat model does.
 
 ## Commands
 
@@ -162,15 +179,9 @@ The footer shows the account of the current session:
 
 ## Switching accounts mid-session
 
-The conversation history is kept when you switch accounts, and the next request continues it. Earlier reasoning is handled differently from visible text. Providers sign or encrypt reasoning for the account that produced it, so the new account cannot accept it as is. Pi replaces that reasoning with a short summary that starts with this label:
+The conversation history is kept when you switch accounts, and the next request continues it. Credne sends the whole history, including earlier reasoning with its signatures, and oh-my-pi decides what the target can accept. Providers sign or encrypt reasoning for the account and model that produced it, so another account or model cannot replay it as is. oh-my-pi then replays that reasoning as plain text or leaves it out. Visible text, tool calls and tool results are kept unchanged. Inside a pool the same rule applies when the conversation moves to another account or an account rejects reasoning from another account.
 
-```
-[Reasoning summary from an earlier turn, not shown to the user]
-```
-
-The label marks the summary as earlier private reasoning, so the model does not treat it as part of its visible reply. Each summary is limited to about 1500 characters. Visible text, tool calls and tool results are kept unchanged. Reasoning the provider marks as redacted is dropped, because it has no readable text.
-
-Credne handles this when you switch a session to another provider. Inside a pool, the broker handles it when the conversation moves to another account or an account rejects reasoning from another account.
+oh-my-pi recognizes its own earlier turns by the provider and API it resolved for the model, for example `anthropic` and `anthropic-messages`. The broker reports both with each account's model list, and Credne keeps them in `catalog.json` for each account and for each pool model whose accounts all agree. Earlier turns carry them, so a turn of a Claude account keeps its signed reasoning when the next request goes to the same model on that account or on `pool:claude`. A turn whose identity Credne does not know replays its reasoning as plain text: an account that was removed, a `pool:all` model that a ChatGPT subscription and an OpenAI key both serve, or a catalog written before the broker reported them.
 
 ## Configuration file
 

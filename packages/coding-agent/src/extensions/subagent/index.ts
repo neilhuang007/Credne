@@ -25,7 +25,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "../../core/t
 import { getMarkdownTheme, type ThemeColor } from "../../modes/interactive/theme/theme.ts";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { captureSubagentContext, turnSchema } from "./context.ts";
-import { createSubagentDispatch, reasoningEffortSchema } from "./dispatch.ts";
+import { createSubagentDispatch, dropBlankSelections, reasoningEffortSchema } from "./dispatch.ts";
 import { registerModelSearch } from "./model-search.ts";
 import { type ModelTier, modelTierSchema } from "./model-tiers.ts";
 import {
@@ -394,6 +394,7 @@ export default function (pi: ExtensionAPI) {
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
 		parameters: SubagentParams,
+		prepareArguments: dropBlankSelections,
 		prepareLoadout: () => (delegated ? undefined : HIDE_DELEGATION_TOOLS),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {

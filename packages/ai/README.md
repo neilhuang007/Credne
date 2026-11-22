@@ -456,7 +456,7 @@ await models.completeSimple(model, context, { identity: { attribution: null } })
 
   `PI_ATTRIBUTION` is pi's: `{ name: "pi", url: "https://pi.dev", categories: ["cli-agent"] }`.
 
-Identity headers are defaults below provider, model, and request headers, so configured headers win and a `null` request header removes one. Providers that send a fixed client identity, such as GitHub Copilot and Anthropic OAuth, keep it. `withClientIdentity(models, identity)` returns a wrapper of a `Models` (or `MutableModels`) whose requests use `identity` over the one the `Models` was created with, for libraries that receive a `Models` from their host. `identity` is plain JSON, so it can be persisted with other request options.
+Identity headers are defaults below provider, model, and request headers, so configured headers win and a `null` request header removes one. Providers that send a fixed client identity, such as GitHub Copilot, keep it. `withClientIdentity(models, identity)` returns a wrapper of a `Models` (or `MutableModels`) whose requests use `identity` over the one the `Models` was created with, for libraries that receive a `Models` from their host. `identity` is plain JSON, so it can be persisted with other request options.
 
 ### Credential Store
 
@@ -1805,7 +1805,6 @@ Use this when one process needs different provider settings per request, or when
 
 Several providers support OAuth authentication instead of static API keys:
 
-- **Anthropic** (Claude Pro/Max subscription)
 - **OpenAI** (Sign in with ChatGPT: uses the ChatGPT subscription with the OpenAI API)
 - **OpenAI Codex** (ChatGPT Plus/Pro subscription, access to GPT-5.x Codex models)
 - **GitHub Copilot** (Copilot subscription)
@@ -1815,13 +1814,13 @@ Each of these providers carries an `OAuthAuth` on `provider.auth.oauth` with thr
 
 ```typescript
 import { createModels } from '@earendil-works/pi-ai';
-import { anthropicProvider } from '@earendil-works/pi-ai/providers/anthropic';
+import { openaiProvider } from '@earendil-works/pi-ai/providers/openai';
 
 const models = createModels({ credentials: myStore }); // persistent CredentialStore
-models.setProvider(anthropicProvider());
+models.setProvider(openaiProvider());
 
 // Login: Models drives the flow and persists the credential
-await models.login('anthropic', 'oauth', {
+await models.login('openai', 'oauth', {
   prompt: async (p) => {
     // p.type: 'text' | 'secret' | 'select' | 'manual_code'
     // manual_code prompts race a local callback server; p.signal aborts them when the server wins
@@ -1840,11 +1839,11 @@ await models.login('anthropic', 'oauth', {
 });
 
 // From here on, requests resolve and refresh the token automatically
-const model = models.getModel('anthropic', 'claude-sonnet-4-5')!;
+const model = models.getModel('openai', 'gpt-5-mini')!;
 await models.complete(model, context);
 
 // Logout
-await models.logout('anthropic');
+await models.logout('openai');
 ```
 
 ### Vertex AI
@@ -1875,7 +1874,7 @@ The quickest way to authenticate:
 
 ```bash
 npx @earendil-works/pi-ai login              # interactive provider selection
-npx @earendil-works/pi-ai login anthropic    # login to specific provider
+npx @earendil-works/pi-ai login openai       # login to specific provider
 npx @earendil-works/pi-ai list               # list available providers
 ```
 

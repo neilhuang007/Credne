@@ -26,6 +26,7 @@ Credne finds the executable through `PI_ACCOUNTS_BROKER`, its package `bin` dire
 | `--max-concurrency-per-account` | `0` | In-flight inference limit per account; `0` is unlimited |
 | `--anthropic-base-url` | `https://api.anthropic.com` | Anthropic API-key endpoint |
 | `--openai-base-url` | `https://api.openai.com` | OpenAI API-key endpoint |
+| `--typesafe-base-url` | `https://api.typesafe.ai` | TypeSafe API-key endpoint |
 | `--debug` | off | Log daemon lifecycle metadata; never provider bodies or credentials |
 | `--version` | | Print broker version |
 
@@ -41,6 +42,18 @@ Idle shutdown waits for HTTP response bodies, upstream streams, and pending logi
 
 Before upgrading an already running legacy broker, stop it explicitly. Health identifies this backend with `backend: "oh-my-pi"`. Neither the new client nor daemon silently starts beside a live legacy process.
 
+## Architecture
+
+OMP owns every provider request. The broker chooses the account and observes the outcome.
+
+Problem: a request that the broker reshaped could differ from what OMP itself sends. A rewritten cache marker or a dropped signature would then fail only through the broker, and OMP's own recovery would never see it.
+
+Solution: Credne's harness is an OMP pi-native client. It sends the request exactly as OMP's own client builds it, and the broker hands those original bytes and headers to OMP's auth gateway router, as OMP's HTTP server does for a gateway-token caller. OMP resolves the account's credential and refreshes it on expiry and after a 401, reshapes the context for the provider, signs and compresses Claude requests, retries, and recovers from rejected thinking signatures. The broker never edits a body, a header, or a response.
+
+The broker's only seam is the router's `fetch`. It calls OMP's own default transport for the model with the request unchanged: Claude Code's HTTP/1.1 TLS profile for Anthropic Messages, plain `fetch` for everything else, under OMP's User-Agent, extra CA and proxy layers. It returns the answer untouched and records its status and `Retry-After`. An Anthropic 400 that reports an empty credit balance is recorded as a 402 with a one-hour cooldown; OMP still sees the 400.
+
+Reasoning, thinking signatures, cache boundaries, hosted search, Claude billing attestation and compression are OMP's. The broker has no codec for the OpenAI or Anthropic wire. Classifiers go through OMP's System One route (`/systemone` below), which serves TypeSafe's Jev and OpenAI's GPT-6 Luna.
+
 ## Accounts and routing
 
 | Public provider | Kind | Authentication |
@@ -49,6 +62,7 @@ Before upgrading an already running legacy broker, stop it explicitly. Health id
 | `claude` | `oauth` | Claude subscription login through OMP |
 | `claude-api` | `api-key` | Anthropic API key |
 | `openai-api` | `api-key` | OpenAI API key |
+| `typesafe` | `api-key` | TypeSafe API key; classifier models for System One, never chat |
 
 To move from a local `claude-sub:` account, sign in again with `/accounts add claude-subscription` and select the new account in `/model`. Credne leaves the old local credentials on disk. Console credit profiles are not OMP credentials; use an Anthropic API key for API billing.
 
@@ -56,17 +70,25 @@ Each account has its own pi-ai SQLite auth store and gateway router inside the s
 
 `acct:<id>` addresses `a.<base64url id>`. A missing, disabled, cooling, or rejected pinned account fails without fallback.
 
-`pool:all` addresses `p.all`. Family pools are `p.claude`, `p.codex`, and `p.openai`. Pools use only enabled accounts that list the model. Claude keys and subscriptions share a family. OpenAI API billing and ChatGPT subscriptions remain separate families.
+`pool:all` addresses `p.all`. Family pools are `p.claude`, `p.codex`, and `p.openai`. Pools use only enabled accounts that list the model. A request names its model as `modelId`, either bare (`claude-sonnet-5`) or with OMP's provider (`anthropic/claude-sonnet-5`). TypeSafe accounts are never chat candidates, so they cannot make `p.all` ambiguous. Claude keys and subscriptions share a family. OpenAI API billing and ChatGPT subscriptions remain separate families.
 
-For pooled chat, the broker asks OMP whether each candidate's stored credential is subscription-backed. It tries eligible subscription accounts before ordinary API keys, even if a key served the previous turn. For example, `p.all` prefers a ChatGPT subscription over an OpenAI API key for a GPT model offered by both. The configured strategy and session affinity apply within each group. A pool can fall back to a paid API key; pin a subscription to rule out that charge. The default strategy is round-robin. The broker recognizes `X-Session-Affinity`, `Session-Id`, and `X-Session-Id`. Pools can select another eligible account on a pre-emission failure. Rate limits, insufficient credits, and temporary unavailability create cooldowns. `X-Credne-Account` identifies the selected account with its base64url key.
+For pooled chat, the broker asks OMP whether each candidate's stored credential is subscription-backed. It tries eligible subscription accounts before ordinary API keys, even if a key served the previous turn. For example, `p.all` prefers a ChatGPT subscription over an OpenAI API key for a GPT model offered by both. The configured strategy and session affinity apply within each group. A pool can fall back to a paid API key; pin a subscription to rule out that charge. The default strategy is round-robin. Affinity follows the request's `options.sessionId`. `X-Credne-Account` identifies the selected account with its base64url key.
 
-On pool account changes, signed Anthropic thinking and encrypted OpenAI reasoning become bounded, labeled summaries. Redacted reasoning is removed. Visible text, tool calls, and results remain. A thinking-signature rejection receives one rewritten retry. Anthropic thinking is disabled for an in-flight tool-result turn if its required thinking block was removed.
+### Failover
 
-Requests use pi-ai's gateway and providers. A transport bridge restores native hosted-search definitions and non-streaming results that the generic codec drops. It retains Codex `web_search_call.action.sources` and Anthropic `web_search_tool_result` output.
+A pinned request is never cut short. OMP's own retries, token refresh and recovery run to the end, and the broker records the final outcome: a rate limit, an unpaid balance or an unavailable provider (429, 402, 503) puts the account in cooldown, and a pinned request to a cooling account is refused without a call.
+
+A pooled request may be cut short only when another account can take over. The broker aborts the attempt at the first provider answer that is a failover status and tries the next account. That is 429, 402 (including the credit-balance 400), any 5xx, or a request that never got an answer. The caller sees no frame of the abandoned attempt: the broker holds the stream until the transport has seen the provider's answer. A 401 or 403 is different. OMP refreshes the credential and retries, so the broker waits for that: only if OMP gives up with an auth failure does the pool move on. Other 400s never fail over, so OMP's thinking-signature recovery runs on the same account. The last account of the last round, and a pool without an available sibling, run like a pinned account. `request-retry` adds rounds over the candidates.
+
+### Credential lock
+
+Problem: when an OAuth account cannot serve (its credential is blocked after a usage limit, or its refresh failed), OMP's key cascade moves on to the next source, including an `ANTHROPIC_API_KEY` in the broker's environment. A subscription request would be billed to a key nobody chose.
+
+Solution: while a request runs, the broker restricts its session to that account's identity with `sessions.restrict`, and OMP fails the request instead. The restriction must name the exact session id OMP resolves credentials under, so every `/pi/stream` request must carry `options.sessionId`; without it the route answers 400. API-key accounts need no lock, because their key is OMP's runtime override, which the cascade reads first.
 
 ### Account management
 
-Beyond the legacy account IDs above, `/providers` lists supported OMP provider IDs and authentication methods. The broker uses OMP's key validator or authenticated catalog descriptor before storing a key. Some validators send a small inference request that may incur a charge. For descriptor-based enrollment the broker intersects the returned model IDs with supported chat models in the bundled catalog. A validated key is not proof of access to every model. Cloud credential chains, native CLI adapters and sign-ins that need unsupported prompts or host state are not advertised. Duplicate names and keys return 409. Final duplicate checks and writes are serialized.
+Beyond the legacy account IDs above, `/providers` lists supported OMP provider IDs and authentication methods. The broker uses OMP's key validator or authenticated catalog descriptor before storing a key. Some validators send a small inference request that may incur a charge. For descriptor-based enrollment the broker intersects the returned model IDs with supported chat models in the bundled catalog. Anthropic and OpenAI keys are checked and listed through the same catalog descriptors, against the account's own base URL: embedding, speech and judge models are left out, model IDs the catalog lacks are kept, and only the provider itself ever sees the key. A validated key is not proof of access to every model. Cloud credential chains, native CLI adapters and sign-ins that need unsupported prompts or host state are not advertised. A TypeSafe key is validated by listing its models with OMP's authenticated TypeSafe discovery; those model names become its `classifier` models. Duplicate names and keys return 409. Final duplicate checks and writes are serialized.
 
 Subscription login supports browser redirects, manual callback submission, status, and cancellation. Callbacks must match the pending redirect destination and state. Signing in to an existing identity renews its credential but reports that no account was added. Its disabled setting remains.
 
@@ -90,7 +112,7 @@ api-keys:
         - api-key: YOUR_KEY
 ```
 
-`openai` and legacy `codex` groups use the same structure. A `codex` key requires its original `base-url`; requests go to `<base-url>/responses`. Claude and Codex configurations in this subset retain their legacy account IDs, including distinct IDs for keys that differ only by routing headers. A key's `headers` or `models` replaces the corresponding group setting.
+`openai` and legacy `codex` groups use the same structure. A `codex` key requires its original `base-url`; requests go to `<base-url>/responses`. Claude and Codex configurations in this subset retain their legacy account IDs, including distinct IDs for keys that differ only by routing headers. A key's `headers` or `models` replaces the corresponding group setting. Headers and the base URL are set on the OMP model, so they reach chat requests like any other model header.
 
 The broker accepts literal model names and custom headers that do not override credentials or transport controls. Unsupported options such as a proxy, model alias, provider prefix, or weighted routing stop startup with a diagnostic instead of silently changing which account or upstream serves a request. Back up `config.yaml` before adapting it; the broker does not edit it.
 
@@ -103,7 +125,7 @@ Read URL, token, and PID from `<home>/broker.json`. Supply `Authorization: Beare
 | `GET /health` | Backend, versions, PID, start time, account count |
 | `POST /shutdown` | Stop shared daemon |
 | `GET /accounts` | Credential-free account descriptions |
-| `GET /accounts/{key}/models` | Account model descriptions |
+| `GET /accounts/{key}/models` | Account model descriptions: ID, kind, limits, cost, and the OMP `provider` and `api` the account's router resolves the model to |
 | `GET /accounts/{key}/usage` | Normalized live subscription windows and credits |
 | `POST /accounts/{key}/disable`, `/enable` | Change account state |
 | `POST /accounts/{key}/reset` | Clear cooldown |
@@ -115,16 +137,14 @@ Read URL, token, and PID from `<home>/broker.json`. Supply `Authorization: Beare
 | `GET /logins/{state}` | `wait`, `ok`, or `error`; optional account/error |
 | `POST /logins/{state}/callback` `{redirectUrl}` | Submit complete browser redirect |
 | `DELETE /logins/{state}` | Cancel login |
-| `POST /route/{target}/v1/messages` | Anthropic Messages |
-| `POST /route/{target}/responses` | OpenAI Responses |
-| `POST /route/{target}/chat/completions` | Chat Completions |
-| `POST /route/{target}/decisions` | OpenAI Decisions, for a pinned OpenAI API key or `p.openai` only |
+| `POST /route/{target}/pi/stream` | OMP pi-native stream, for any account or pool |
+| `POST /route/{target}/systemone` | System One judgments, for a pinned TypeSafe or OpenAI API key, `p.typesafe` or `p.openai` |
 
-Decisions requests use the selected account’s OpenAI API key from OMP. The broker forwards the request body unchanged to `/v1/decisions` and passes the status, body, content type, request ID, and retry hint back to the client. Subscription accounts cannot serve this endpoint. A failed classification does not put the account on cooldown for chat.
+`/pi/stream` takes the body and headers of OMP's own pi-native client: `POST /v1/pi/stream` with `{modelId, context, options, stream}` and the `x-omp-*` attribution headers. Only the broker's `Authorization` and `x-api-key`, `Host` and connection headers are removed before the bytes go to OMP. OMP's router answers as its HTTP server would: an SSE stream of pi-native events ending in `data: [DONE]`, or `{error: {type, message}}` with a status for what it refuses before a provider is asked. A provider failure after the stream began, such as a 429 that OMP gave up on, arrives as OMP's `error` event. Broker-side refusals use the same error envelope with `Retry-After` where known: 400 for a malformed body or a missing `modelId` or `options.sessionId`, 403 for a disabled pinned account, 404 when no enabled account serves the model, 409 when `p.all` would mix providers, 429 for a cooling account.
 
-Inference supports streaming and non-streaming. Errors use the request protocol envelope and retain provider status and `Retry-After`, without raw upstream bodies.
+System One requests go through OMP's own `/v1/systemone` route with the selected account's key, so OMP validates the body, picks the dialect of the account's judge (TypeSafe's System One, or OpenAI Decisions for GPT-6 Luna), adds the image opt-in header for requests that carry images, and decodes the answers. The response is OMP's `{model, answers, usage}`. OMP's route accepts `noul`, `choice`, and `score` questions only; `box` questions return 422. An OpenAI key serves `gpt-6-luna` when it lists that model. Pools are `p.typesafe` and `p.openai`. For TypeSafe, a failover status (401, 402, 403, 429 or any 5xx) moves a pool on to its next account, and 429, 402 and 503 also put the account in cooldown. An OpenAI key is shared with chat, so a failed classification neither cools it nor moves the pool. Other statuses pass through without cooldown, and errors carry the status and `Retry-After` without raw provider bodies. OMP sends no model headers on this route, so configured routing headers do not apply to it.
 
-Live usage calls only Anthropic OAuth usage or ChatGPT WHAM usage. Redirects are refused, requests time out after ten seconds, and bodies are capped at 256 KiB. Only allowlisted quota windows and credits are returned. Missing values remain missing. API keys return an explicit unsupported reason. Session token cost is not subscription billing.
+Live usage is OMP's own: its usage providers read the account's Claude or ChatGPT subscription windows with its credential, base URL, timeouts and five-minute cache. The broker maps OMP's limits to windows (percent limits) and credits (every other unit); values it cannot show are left out and missing values stay missing. API keys and providers without a usage endpoint return an explicit unsupported reason. Session token cost is not subscription billing.
 
 ## Storage and security
 
@@ -141,16 +161,16 @@ Live usage calls only Anthropic OAuth usage or ChatGPT WHAM usage. Redirects are
 
 Storage directories and credentials are owner-only. Existing Codex and managed API-account IDs remain stable. During the initial migration, the broker imports legacy managed API keys and Claude and Codex subscription files without replacing the Go broker's records. It leaves former Console credit profiles on disk, but does not list or route those accounts.
 
-The gate rejects foreign Host and Origin values. Only broker routes and validated pending OAuth callbacks are exposed. Caller authorization, keys, and cookies are stripped before dispatch. The selected account supplies its credential. Provider errors and logs do not expose credential bodies through IPC.
+The gate rejects foreign Host and Origin values. Only broker routes and validated pending OAuth callbacks are exposed. The broker's own token is removed before dispatch, and OMP forwards only its allow-listed request headers, never cookies or caller credentials. The selected account supplies its credential. Logs never contain provider bodies or credentials. A provider's error message reaches the caller inside OMP's error event, as it does from OMP's own gateway.
 
 The trust boundary is the OS user. Shell tools and other applications under that user can read private storage. Stronger isolation requires separate OS users or sandboxing.
 
 ## Tests and upgrades
 
-`bun test test` uses isolated homes and local fake upstreams with the real pi-ai gateway/provider stack. Tests cover pinning, pools, reasoning, hosted search, gate security, duplicate adds, OAuth callbacks, usage, and separate-process singleton/crash recovery.
+`bun test test` uses isolated homes and local fake upstreams with the real pi-ai gateway/provider stack. Tests compare what a fake provider receives through the broker with what OMP's own router sends for the same request, and cover pinning, pools, failover, the credential lock, gate security, duplicate adds, enrollment, OAuth callbacks, usage, System One, and separate-process singleton/crash recovery. Claude's default transport only dials HTTPS hosts itself, and hands any other URL to `fetch`, which is how the fakes are reached.
 
 Node-side account tests remain in `packages/coding-agent/test`. Set `PI_ACCOUNTS_BROKER` to the compiled executable for broker end-to-end tests.
 
-After upgrading pi-ai, run broker checks/tests, compile, then run Node adapter end-to-end tests. Inspect hosted-tool codecs and auth retry behavior before changing the version.
+After upgrading pi-ai, run broker checks/tests, compile, then run Node adapter end-to-end tests. Inspect the pi-native route, the gateway's caller trust (`auth-gateway/caller-options.ts`) and the default transport choice (`utils/transport-fetch.ts`) before changing the version.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled software notices.
