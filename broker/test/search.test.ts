@@ -168,3 +168,51 @@ test("search refuses API keys and pool routes, and a usage limit benches the acc
 		await upstream.server.stop(true);
 	}
 });
+
+test("results outside the query's site: scope are removed, as OMP's search pipeline does", async () => {
+	const answer = (sources: { url: string; title: string }[]) =>
+		[
+			{
+				type: "response.output_item.done",
+				item: { type: "web_search_call", status: "completed", action: { type: "search", sources } },
+			},
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					role: "assistant",
+					content: [{ type: "output_text", text: "Summary.", annotations: [] }],
+				},
+			},
+			{ type: "response.completed", response: { id: "resp_1", model: "gpt-6-luna" } },
+		]
+			.map((event) => `data: ${JSON.stringify(event)}\n\n`)
+			.join("");
+	let sources = [
+		{ url: "https://www.reddit.com/r/node", title: "Reddit" },
+		{ url: "https://nodejs.org/en", title: "Node.js" },
+	];
+	const upstream = fakeUpstream(() => new Response(null, { status: 404 }));
+	const h = await harness(
+		upstream.origin,
+		() => new Response(answer(sources), { headers: { "content-type": "text/event-stream" } }),
+	);
+	try {
+		await h.add("plan", "codex", subscription("codex-token"), []);
+		const response = await search(h, "plan", searchBody("gpt-6-sol", "node lts -site:reddit.com"));
+		const result = (await response.json()) as { sources: { url: string }[]; notes?: string[] };
+		expect(result.sources.map((source) => source.url)).toEqual(["https://nodejs.org/en"]);
+		expect(result.notes).toEqual([
+			"removed 1 source outside `-site:reddit.com`; the answer text is unfiltered and may draw on them",
+		]);
+
+		// Nothing inside the scope is a failed search on both models.
+		sources = [{ url: "https://www.reddit.com/r/node", title: "Reddit" }];
+		const refused = await search(h, "plan", searchBody("gpt-6-sol", "node lts -site:reddit.com"));
+		expect(refused.status).toBe(502);
+		expect(JSON.stringify(await refused.json())).toContain("no results inside");
+	} finally {
+		await h.close();
+		await upstream.server.stop(true);
+	}
+});

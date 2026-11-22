@@ -26,6 +26,8 @@ export interface SearchResult {
 	model?: string;
 	answer?: string;
 	sources: SearchSource[];
+	/** What oh-my-pi's query post-filter changed, such as sources removed outside a domain filter. */
+	notes: string[];
 }
 
 const domainList = (description: string) =>
@@ -122,6 +124,7 @@ function formatResults(query: string, result: SearchResult): string {
 		`Web search results for query: "${query}"`,
 		result.answer?.trim() || "The search returned sources without a summary.",
 		`Sources:\n${sources.join("\n")}`,
+		...(result.notes.length > 0 ? [`Notes:\n${result.notes.map((note) => `- ${note}`).join("\n")}`] : []),
 		"REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.",
 	].join("\n\n");
 }
@@ -205,6 +208,7 @@ function brokerError(payload: unknown): string | undefined {
 
 function parseResult(payload: unknown): SearchResult {
 	const rawSources = field(payload, "sources");
+	const rawNotes = field(payload, "notes");
 	const sources = (Array.isArray(rawSources) ? rawSources : []).flatMap((source): SearchSource[] => {
 		const url = optionalText(field(source, "url"));
 		const parsed = url ? URL.parse(url) : null;
@@ -221,5 +225,8 @@ function parseResult(payload: unknown): SearchResult {
 		model: optionalText(field(payload, "model")),
 		answer: optionalText(field(payload, "answer"))?.slice(0, 16_000),
 		sources,
+		notes: (Array.isArray(rawNotes) ? rawNotes : [])
+			.flatMap((note) => (typeof note === "string" && note ? [note.slice(0, 500)] : []))
+			.slice(0, 10),
 	};
 }

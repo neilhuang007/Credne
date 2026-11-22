@@ -31,6 +31,7 @@ const found = {
 		{ title: "Node.js releases", url: "https://nodejs.org/en/about/releases", publishedDate: "2 days ago" },
 		{ title: "not a link", url: "javascript:alert(1)" },
 	],
+	notes: ["removed 1 source outside `-site:reddit.com`; the answer text is unfiltered and may draw on them"],
 };
 
 function account(id: string, provider: string, kind: BrokerAccount["kind"] = "oauth"): BrokerAccount {
@@ -121,6 +122,7 @@ describe("web_search on a broker subscription", () => {
 		expect(text).toContain("Node 26 is the active LTS.");
 		expect(text).toContain("1. [Node.js releases](https://nodejs.org/en/about/releases) (2 days ago)");
 		expect(text).not.toContain("javascript:");
+		expect(text).toContain("Notes:\n- removed 1 source outside `-site:reddit.com`");
 	});
 
 	it("sends domain filters as oh-my-pi site: directives", async () => {

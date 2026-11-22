@@ -6,6 +6,7 @@ import { searchAnthropic } from "./omp-search/anthropic.ts";
 import type { SearchParams } from "./omp-search/base.ts";
 import { searchCodex } from "./omp-search/codex.ts";
 import webSearchSystemPrompt from "./omp-search/prompts/web-search.md" with { type: "text" };
+import { applyQueryConstraints, parseSearchQuery, type StructuredQuery, scopeConstraints } from "./omp-search/query.ts";
 import { accountRegistry } from "./omp-search/registry.ts";
 import { DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS, SearchProviderError, type SearchResponse } from "./omp-search/types.ts";
 import { object, text } from "./wire.ts";
@@ -19,6 +20,9 @@ export interface SearchRequest {
 	sessionId: string;
 	query: string;
 }
+
+/** OMP's search response after its query post-filter, with the notes OMP adds about what the filter changed. */
+export type ScopedResponse = SearchResponse & { notes?: string[] };
 
 /** Reads a search request body (wire input). */
 export async function readSearchRequest(request: Request): Promise<SearchRequest> {
@@ -58,7 +62,7 @@ export async function searchOnModel(
 	model: Model<Api>,
 	search: SearchRequest,
 	signal: AbortSignal,
-): Promise<SearchResponse> {
+): Promise<ScopedResponse> {
 	const params: SearchParams = {
 		query: search.query,
 		systemPrompt: webSearchSystemPrompt,
@@ -71,12 +75,47 @@ export async function searchOnModel(
 		sessionId: search.sessionId,
 	};
 	const response = model.webSearch === "anthropic" ? await searchAnthropic(params) : await searchCodex(params);
+	const provider = model.webSearch === "anthropic" ? "anthropic" : "codex";
 	if (response.sources.length === 0 && !response.citations?.length) {
 		throw new SearchProviderError(
-			model.webSearch === "anthropic" ? "anthropic" : "codex",
+			provider,
 			`${model.id} returned no sources; it may not support hosted web search.`,
 			502,
 		);
 	}
-	return response;
+	return constrain(response, parseSearchQuery(search.query), provider);
+}
+
+/**
+ * OMP's central post-filter (web/search/index.ts): every response is filtered by the query's directives, because
+ * Codex only reads `site:` as search text and Claude's domain filters do not cover paths. Scope directives (`site:`,
+ * exclusions) always apply; other constraints relax when they would leave nothing. A response with nothing in scope
+ * is a failed search, so the next model is tried.
+ */
+function constrain(response: SearchResponse, query: StructuredQuery, provider: "anthropic" | "codex"): ScopedResponse {
+	if (!query.hasConstraints) return response;
+	const scope = scopeConstraints(query);
+	const filtered = applyQueryConstraints(response.sources, query);
+	const citations = scope ? response.citations?.filter(scope.matches) : response.citations;
+	const notes = filtered.dropped.map((label) => `no results matched \`${label}\`; the constraint was relaxed`);
+	if (scope) {
+		if (filtered.sources.length === 0 && !citations?.length) {
+			throw new SearchProviderError(provider, `no results inside \`${scope.label}\``, 502);
+		}
+		const offScope =
+			response.sources.filter((source) => !scope.matches(source)).length +
+			(response.citations?.length ?? 0) -
+			(citations?.length ?? 0);
+		if (response.answer?.trim() && offScope > 0) {
+			notes.push(
+				`removed ${offScope} ${offScope === 1 ? "source" : "sources"} outside \`${scope.label}\`; the answer text is unfiltered and may draw on them`,
+			);
+		}
+	}
+	return {
+		...response,
+		sources: filtered.sources,
+		...(citations === undefined ? {} : { citations }),
+		...(notes.length > 0 ? { notes } : {}),
+	};
 }
