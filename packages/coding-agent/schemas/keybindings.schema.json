@@ -231,6 +231,22 @@
       "$ref": "#/$defs/KeybindingValue",
       "description": "Open model selector"
     },
+    "app.accounts.add": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Add an account"
+    },
+    "app.accounts.remove": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Delete the selected accounts or highlighted account"
+    },
+    "app.accounts.mark": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Select or deselect the highlighted account"
+    },
+    "app.accounts.toolbar": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Move focus between account actions and the list"
+    },
     "app.accounts.manage": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Manage the selected account"
@@ -242,6 +258,10 @@
     "app.accounts.refresh": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Refresh selected account usage"
+    },
+    "app.subagents.background": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Continue main with foreground workers in the background"
     },
     "app.subagents.select": {
       "$ref": "#/$defs/KeybindingValue",

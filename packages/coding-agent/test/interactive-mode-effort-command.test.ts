@@ -4,9 +4,13 @@ import { describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type ThinkingCommandContext = {
-	session: { getAvailableThinkingLevels: () => ThinkingLevel[] };
+	session: {
+		getAvailableThinkingLevels: () => ThinkingLevel[];
+		setThinkingLevel: (level: ThinkingLevel, options: { persist: boolean }) => void;
+	};
 	showThinkingSelector: () => void;
-	selectThinkingLevel: (level: ThinkingLevel, persist: boolean) => void;
+	selectThinkingLevel: (level: ThinkingLevel) => void;
+	showThinkingLevelSaved: (level: ThinkingLevel) => void;
 	showError: (message: string) => void;
 };
 
@@ -34,6 +38,7 @@ type AutocompleteContext = {
 type InteractiveModePrivate = {
 	setupEditorSubmitHandler(this: SubmitContext): void;
 	handleThinkingCommand(this: ThinkingCommandContext, searchTerm?: string): void;
+	selectThinkingLevel(this: ThinkingCommandContext, level: ThinkingLevel): void;
 	createBaseAutocompleteProvider(this: AutocompleteContext): AutocompleteProvider;
 };
 
@@ -41,9 +46,10 @@ const interactiveModePrototype = (InteractiveMode as unknown as { prototype: Int
 
 function createCommandContext(levels: ThinkingLevel[]) {
 	const context: ThinkingCommandContext = {
-		session: { getAvailableThinkingLevels: () => levels },
+		session: { getAvailableThinkingLevels: () => levels, setThinkingLevel: vi.fn() },
 		showThinkingSelector: vi.fn(),
-		selectThinkingLevel: vi.fn(),
+		selectThinkingLevel: interactiveModePrototype.selectThinkingLevel,
+		showThinkingLevelSaved: vi.fn(),
 		showError: vi.fn(),
 	};
 	const submitContext: SubmitContext = {
@@ -64,17 +70,17 @@ describe("InteractiveMode /effort command", () => {
 
 		expect(submitContext.editor.setText).toHaveBeenCalledWith("");
 		expect(context.showThinkingSelector).toHaveBeenCalledOnce();
-		expect(context.selectThinkingLevel).not.toHaveBeenCalled();
+		expect(context.session.setThinkingLevel).not.toHaveBeenCalled();
 	});
 
 	it.each(["/effort HIGH", "/thinking HIGH"])(
-		"sets an explicitly supported level for this session with %s",
+		"saves the requested level for new sessions with %s",
 		async (command) => {
 			const { context, submitContext } = createCommandContext(["off", "low", "high"]);
 
 			await submitContext.defaultEditor.onSubmit?.(command);
 
-			expect(context.selectThinkingLevel).toHaveBeenCalledWith("high", false);
+			expect(context.session.setThinkingLevel).toHaveBeenCalledWith("high", { persist: true });
 			expect(context.showError).not.toHaveBeenCalled();
 		},
 	);
@@ -84,7 +90,7 @@ describe("InteractiveMode /effort command", () => {
 
 		await submitContext.defaultEditor.onSubmit?.(`/effort ${level}`);
 
-		expect(context.selectThinkingLevel).not.toHaveBeenCalled();
+		expect(context.session.setThinkingLevel).not.toHaveBeenCalled();
 		expect(context.showError).toHaveBeenCalledWith(
 			`Unknown thinking level "${level}". Available levels: off, low, high.`,
 		);

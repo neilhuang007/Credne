@@ -103,7 +103,7 @@ test("Claude OAuth waits for explicit risk consent, and OMP refreshes the token 
 			account: { uuid: "account-id", email_address: "claude@example.com" },
 			organization: { uuid: "org-id", name: "Claude Max" },
 		});
-	});
+	}, upstream.origin);
 	const broker = await startBroker({ home, idleTimeout: 0, anthropicBaseUrl: upstream.origin });
 	if (!broker) throw new Error("No test broker");
 	const request = (path: string, body?: unknown, method?: string) =>
@@ -190,6 +190,7 @@ test("retired Console accounts are ignored without removing saved metadata or cr
 		expired: new Date(Date.now() + 3600000).toISOString(),
 	});
 	await writeFile(legacy, legacyJson);
+	const network = fakeNetwork();
 	const broker = await startBroker({ home, idleTimeout: 0 });
 	if (!broker) throw new Error("No test broker");
 	try {
@@ -209,6 +210,7 @@ test("retired Console accounts are ignored without removing saved metadata or cr
 		expect(await readFile(legacy, "utf8")).toBe(legacyJson);
 	} finally {
 		await broker.close();
+		network.restore();
 		await rm(home, { recursive: true, force: true });
 	}
 });

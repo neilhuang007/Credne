@@ -1,7 +1,6 @@
 import {
 	type ClientIdentity,
 	createInitialSystemMessage,
-	getCurrentSystemMessage,
 	getCurrentSystemPrompt,
 	type ImageContent,
 	type Message,
@@ -12,7 +11,7 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { getCurrentAgentSystemMessage, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -84,7 +83,10 @@ function createMutableAgentState(initialState?: AgentInitialState): MutableAgent
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
 	const initialMessage = createInitialSystemMessage(initialState?.systemPrompt, tools.map(toToolDeclaration));
-	if (messages[0]?.role !== "system" && initialMessage) messages.unshift(initialMessage);
+	if (messages[0]?.role !== "system" && initialMessage) {
+		const hiddenToolDeclarations = tools.filter((tool) => tool.omitFromDeclaration).map((tool) => tool.name);
+		messages.unshift(hiddenToolDeclarations.length ? { ...initialMessage, hiddenToolDeclarations } : initialMessage);
+	}
 
 	return {
 		get systemPrompt() {
@@ -366,7 +368,7 @@ export class Agent {
 			throw new Error("Agent is already processing. Wait for completion before resetting.");
 		}
 
-		const baseline = getCurrentSystemMessage(this._state.messages);
+		const baseline = getCurrentAgentSystemMessage(this._state.messages);
 		this._state.messages = baseline ? [baseline] : [];
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;

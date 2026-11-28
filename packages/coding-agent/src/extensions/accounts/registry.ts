@@ -87,6 +87,13 @@ export class AccountRegistry {
 		return this.catalog.accounts.some((account) => account.provider === provider && !account.disabled);
 	}
 
+	/** Whether the cached account is enabled and can have subscription quota. */
+	isSubscriptionAccount(key: string): boolean {
+		return this.catalog.accounts.some(
+			(account) => account.key === key && account.kind === "oauth" && !account.disabled,
+		);
+	}
+
 	/** The pinned-account provider whose broker key is `key`. */
 	accountByKey(key: string): AccountProviderSpec | undefined {
 		return this.specs.find((spec) => spec.target.type === "account" && spec.target.key === key);

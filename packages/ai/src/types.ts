@@ -290,6 +290,9 @@ export interface DeferredFetchOptions extends ProviderRequestOptions<Model<Api>>
 /** Request options for best-effort deferred-response cancellation. */
 export type DeferredCancelOptions = ProviderRequestOptions<Model<Api>>;
 
+/** Request options for opening a provider connection ahead of a request. */
+export type ConnectionPrewarmOptions = ProviderRequestOptions<Model<Api>>;
+
 /**
  * Maps known APIs to their full provider-specific stream option types.
  * Type-only imports from API implementation modules are erased at emit, so
@@ -337,6 +340,8 @@ export interface ProviderStreams {
 		options?: DeferredFetchOptions,
 	): AssistantMessageEventStream;
 	cancelDeferred?(model: Model<Api>, handle: DeferredHandle, options?: DeferredCancelOptions): Promise<void>;
+	/** Opens, or keeps alive, the connection the next request of `model` will use. Sends no inference request. */
+	prewarm?(model: Model<Api>, options?: ConnectionPrewarmOptions): Promise<void>;
 }
 
 /**
@@ -581,6 +586,8 @@ export interface SystemMessage {
 	toolsAdded?: Tool[];
 	/** Tools that stop being available at this point. */
 	toolsRemoved?: ToolReference[];
+	/** Request-only: omit incremental Responses notices for a forced prompt with additive tool changes. */
+	toolAdditionNotices?: "omit";
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
@@ -603,6 +610,11 @@ export interface AssistantMessage {
 	/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
 	thinkingLevel?: ModelThinkingLevel;
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
+	/**
+	 * Opaque state the API that produced this response recorded on it, sent back to that API with later requests over
+	 * the same transcript so it can rebuild them byte for byte. Other APIs ignore it.
+	 */
+	providerState?: JsonObject;
 	usage: Usage;
 	stopReason: StopReason;
 	deferred?: DeferredHandle;

@@ -60,7 +60,7 @@ import type { Static, TSchema } from "typebox";
 import type { Theme, ThemeColor } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
-import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type { CompactionPreparation, CompactionReason, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
@@ -191,6 +191,17 @@ export interface ExtensionUIContext {
 
 	/** Set status text in the footer/status bar. Pass undefined to clear. */
 	setStatus(key: string, text: string | undefined): void;
+
+	/** Set the built-in editor's top-right badge in the main session. The renderer gets the available columns. Pass undefined to clear. */
+	setMainEditorBadge?(render: ((width: number) => string) | undefined): void;
+
+	/**
+	 * Show a line in place of the text of the indicator shown while a compaction runs, until that compaction ends; does
+	 * nothing while none runs. The renderer gets the available columns and the indicator's current spinner frame, which
+	 * is not drawn unless the line includes it. While the line is shown in the editor's top border, the badge set with
+	 * `setMainEditorBadge` is not drawn. Pass undefined to restore the default text.
+	 */
+	setCompactionStatus?(render: ((width: number, spinner: string) => string) | undefined): void;
 
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;
@@ -409,6 +420,11 @@ export interface ExtensionContext {
 	getContextUsage(): ContextUsage | undefined;
 	/** Trigger compaction without awaiting completion. */
 	compact(options?: CompactOptions): void;
+	/**
+	 * Compact before the next assistant response of the current run, without aborting the run. Has no
+	 * effect when no run is in progress.
+	 */
+	requestCompaction(): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
 }
@@ -836,11 +852,18 @@ export interface SessionBeforeCompactEvent {
 	preparation: CompactionPreparation;
 	branchEntries: SessionEntry[];
 	customInstructions?: string;
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/** What triggered the compaction: manual /compact, the context threshold, context overflow recovery, or `ctx.requestCompaction()` */
+	reason: CompactionReason;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 	signal: AbortSignal;
+	/**
+	 * Prompt options of the current run, or the base options while no run has any. Section changes
+	 * made here, such as `closingSections` that re-send guidance this compaction removes from context,
+	 * go into the prompt state the compaction stores, and an active run continues with these options.
+	 * A cancelled or failed compaction discards them.
+	 */
+	systemPromptOptions: NormalizedBuildSystemPromptOptions;
 }
 
 /** Fired after context compaction succeeds */
@@ -848,8 +871,8 @@ export interface SessionCompactEvent {
 	type: "session_compact";
 	compactionEntry: CompactionEntry;
 	fromExtension: boolean;
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/** What triggered the compaction: manual /compact, the context threshold, context overflow recovery, or `ctx.requestCompaction()` */
+	reason: CompactionReason;
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
 }
@@ -857,15 +880,15 @@ export interface SessionCompactEvent {
 /** Fired after context compaction fails or is aborted */
 export interface SessionCompactFailedEvent {
 	type: "session_compact_failed";
-	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
-	reason: "manual" | "threshold" | "overflow";
+	/** What triggered the compaction: manual /compact, the context threshold, context overflow recovery, or `ctx.requestCompaction()` */
+	reason: CompactionReason;
 	/** Error text when compaction failed for a non-abort reason. */
 	errorMessage?: string;
 	/** True when compaction was cancelled or aborted. */
 	aborted: boolean;
 	/** True when the aborted turn would have been retried after this compaction (overflow recovery) */
 	willRetry: boolean;
-	/** True when the failing compaction content came from a session_before_compact handler. */
+	/** True when a session_before_compact handler failed the compaction or provided the content that failed. */
 	fromExtension: boolean;
 }
 
@@ -982,7 +1005,10 @@ interface BeforeAgentStartEventBase {
 	type: "before_agent_start";
 	/** The current system prompt, rendered from systemPromptOptions and earlier handler changes. */
 	readonly systemPrompt: string;
-	/** Mutable prompt sections. Later handlers observe mutations made by earlier handlers. */
+	/**
+	 * Mutable prompt sections. Later handlers observe mutations made by earlier handlers.
+	 * `closingSections` render after the working directory, at the end of the prompt.
+	 */
 	systemPromptOptions: NormalizedBuildSystemPromptOptions;
 }
 
@@ -1560,6 +1586,11 @@ export interface SessionBeforeForkResult {
 export interface SessionBeforeCompactResult {
 	cancel?: boolean;
 	compaction?: CompactionResult;
+	/**
+	 * Fail the compaction with this message: nothing is stored, no summary is generated, and the compaction ends like any
+	 * failed one. A handler that throws fails it the same way, with the thrown message.
+	 */
+	error?: string;
 }
 
 export interface SessionBeforeTreeResult {
@@ -2303,6 +2334,7 @@ export interface ExtensionContextActions {
 	shutdown: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (options?: CompactOptions) => void;
+	requestCompaction: () => void;
 	getSystemPrompt: () => string;
 	getSystemPromptOptions?: () => BuildSystemPromptOptions;
 	/** Backs `ExtensionToolContext.executeTool()`. Without it, nested calls fail. */

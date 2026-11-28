@@ -1,6 +1,6 @@
 ---
 name: worker
-description: General-purpose implementation agent. It should reason during implementation within the scope assigned by the main agent.
+description: General-purpose agent for executing multi-step tasks. It should reason during implementation within the scope assigned by the main agent.
 tools: read, bash, edit, write, tool_search
 model: claude-opus-5-5
 effort: xhigh

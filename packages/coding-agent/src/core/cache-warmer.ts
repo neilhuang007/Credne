@@ -14,6 +14,8 @@ import {
 	type Model,
 	type ModelsSimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { getConfiguredCacheRetention } from "@earendil-works/pi-ai/utils/provider-env";
+import type { OmpCacheRefreshOptions } from "../extensions/accounts/omp-native.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { SessionEntry, SessionManager, UsageEntry } from "./session-manager.ts";
 import type { CacheWarmingMode } from "./settings-manager.ts";
@@ -63,6 +65,8 @@ export interface CacheWarmRequest {
 	model: Model<Api>;
 	context: Context;
 	options: ModelsSimpleStreamOptions;
+	/** For routes whose effective retention can only be confirmed in the provider response. */
+	confirmedCache?: { ttlMs: number; touchedAt: number };
 }
 
 interface ActiveRun extends CacheWarmRequest {
@@ -140,13 +144,13 @@ export class CacheWarmer {
 			this.stop("request cannot be replayed safely");
 			return;
 		}
-		const ttlMs = getPromptCacheTtlMs(request.model, request.options);
+		if (getConfiguredCacheRetention(request.options.cacheRetention, request.options.env) === "none") {
+			this.stop("request disabled prompt caching");
+			return;
+		}
+		const ttlMs = request.confirmedCache?.ttlMs ?? getPromptCacheTtlMs(request.model, request.options);
 		if (ttlMs === undefined) {
-			this.stop(
-				request.options.cacheRetention === "none"
-					? "request disabled prompt caching"
-					: "cache lifetime unavailable",
-			);
+			this.stop("cache lifetime unavailable");
 			return;
 		}
 		const delayMs = getCacheWarmingDelayMs(ttlMs);
@@ -160,13 +164,13 @@ export class CacheWarmer {
 			ttlMs,
 			delayMs,
 			refreshDeadlineAt: 0,
-			startedAt: Date.now(),
+			startedAt: request.confirmedCache?.touchedAt ?? Date.now(),
 			controller: new AbortController(),
 			phase: "streaming",
 			nextWarmAt: 0,
 			extensionOverride: false,
 		};
-		this.schedule(this.run);
+		this.schedule(this.run, this.run.startedAt);
 	}
 
 	onAgentSettled(): void {
@@ -208,9 +212,9 @@ export class CacheWarmer {
 		this.inactive = { state: "inactive", reason, ...stopped };
 	}
 
-	private schedule(run: ActiveRun): void {
+	private schedule(run: ActiveRun, touchedAt: number): void {
 		run.extensionOverride = false;
-		run.nextWarmAt = Date.now() + run.delayMs;
+		run.nextWarmAt = touchedAt + run.delayMs;
 		// A timer can run late after sleep or event-loop blockage. Keep half of
 		// the planned pre-expiry margin for that delay and request dispatch; a
 		// late refresh is likely a full-price cache write, not a cache warm.
@@ -256,25 +260,42 @@ export class CacheWarmer {
 		}
 
 		run.extensionOverride = extensionOverride;
+		const touchedAt = Date.now();
+		const remainingMs = run.refreshDeadlineAt - touchedAt;
+		if (remainingMs <= 0) {
+			this.stop("cache refresh deadline missed");
+			return;
+		}
+		const signal = AbortSignal.any([run.controller.signal, AbortSignal.timeout(remainingMs)]);
+		const options: ModelsSimpleStreamOptions & OmpCacheRefreshOptions = {
+			...getCacheWarmingRequestOptions(run.options, signal),
+			...(run.confirmedCache ? { brokerCacheRefresh: true } : {}),
+		};
 		try {
-			const message = await this.models
-				.streamSimple(run.model, run.context, getCacheWarmingRequestOptions(run.options, run.controller.signal))
-				.result();
+			const message = await this.models.streamSimple(run.model, run.context, options).result();
 			if (!this.validateRun(run)) return;
-			if (message.stopReason !== "error" && message.stopReason !== "aborted") {
-				const entry = this.sessionManager.appendUsage(
-					"cache_warm",
-					message.provider,
-					message.responseModel ?? message.model,
-					message.usage,
-					extensionOverride ? "extension override" : undefined,
-				);
-				this.onWarmed?.(entry);
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				this.stop("cache refresh failed");
+				return;
+			}
+			const entry = this.sessionManager.appendUsage(
+				"cache_warm",
+				message.provider,
+				message.responseModel ?? message.model,
+				message.usage,
+				extensionOverride ? "extension override" : undefined,
+			);
+			this.onWarmed?.(entry);
+			// Repeated full writes cost more than letting this entry expire.
+			if (message.usage.cacheRead <= 0 || message.usage.cacheWrite > 0) {
+				if (this.run === run) this.stop("cache refresh missed the cache");
+				return;
 			}
 		} catch {
-			// Cache warming is best-effort and must not affect the active agent run.
+			if (this.run === run) this.stop("cache refresh failed");
+			return;
 		}
-		if (this.run === run) this.schedule(run);
+		if (this.run === run) this.schedule(run, touchedAt);
 	}
 
 	private refreshDeadlineMissed(run: ActiveRun): boolean {

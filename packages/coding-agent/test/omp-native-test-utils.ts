@@ -27,6 +27,8 @@ interface OmpPartial {
 	stopReason: string;
 	errorMessage?: string;
 	timestamp: number;
+	requestControls?: Record<string, unknown>;
+	providerPayload?: Record<string, unknown>;
 }
 
 export interface OmpTurnOptions {

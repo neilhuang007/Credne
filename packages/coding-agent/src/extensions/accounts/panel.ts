@@ -33,8 +33,15 @@ export type AccountPanelResult =
 	| { action: "cancel"; selectedId: string }
 	| { action: "bulk"; operation: BulkOperation; selectedIds: string[]; selectedId: string };
 
+/** Panel layout that outlives one panel, so reopening it keeps where the divider was dragged. */
+export interface AccountPanelLayout {
+	/** The list's share of the width after the divider was dragged; unset uses the default split. */
+	listShare?: number;
+}
+
 interface AccountPanelOptions {
 	entries: readonly AccountPanelEntry[];
+	layout: AccountPanelLayout;
 	currentId?: string;
 	defaultId?: string;
 	selectedId?: string;
@@ -44,24 +51,40 @@ interface AccountPanelOptions {
 
 type PanelRow = { id: string; label: string; entry?: AccountPanelEntry };
 type BulkOperation = "enable" | "disable" | "remove";
-type ToolbarAction = "add" | "selectAll" | "clear" | BulkOperation;
+type ToolbarAction = "pin" | "add" | "selectAll" | "clear" | BulkOperation;
+type ToolbarButton = { label: string; action: ToolbarAction };
 type PanelAction = Exclude<AccountPanelResult["action"], "bulk"> | "refresh" | "mark" | "toolbar";
 type Control = { keys: readonly Keybinding[]; label: string; action?: PanelAction };
 type HitLine<Action> = { text: string; hits: { x: number; end: number; action: Action }[] };
 
-const TOOLBAR: readonly { label: string; action: ToolbarAction }[] = [
-	{ label: "+ Add", action: "add" },
-	{ label: "Select all", action: "selectAll" },
-	{ label: "Clear", action: "clear" },
-	{ label: "Enable", action: "enable" },
-	{ label: "Disable", action: "disable" },
-	{ label: "Delete", action: "remove" },
+/** Toolbar buttons by group; a group wraps to the next line as a whole, so a pair stays side by side. */
+const TOOLBAR_GROUPS: readonly (readonly ToolbarButton[])[] = [
+	[{ label: "Pin", action: "pin" }],
+	[
+		{ label: "Select all", action: "selectAll" },
+		{ label: "Clear", action: "clear" },
+	],
+	[
+		{ label: "Enable", action: "enable" },
+		{ label: "Disable", action: "disable" },
+	],
+	[
+		{ label: "+ Add", action: "add" },
+		{ label: "Delete", action: "remove" },
+	],
 ];
+const TOOLBAR = TOOLBAR_GROUPS.flat();
+const GROUP_GAP = "  ";
 
 const SPLIT_MIN_WIDTH = 72;
 const DIVIDER = " │ ";
+const LIST_MIN_WIDTH = 20;
+const DETAILS_MIN_WIDTH = 24;
 
-/** Browse account usage without changing providers; Enter uses the selection and makes it the default. */
+/**
+ * Browse account usage without changing providers. Enter selects accounts; Pin uses the one selected account, or the
+ * highlighted row when none is selected, and makes it the default.
+ */
 export class AccountsPanel implements Component, Focusable {
 	focused = true;
 	readonly capturesViewportInput = true;
@@ -84,6 +107,8 @@ export class AccountsPanel implements Component, Focusable {
 	private renderedSelection = 0;
 	private listWidth = 0;
 	private detailsX = 0;
+	private dividerHovered = false;
+	private resizing = false;
 	private detailsStart = 0;
 	private controlsStart = 0;
 	private renderedControls: HitLine<PanelAction>[] = [];
@@ -110,7 +135,6 @@ export class AccountsPanel implements Component, Focusable {
 			...options.entries
 				.map((entry) => ({ id: entry.id, label: entry.name, entry }))
 				.sort((a, b) => Number(a.entry.pool) - Number(b.entry.pool)),
-			{ id: "+add", label: "+ Add account" },
 			{ id: "+restart", label: "Restart broker (reload config.yaml)" },
 		];
 		this.mutableEntries = new Map(
@@ -129,7 +153,10 @@ export class AccountsPanel implements Component, Focusable {
 		const height = Math.max(1, this.tui.terminal.rows - 2);
 		const split = width >= SPLIT_MIN_WIDTH;
 		const minBodyRows = split ? 1 : 2;
-		this.listWidth = split ? Math.min(48, Math.floor(width * 0.42)) : width;
+		const share = this.options.layout.listShare;
+		const preferredListWidth =
+			share === undefined ? Math.min(48, Math.floor(width * 0.42)) : Math.round(width * share);
+		this.listWidth = split ? fitListWidth(preferredListWidth, width) : width;
 		this.detailsX = split ? this.listWidth + DIVIDER.length : 0;
 		const detailWidth = Math.max(1, width - this.detailsX);
 		this.renderedSelection = this.selectedIndex;
@@ -157,10 +184,13 @@ export class AccountsPanel implements Component, Focusable {
 		const detailRange = this.detailMaxOffset
 			? ` ${this.detailOffset + 1}–${this.detailOffset + page.length}/${details.length}`
 			: "";
-		const title = this.theme.bold("Accounts") + this.theme.fg("muted", ` · ${this.markedIds.size} marked`);
+		const title = this.theme.bold("Accounts") + this.theme.fg("muted", ` · ${this.markedIds.size} selected`);
 		const lines: string[] = [];
 		if (split) {
-			const divider = this.theme.fg("borderMuted", DIVIDER);
+			const divider =
+				this.dividerHovered || this.resizing
+					? ` ${this.theme.inverse(this.theme.fg("borderAccent", "┃"))} `
+					: this.theme.fg("borderMuted", DIVIDER);
 			if (titleRows) {
 				const heading = truncateToWidth(title, this.listWidth, "…", true);
 				lines.push(`${heading}${divider}${this.theme.bold(`Details${detailRange}`)}`);
@@ -201,12 +231,25 @@ export class AccountsPanel implements Component, Focusable {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (this.closed) return undefined;
+		if (this.resizing && (event.type === "drag" || event.type === "release")) {
+			// Keep the divider's line under the pointer.
+			this.options.layout.listShare = fitListWidth(event.x - 1, event.width) / event.width;
+			if (event.type === "release") this.resizing = false;
+			return { handled: true, render: true };
+		}
+		const onDivider = event.x >= this.listWidth && event.x < this.detailsX && event.y < this.controlsStart;
+		if (event.type === "press" && event.button === "left" && onDivider) {
+			this.resizing = true;
+			return { handled: true, capture: true, render: true };
+		}
 		const index = event.x < this.listWidth ? this.renderedRows.get(event.y) : undefined;
 		if (event.type === "leave" || event.type === "move") {
 			const hoveredId = event.type === "move" && index !== undefined ? this.rows[index].id : undefined;
-			const changed = hoveredId !== this.hoveredId;
+			const dividerHovered = event.type === "move" && onDivider;
+			const changed = hoveredId !== this.hoveredId || dividerHovered !== this.dividerHovered;
 			this.hoveredId = hoveredId;
-			return hoveredId || changed ? { handled: true, render: changed } : undefined;
+			this.dividerHovered = dividerHovered;
+			return hoveredId || dividerHovered || changed ? { handled: true, render: changed } : undefined;
 		}
 		if (event.type === "wheel" && event.wheelDelta) {
 			if (index !== undefined) this.select(this.selectedIndex + Math.sign(event.wheelDelta));
@@ -257,14 +300,16 @@ export class AccountsPanel implements Component, Focusable {
 			this.renderedRows.set(y + offset, index);
 			const selected = index === this.selectedIndex;
 			const pool = row.entry?.pool;
+			const disabled = row.entry?.disabled;
 			const box = this.mutableEntries.has(row.id) ? `[${this.markedIds.has(row.id) ? "x" : " "}] ` : "";
 			const label = `${selected ? "›" : " "} ${box}${pool ? "Pool: " : ""}${stripVTControlCharacters(row.label)}`;
-			const status = row.id === this.options.currentId ? " ●" : "";
+			const status = `${disabled ? " (disabled)" : ""}${row.id === this.options.currentId ? " ●" : ""}`;
 			const mark = row.id === this.options.defaultId ? `${status} ◆` : status;
 			const badge = this.listWidth > mark.length + 3 ? mark : "";
 			const text = truncateToWidth(label, this.listWidth - badge.length, "…", true) + badge;
 			if (selected) return `\x1b[7m${text}\x1b[27m`;
 			if (row.id === this.hoveredId) return this.theme.fg("accent", text);
+			if (disabled) return this.theme.fg("dim", text);
 			return pool ? this.theme.fg("muted", text) : text;
 		});
 	}
@@ -275,22 +320,32 @@ export class AccountsPanel implements Component, Focusable {
 		const contentWidth = width - 2 * inset;
 		const lines: (HitLine<ToolbarAction | number> & { first: number })[] = [];
 		let focusLine = 0;
-		for (const [index, { label, action }] of TOOLBAR.entries()) {
-			const count = action === "clear" && this.markedIds.size ? ` (${this.markedIds.size})` : "";
-			const tab = truncateToWidth(`[${label}${count}]`, contentWidth, "…");
-			let line = lines.at(-1);
-			if (!line || visibleWidth(line.text) + 1 + visibleWidth(tab) > contentWidth) {
-				line = { text: "", hits: [], first: index };
-				lines.push(line);
+		let index = 0;
+		for (const group of TOOLBAR_GROUPS) {
+			const tabs = group.map(({ label, action }) => {
+				const count = action === "clear" && this.markedIds.size ? ` (${this.markedIds.size})` : "";
+				return truncateToWidth(`[${label}${count}]`, contentWidth, "…");
+			});
+			for (const [offset, tab] of tabs.entries()) {
+				const { action } = group[offset];
+				const separator = offset ? " " : GROUP_GAP;
+				// A group starts a new line unless all of it fits; it splits only when a line cannot hold it.
+				const needed = offset ? tab : tabs.join(" ");
+				let line = lines.at(-1);
+				if (!line || visibleWidth(line.text + separator + needed) > contentWidth) {
+					line = { text: "", hits: [], first: index };
+					lines.push(line);
+				}
+				if (line.text) line.text += separator;
+				const x = inset + visibleWidth(line.text);
+				const enabled = this.toolbarEnabled(action);
+				if (enabled) line.hits.push({ x, end: x + visibleWidth(tab), action });
+				const focused = index === this.toolbarIndex;
+				if (focused) focusLine = lines.length - 1;
+				const text = this.theme.fg(enabled ? "accent" : "dim", tab);
+				line.text += focused && this.toolbarFocused ? `\x1b[7m${text}\x1b[27m` : text;
+				index++;
 			}
-			if (line.text) line.text += " ";
-			const x = inset + visibleWidth(line.text);
-			const enabled = this.toolbarEnabled(action);
-			if (enabled) line.hits.push({ x, end: x + visibleWidth(tab), action });
-			const focused = index === this.toolbarIndex;
-			if (focused) focusLine = lines.length - 1;
-			const text = this.theme.fg(enabled ? "accent" : "dim", tab);
-			line.text += focused && this.toolbarFocused ? `\x1b[7m${text}\x1b[27m` : text;
 		}
 
 		// Keep the focused action visible even if the terminal only has room for one tab.
@@ -309,6 +364,7 @@ export class AccountsPanel implements Component, Focusable {
 	}
 
 	private toolbarEnabled(action: ToolbarAction): boolean {
+		if (action === "pin") return this.pinTarget() !== undefined;
 		if (action === "add") return true;
 		if (action === "selectAll") return this.markedIds.size < this.mutableEntries.size;
 		if (action === "clear") return this.markedIds.size > 0;
@@ -322,7 +378,24 @@ export class AccountsPanel implements Component, Focusable {
 		return false;
 	}
 
+	/** The entry Pin uses: the one selected account, or the highlighted row when none is selected. */
+	private pinTarget(): AccountPanelEntry | undefined {
+		const [id, ...others] = this.markedIds;
+		const entry =
+			id === undefined
+				? this.rows[this.selectedIndex].entry
+				: others.length
+					? undefined
+					: this.mutableEntries.get(id);
+		return entry?.disabled ? undefined : entry;
+	}
+
 	private runToolbarAction(action: ToolbarAction): void {
+		if (action === "pin") {
+			const target = this.pinTarget();
+			if (target) this.finish({ action: "use", selectedId: target.id });
+			return;
+		}
 		if (!this.toolbarEnabled(action)) return;
 		if (action === "add") this.runAction("add");
 		else if (action === "selectAll") for (const id of this.mutableEntries.keys()) this.markedIds.add(id);
@@ -383,28 +456,18 @@ export class AccountsPanel implements Component, Focusable {
 			);
 		} else if (row.id === "+restart") {
 			controls.push({ keys: ["tui.select.confirm"], label: "Restart broker", action: "restart" });
-		} else if (row.entry && !row.entry.disabled) {
-			controls.push({ keys: ["tui.select.confirm"], label: "Use + make default", action: "use" });
-		}
-		if (!this.toolbarFocused && this.mutableEntries.has(row.id)) {
+		} else if (this.mutableEntries.has(row.id)) {
 			controls.push({
-				keys: ["app.accounts.mark"],
-				label: this.markedIds.has(row.id) ? "Unmark" : "Mark",
+				keys: ["tui.select.confirm", "app.accounts.mark"],
+				label: this.markedIds.has(row.id) ? "Deselect" : "Select",
 				action: "mark",
 			});
 		}
-		controls.push({
-			keys:
-				row.id === "+add" && !this.toolbarFocused
-					? ["tui.select.confirm", "app.accounts.add"]
-					: ["app.accounts.add"],
-			label: "Add account",
-			action: "add",
-		});
+		controls.push({ keys: ["app.accounts.add"], label: "Add account", action: "add" });
 		if (this.toolbarEnabled("remove")) {
 			controls.push({
 				keys: ["app.accounts.remove"],
-				label: this.markedIds.size ? `Delete marked (${this.markedIds.size})` : "Delete account",
+				label: this.markedIds.size ? `Delete selected (${this.markedIds.size})` : "Delete account",
 				action: "remove",
 			});
 		}
@@ -477,12 +540,7 @@ export class AccountsPanel implements Component, Focusable {
 	private details(width: number): string[] {
 		const row = this.rows[this.selectedIndex];
 		const entry = row.entry;
-		if (!entry)
-			return [
-				row.id === "+add"
-					? "Add a subscription or API key."
-					: "Stops the shared broker; the next request restarts it and reloads config.yaml.",
-			];
+		if (!entry) return ["Stops the shared broker; the next request restarts it and reloads config.yaml."];
 		const theme = this.theme;
 		const lines = [theme.bold(entry.name), theme.fg("muted", `${entry.pool ? "Pool" : "Account"} · ${entry.state}`)];
 		const status = [
@@ -563,6 +621,11 @@ export class AccountsPanel implements Component, Focusable {
 			this.theme.fg("dim", "Recorded rates; missing catalog prices are not billing data."),
 		];
 	}
+}
+
+/** Clamp a split list's width so the list and the details both stay usable. */
+function fitListWidth(listWidth: number, width: number): number {
+	return Math.max(LIST_MIN_WIDTH, Math.min(listWidth, width - DIVIDER.length - DETAILS_MIN_WIDTH));
 }
 
 const QUOTA_BAR_WIDTH = 50;

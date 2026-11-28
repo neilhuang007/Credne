@@ -21,7 +21,6 @@ import type {
 	Message,
 	Model,
 	OpenAICompletionsCompat,
-	ProviderEnv,
 	ProviderHeaders,
 	SimpleStreamOptions,
 	StopReason,
@@ -45,7 +44,7 @@ import {
 	isOpenRouterModel,
 	type OpenRouterUsageAccounting,
 } from "../utils/openrouter-cost.ts";
-import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { getConfiguredCacheRetention } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
@@ -67,7 +66,7 @@ import {
 	resolveJsonSchemaStrictSampling,
 } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
-import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
+import { clampOpenAIPromptCacheKey, isOpenAIHeaderSafePromptCacheKey } from "./openai-prompt-cache.ts";
 import {
 	buildBaseOptions,
 	clampThinkingBudgetToAnswerRoom,
@@ -299,16 +298,6 @@ type ChatCompletionToolWithCacheControl = OpenAI.Chat.Completions.ChatCompletion
 	cache_control?: OpenAICompatCacheControl;
 };
 
-function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
-	if (cacheRetention) {
-		return cacheRetention;
-	}
-	if (getProviderEnvValue("PI_CACHE_RETENTION", env) === "long") {
-		return "long";
-	}
-	return "short";
-}
-
 export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptions> = (
 	model: Model<"openai-completions">,
 	context: TranscriptContext,
@@ -352,18 +341,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				getDeclaredTools(normalizedContext.messages),
 				compat.supportsOpenAIGrammarTools,
 			);
-			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
+			const cacheRetention = getConfiguredCacheRetention(options?.cacheRetention, options?.env) ?? "short";
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const client = createClient(
-				model,
-				normalizedContext,
-				apiKey,
-				options?.headers,
-				options?.identity,
-				options?.fetch,
-				cacheSessionId,
-				compat,
-			);
 			let params = buildParams(
 				model,
 				normalizedContext,
@@ -372,10 +351,30 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				cacheRetention,
 				grammarToolInputProperties,
 			);
+			const originalCacheKey = params.prompt_cache_key;
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
 			}
+			const payloadCacheKey: unknown = params?.prompt_cache_key;
+			const routingCacheKey =
+				cacheSessionId &&
+				compat.promptCacheKeyMode !== "disabled" &&
+				payloadCacheKey !== originalCacheKey &&
+				isOpenAIHeaderSafePromptCacheKey(payloadCacheKey)
+					? payloadCacheKey
+					: undefined;
+			const client = createClient(
+				model,
+				normalizedContext,
+				apiKey,
+				options?.headers,
+				options?.identity,
+				options?.fetch,
+				cacheSessionId,
+				routingCacheKey,
+				compat,
+			);
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -746,6 +745,7 @@ function createClient(
 	identity?: ClientIdentity,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
+	routingCacheKey?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
 ) {
 	const headers: ProviderHeaders = { ...getIdentityHeaders(model, identity), ...model.headers };
@@ -766,7 +766,7 @@ function createClient(
 				headers.session_id = sessionId;
 			}
 			headers["x-client-request-id"] = sessionId;
-			headers["x-session-affinity"] = sessionId;
+			headers["x-session-affinity"] = routingCacheKey ?? sessionId;
 		}
 	}
 
@@ -787,13 +787,10 @@ function createClient(
 function buildParams(
 	model: Model<"openai-completions">,
 	context: TranscriptContext,
-	options?: OpenAICompletionsOptions,
-	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
-	cacheRetention: CacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env),
-	grammarToolInputProperties: ReadonlyMap<string, string> = createGrammarToolInputProperties(
-		getDeclaredTools(context.messages),
-		compat.supportsOpenAIGrammarTools,
-	),
+	options: OpenAICompletionsOptions | undefined,
+	compat: ResolvedOpenAICompletionsCompat,
+	cacheRetention: CacheRetention,
+	grammarToolInputProperties: ReadonlyMap<string, string>,
 ) {
 	const transcriptTools = resolveTranscriptTools(
 		context.messages,

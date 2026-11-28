@@ -15,7 +15,7 @@ import type { WorkerTeam, WorkerView } from "./team.ts";
 import { formatWorkerStats } from "./widget.ts";
 import { renderWorkerName } from "./worker-color.ts";
 
-export type WorkerViewTeam = Pick<WorkerTeam, "continue" | "getViews" | "send" | "subscribe">;
+export type WorkerViewTeam = Pick<WorkerTeam, "continue" | "getViews" | "sendUserMessage" | "subscribe">;
 
 interface ToolChat {
 	component: ToolExecutionComponent;
@@ -62,8 +62,10 @@ async function sendToWorker(ui: ExtensionUIContext, team: WorkerViewTeam, worker
 	if (worker.status === "cancelled") return ui.notify(`${worker.name} has been cancelled.`, "warning");
 	try {
 		let result =
-			worker.status === "interrupted" ? await team.continue(workerId, prompt) : await team.send(workerId, prompt);
-		if (result === "already_active") result = await team.send(workerId, prompt);
+			worker.status === "interrupted"
+				? await team.continue(workerId, prompt)
+				: await team.sendUserMessage(workerId, prompt);
+		if (result === "already_active") result = await team.sendUserMessage(workerId, prompt);
 		if (result === "cancelled" || result === "not_running") {
 			ui.notify(`${worker.name}: message not sent (${result})`, "warning");
 		} else if (result === "queued_until_continue") {
@@ -90,6 +92,7 @@ class WorkerChat extends Container {
 	private readonly unsubscribe: () => void;
 	private readonly header = new Text("", 0, 0);
 	private readonly chat = new Container();
+	private readonly pending = new Text("", 0, 0);
 	private readonly runs: RunChat[] = [];
 	private readonly renderers: Readonly<Record<string, ToolRenderers | undefined>> = createAllToolRenderers();
 	private dirty = true;
@@ -112,6 +115,7 @@ class WorkerChat extends Container {
 		this.spinner.stop();
 		this.addChild(this.header);
 		this.addChild(this.chat);
+		this.addChild(this.pending);
 		this.unsubscribe = team.subscribe(() => {
 			this.dirty = true;
 			this.updateSpinner();
@@ -125,6 +129,7 @@ class WorkerChat extends Container {
 		if (!worker) {
 			this.header.setText(this.theme.fg("muted", `Worker ${this.workerId} no longer exists.`));
 			this.chat.clear();
+			this.pending.setText("");
 			return super.render(width);
 		}
 		const icon = worker.status === "running" ? this.spinner.render(1)[0] : this.theme.fg("muted", "◯");
@@ -145,6 +150,8 @@ class WorkerChat extends Container {
 		);
 		if (this.dirty) {
 			this.updateChat(worker);
+			const steering = worker.runs.find((run) => run.status === "running")?.pendingSteering ?? [];
+			this.pending.setText(steering.map((message) => this.theme.fg("dim", `Steering: ${message}`)).join("\n"));
 			this.dirty = false;
 		}
 		return super.render(width);

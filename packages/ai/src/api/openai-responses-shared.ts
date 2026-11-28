@@ -36,7 +36,12 @@ import { shortHash } from "../utils/hash.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
-import { resolveTranscript, resolveTranscriptTools, type TranscriptToolSupport } from "../utils/transcript.ts";
+import {
+	getInitialSystemMessage,
+	resolveTranscript,
+	resolveTranscriptTools,
+	type TranscriptToolSupport,
+} from "../utils/transcript.ts";
 import {
 	appendGrammarToolInputJsonDelta,
 	closeGrammarToolInputJson,
@@ -226,6 +231,9 @@ export function convertResponsesMessages<TApi extends Api>(
 	const transformedMessages = transformMessages(normalizedContext.messages, model, normalizeToolCallId);
 	const toolSupport = getResponsesToolSupport(options ?? {});
 	const transcriptTools = resolveTranscriptTools(normalizedContext.messages, toolSupport);
+	const omitToolAdditionNotices =
+		(model.api === "openai-responses" || model.api === "openai-codex-responses") &&
+		getInitialSystemMessage(normalizedContext.messages)?.toolAdditionNotices === "omit";
 	let declaredAdditionalTools = false;
 	/** Tools announced as removed and not declared again since. */
 	const unavailableTools = new Set<string>();
@@ -234,7 +242,7 @@ export function convertResponsesMessages<TApi extends Api>(
 		for (const tool of tools) unavailableTools.delete(tool.name);
 		if (tools.length === 0) return;
 		if (toolSupport === "changes") {
-			if (declaredAdditionalTools) {
+			if (declaredAdditionalTools && !omitToolAdditionNotices) {
 				messages.push({ role: instructionRole, content: renderIncrementalToolsNotice(unavailableTools) });
 			}
 			declaredAdditionalTools = true;

@@ -130,6 +130,9 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	keepRecentTokens: 20000,
 };
 
+/** What started a compaction: `/compact`, the context threshold, overflow recovery, or the agent's request. */
+export type CompactionReason = "manual" | "threshold" | "overflow" | "agent";
+
 // ============================================================================
 // Token calculation
 // ============================================================================
@@ -269,7 +272,35 @@ export function estimateProjectedContextTokens(
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	// The core does not know which model a strategy compacts with, so the working model's window stands in for the
+	// compactor's: the summary strategy compacts with the working model, and no request of the blocks strategy reads
+	// the whole conversation (each input is fitted to the compactor's window or falls back when it is too long), so
+	// keeping `reserveTokens` free is safe for both.
+	return contextTokens > compactionLimit(contextWindow, contextWindow, settings.reserveTokens);
+}
+
+/** Context tokens above which forced compaction starts, for a working model compacted by a model with `compactorWindow`. */
+export function compactionLimit(contextWindow: number, compactorWindow: number, reserveTokens: number): number {
+	// A compactor larger than the working model still fits the whole conversation, so the working model may
+	// use its full window. Otherwise (the working model compacts itself, or the compactor is not larger)
+	// `reserveTokens` stay free at the end.
+	return compactorWindow > contextWindow ? contextWindow : contextWindow - reserveTokens;
+}
+
+/**
+ * The compactor, the model that makes the requests of a compaction for the working model: the account's medium tier
+ * model `medium`, unless there is none, it is the working model or the working model is cheaper than it; `working`
+ * itself then. Its window may be smaller than the working model's: no compaction request reads the whole conversation.
+ */
+export function chooseCompactor<T extends { id: string; cost: { input: number } }>(
+	working: T,
+	medium: T | undefined,
+): T {
+	// The same model served by another account of a pool has the same ID, so it is the working model too.
+	if (!medium || medium.id === working.id) return working;
+	// A catalog price of zero means the price is unknown, not that the model is free.
+	const cheaper = working.cost.input > 0 && medium.cost.input > 0 && working.cost.input < medium.cost.input;
+	return cheaper ? working : medium;
 }
 
 // ============================================================================
@@ -869,6 +900,28 @@ function filterProjectionFailures(projection: SessionProjection): SessionProject
 	return { ...projection, entries, messages: entries.flatMap((entry) => entry.messages) };
 }
 
+/** A branch projected for compaction, and where in it the range that compaction works on starts. */
+export interface CompactionRange {
+	/** The branch's model-visible projection without failed provider attempts. */
+	projection: SessionProjection;
+	/** Index of the previous compaction in `projection.entries`, or -1 without one. */
+	prevCompactionIndex: number;
+	/** Index of the first entry after the previous compaction's kept boundary; the range runs to the end. */
+	start: number;
+}
+
+/** Projects a branch and finds the range compaction works on: the model-visible entries since the previous compaction's kept boundary. */
+export function findCompactionRange(pathEntries: SessionEntry[]): CompactionRange {
+	const projection = filterProjectionFailures(buildSessionProjection(pathEntries));
+	// The newest compaction is projected first. Older compaction entries can still
+	// occur in its retained raw range, but their projected contribution is empty.
+	const prevCompactionIndex = projection.entries.findIndex(
+		(entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
+	);
+	// The canonical projection has already selected the previous compaction's retained tail, which follows it.
+	return { projection, prevCompactionIndex, start: prevCompactionIndex + 1 };
+}
+
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
@@ -877,22 +930,13 @@ export function prepareCompaction(
 		return undefined;
 	}
 
-	const projection = filterProjectionFailures(buildSessionProjection(pathEntries));
+	const { projection, prevCompactionIndex, start: boundaryStart } = findCompactionRange(pathEntries);
 	const projectedEntries = projection.entries;
 	const sourceEntries = projectedEntries.map((entry) => entry.sourceEntry);
-	// The newest compaction is projected first. Older compaction entries can still
-	// occur in its retained raw range, but their projected contribution is empty.
-	const prevCompactionIndex = projectedEntries.findIndex(
-		(entry) => entry.sourceEntry.type === "compaction" && entry.messages.length > 0,
-	);
-
-	let previousSummary: string | undefined;
-	let boundaryStart = 0;
-	if (prevCompactionIndex >= 0) {
-		previousSummary = (projectedEntries[prevCompactionIndex].sourceEntry as CompactionEntry).summary;
-		// The canonical projection has already selected the previous compaction's retained tail.
-		boundaryStart = prevCompactionIndex + 1;
-	}
+	const previousSummary =
+		prevCompactionIndex >= 0
+			? (projectedEntries[prevCompactionIndex].sourceEntry as CompactionEntry).summary
+			: undefined;
 	const boundaryEnd = projectedEntries.length;
 	const tokensBefore = estimateProjectedContextTokens(projection, pathEntries).tokens;
 	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);

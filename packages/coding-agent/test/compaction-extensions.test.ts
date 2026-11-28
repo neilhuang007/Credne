@@ -228,7 +228,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 		}
 	}, 120000);
 
-	it("should continue with default compaction if extension throws error", async () => {
+	it("should fail the compaction if extension throws error", async () => {
 		const throwingExtension: Extension = {
 			path: "throwing-extension",
 			resolvedPath: "/test/throwing-extension.ts",
@@ -265,14 +265,11 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 		await session.prompt("What is 2+2? Reply with just the number.");
 		await session.agent.waitForIdle();
 
-		const result = await session.compact();
-
-		expect(result.summary).toBeDefined();
-		expect(result.summary.length).toBeGreaterThan(0);
+		await expect(session.compact()).rejects.toThrow("Extension intentionally throws");
 
 		const compactEvents = capturedEvents.filter((e): e is SessionCompactEvent => e.type === "session_compact");
-		expect(compactEvents.length).toBe(1);
-		expect(compactEvents[0].fromExtension).toBe(false);
+		expect(compactEvents.length).toBe(0);
+		expect(session.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
 	}, 120000);
 
 	it("should call multiple extensions in order", async () => {

@@ -142,6 +142,18 @@ describe("shared broker public contract", () => {
 		}
 	});
 
+	test("prewarm answers at once without a provider call and refuses a request without a model", async () => {
+		const f = await fixture();
+		const prewarm = (target: string, body: string) => f.request(`/route/${target}/prewarm`, { method: "POST", body });
+		// Best effort: a pool with no account for the model is no error either.
+		for (const target of ["p.claude", "p.codex"])
+			expect((await prewarm(target, JSON.stringify({ modelId: "anthropic/claude-test" }))).status).toBe(204);
+		const missing = await prewarm("p.claude", "{}");
+		expect(missing.status).toBe(400);
+		expect(object(object(await missing.json()).error).message).toBe("modelId is required");
+		expect(f.received).toHaveLength(0);
+	});
+
 	test("gateway sends only the selected key, keeps tools, and never falls back from a pin", async () => {
 		const f = await fixture();
 		const accounts = await f.accounts();

@@ -30,6 +30,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getIdentityHeaders } from "../utils/identity.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
+import { getConfiguredCacheRetention } from "../utils/provider-env.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -38,9 +39,10 @@ import {
 	resolveTranscript,
 	resolveTranscriptTools,
 } from "../utils/transcript.ts";
+import { isSubscriptionUsageLimit } from "../utils/usage-limit.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
-import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
+import { clampOpenAIPromptCacheKey, isOpenAIHeaderSafePromptCacheKey } from "./openai-prompt-cache.ts";
 import {
 	convertResponsesMessages,
 	convertResponsesTools,
@@ -131,7 +133,7 @@ function isTerminalRateLimitError(errorText: string): boolean {
 }
 
 function isRetryableError(status: number, errorText: string): boolean {
-	if (status === 429 && isTerminalRateLimitError(errorText)) {
+	if (status === 429 && (isSubscriptionUsageLimit(errorText) || isTerminalRateLimitError(errorText))) {
 		return false;
 	}
 	if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
@@ -281,14 +283,21 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				getDeclaredTools(normalizedContext.messages),
 				model.compat?.supportsOpenAIGrammarTools ?? false,
 			);
-			const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
-			const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
-			let body = buildRequestBody(model, normalizedContext, options, codexSessionId, grammarToolInputProperties);
+			const cachingDisabled = getConfiguredCacheRetention(options?.cacheRetention, options?.env) === "none";
+			const cacheSessionId = cachingDisabled ? undefined : options?.sessionId;
+			// An isolated request keeps prefix routing, but cannot replace the last response on a pooled socket.
+			const websocketSessionId = options?.disableContinuation ? undefined : cacheSessionId;
+			const requestId = clampOpenAIPromptCacheKey(cacheSessionId);
+			let body = buildRequestBody(model, normalizedContext, options, requestId, grammarToolInputProperties);
 			const nextBody = await options?.onPayload?.(body, model);
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
-			const websocketRequestId = codexSessionId || uuidv7();
+			// A hook can share prefix routing, but only if its key survives HTTP header handling unchanged.
+			const payloadCacheKey = body?.prompt_cache_key;
+			const routingSessionId =
+				!cachingDisabled && isOpenAIHeaderSafePromptCacheKey(payloadCacheKey) ? payloadCacheKey : requestId;
+			const websocketRequestId = requestId || uuidv7();
 			// Codex expects an originator on every request; it is not attribution.
 			const identityHeaders = { originator: "pi", ...getIdentityHeaders(model, options?.identity) };
 			const sseHeaders = buildSSEHeaders(
@@ -297,7 +306,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				options?.headers,
 				accountId,
 				apiKey,
-				codexSessionId,
+				routingSessionId,
+				requestId,
 			);
 			const websocketHeaders = buildWebSocketHeaders(
 				identityHeaders,
@@ -305,6 +315,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				options?.headers,
 				accountId,
 				apiKey,
+				routingSessionId || websocketRequestId,
 				websocketRequestId,
 			);
 			const bodyJson = JSON.stringify(body);
@@ -314,7 +325,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			let startEmitted = false;
 			const websocketDisabledForSession = transport !== "sse" && isWebSocketSseFallbackActive(cacheSessionId);
 			if (websocketDisabledForSession) {
-				recordWebSocketSseFallback(cacheSessionId);
+				recordWebSocketSseFallback(websocketSessionId);
 			}
 
 			if (transport !== "sse" && !websocketDisabledForSession) {
@@ -340,7 +351,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							},
 							httpTimeoutMs,
 							websocketConnectTimeoutMs,
-							cacheSessionId,
+							websocketSessionId,
 							accountId,
 							grammarToolInputProperties,
 							options,
@@ -382,11 +393,11 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
 							}),
 						);
-						recordWebSocketFailure(cacheSessionId, error);
+						recordWebSocketFailure(websocketSessionId, error);
 						if (websocketStarted) {
 							throw error;
 						}
-						recordWebSocketSseFallback(cacheSessionId);
+						recordWebSocketSseFallback(websocketSessionId);
 						break;
 					}
 				}
@@ -469,7 +480,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					if (
 						attempt < maxRetries &&
 						!(lastError instanceof RetryDelayExceededError) &&
-						!lastError.message.includes("usage limit")
+						!isSubscriptionUsageLimit(lastError.message) &&
+						!isTerminalRateLimitError(lastError.message)
 					) {
 						const delayMs = BASE_DELAY_MS * 2 ** attempt;
 						await sleep(delayMs, options?.signal);
@@ -705,7 +717,11 @@ class CodexApiError extends Error {
 	readonly payload?: Record<string, unknown>;
 
 	constructor(message: string, options?: { code?: string; payload?: Record<string, unknown>; cause?: unknown }) {
-		super(message);
+		super(
+			isSubscriptionUsageLimit(options?.code ?? "") && !isSubscriptionUsageLimit(message)
+				? `ChatGPT usage limit reached: ${message}`
+				: message,
+		);
 		this.name = "CodexApiError";
 		this.code = options?.code;
 		this.payload = options?.payload;
@@ -905,6 +921,7 @@ interface CachedWebSocketContinuationState {
 
 interface CachedWebSocketConnection {
 	socket: WebSocketLike;
+	sessionHeader: string | null;
 	busy: boolean;
 	createdAt: number;
 	idleTimer?: ReturnType<typeof setTimeout>;
@@ -1194,6 +1211,7 @@ async function acquireWebSocket(
 		};
 	}
 
+	const sessionHeader = headers.get("session-id");
 	let accountEntries = websocketSessionCache.get(sessionId);
 	const cached = accountEntries?.get(accountId);
 	if (cached) {
@@ -1201,8 +1219,13 @@ async function acquireWebSocket(
 			clearTimeout(cached.idleTimer);
 			cached.idleTimer = undefined;
 		}
-		if (!cached.busy && isWebSocketSessionExpired(cached)) {
-			closeWebSocketSilently(cached.socket, 1000, "connection_age_limit");
+		const sessionHeaderChanged = cached.sessionHeader !== sessionHeader;
+		if (!cached.busy && (sessionHeaderChanged || isWebSocketSessionExpired(cached))) {
+			closeWebSocketSilently(
+				cached.socket,
+				1000,
+				sessionHeaderChanged ? "session_id_changed" : "connection_age_limit",
+			);
 			accountEntries?.delete(accountId);
 			if (accountEntries?.size === 0) websocketSessionCache.delete(sessionId);
 		} else if (!cached.busy && isWebSocketReusable(cached.socket)) {
@@ -1242,7 +1265,7 @@ async function acquireWebSocket(
 	}
 
 	const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
-	const entry: CachedWebSocketConnection = { socket, busy: true, createdAt: Date.now() };
+	const entry: CachedWebSocketConnection = { socket, sessionHeader, busy: true, createdAt: Date.now() };
 	accountEntries = websocketSessionCache.get(sessionId);
 	if (!accountEntries) {
 		accountEntries = new Map();
@@ -1626,13 +1649,15 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 		const err = parsed?.error;
 		if (err) {
 			const code = err.code || err.type || "";
-			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
+			if (isSubscriptionUsageLimit(code) || isSubscriptionUsageLimit(err.message ?? "")) {
 				const plan = err.plan_type ? ` (${err.plan_type.toLowerCase()} plan)` : "";
 				const mins = err.resets_at
 					? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
 					: undefined;
 				const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
 				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
+			} else if (response.status === 429 || /rate_limit_exceeded/i.test(code)) {
+				friendlyMessage = err.message ? `ChatGPT rate limit: ${err.message}` : "ChatGPT rate limit exceeded.";
 			}
 			message = err.message || friendlyMessage || message;
 		}
@@ -1688,7 +1713,8 @@ function buildSSEHeaders(
 	additionalHeaders: ProviderHeaders | undefined,
 	accountId: string,
 	token: string,
-	sessionId?: string,
+	sessionId: string | undefined,
+	requestId: string | undefined,
 ): Headers {
 	const headers = buildBaseCodexHeaders(defaultHeaders, initHeaders, additionalHeaders, accountId, token);
 	headers.set("OpenAI-Beta", "responses=experimental");
@@ -1697,7 +1723,9 @@ function buildSSEHeaders(
 
 	if (sessionId) {
 		headers.set("session-id", sessionId);
-		headers.set("x-client-request-id", sessionId);
+	}
+	if (requestId) {
+		headers.set("x-client-request-id", requestId);
 	}
 
 	return headers;
@@ -1709,6 +1737,7 @@ function buildWebSocketHeaders(
 	additionalHeaders: ProviderHeaders | undefined,
 	accountId: string,
 	token: string,
+	sessionId: string,
 	requestId: string,
 ): Headers {
 	const headers = buildBaseCodexHeaders(defaultHeaders, initHeaders, additionalHeaders, accountId, token);
@@ -1718,6 +1747,6 @@ function buildWebSocketHeaders(
 	headers.delete("openai-beta");
 	headers.set("OpenAI-Beta", OPENAI_BETA_RESPONSES_WEBSOCKETS);
 	headers.set("x-client-request-id", requestId);
-	headers.set("session-id", requestId);
+	headers.set("session-id", sessionId);
 	return headers;
 }

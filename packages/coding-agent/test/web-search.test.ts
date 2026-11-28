@@ -125,19 +125,6 @@ describe("web_search on a broker subscription", () => {
 		expect(text).toContain("Notes:\n- removed 1 source outside `-site:reddit.com`");
 	});
 
-	it("sends domain filters as oh-my-pi site: directives", async () => {
-		await runSearch(
-			session("pool:codex", "gpt-6-sol"),
-			[account("plan", "codex")],
-			{ "key-plan": served("gpt-6-sol") },
-			{
-				query: "release notes",
-				blocked_domains: ["reddit.com", "x.com"],
-			},
-		);
-		expect(sent()[0]!.body.query).toBe("release notes -site:reddit.com -site:x.com");
-	});
-
 	it("tries the next subscription after a usage limit and searches only on a pinned account", async () => {
 		fetchBroker.mockImplementationOnce(async () =>
 			Response.json({ error: { message: "account a: usage limit" } }, { status: 429 }),

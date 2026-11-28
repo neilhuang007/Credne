@@ -13,6 +13,8 @@ export const SETTINGS_DEFAULTS = {
 		enabled: true,
 		reserveTokens: 16384,
 		keepRecentTokens: 20000,
+		remindTokens: 50000,
+		strategy: "blocks",
 	},
 	branchSummary: {
 		reserveTokens: 16384,

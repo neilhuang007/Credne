@@ -78,7 +78,7 @@ async function main(): Promise<void> {
 	};
 	process.once("SIGINT", stop);
 	process.once("SIGTERM", stop);
-	console.error(`credne-broker ready (${version}, oh-my-pi 19.0.0)`);
+	console.error(`credne-broker ready (${version}, oh-my-pi ${broker.state.upstreamVersion})`);
 	if (debug) console.error(`credne-broker daemon PID ${broker.state.pid}; listening at ${broker.state.url}`);
 	await broker.closed;
 	if (debug) console.error("credne-broker daemon stopped");

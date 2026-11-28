@@ -617,7 +617,7 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "model-thinking",
 				label: "Default thinking level per model",
-				description: `Override the default thinking level for specific models. ${cycleThinkingKey} cycles in-session.`,
+				description: `Override the default thinking level for specific models. ${cycleThinkingKey} cycles levels and saves the result as the global default.`,
 				currentValue: modelThinkingOverridesSummary(currentModelThinkingLevels),
 				submenu: (_currentValue, done) => {
 					const steps: SteppedSubmenuStep[] = [

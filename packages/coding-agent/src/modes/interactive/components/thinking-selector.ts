@@ -77,8 +77,11 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 		this.addChild(new Text("Thinking Level", 0, 0));
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(`${keyDisplayText("app.thinking.cycle")} cycles thinking levels in-session`, 0, 0));
-		this.addChild(new Spacer(1));
+		const cycleKey = keyDisplayText("app.thinking.cycle");
+		if (cycleKey) {
+			this.addChild(new Text(`In the editor, ${cycleKey} cycles and saves thinking levels`, 0, 0));
+			this.addChild(new Spacer(1));
+		}
 
 		this.searchInput = new Input();
 		this.searchInput.onSubmit = () => this.selectList.handleInput("\r");
@@ -90,16 +93,15 @@ export class ThinkingSelectorComponent extends Container implements Focusable {
 		this.selectListChildIndex = this.children.length;
 		this.addChild(this.selectList);
 		this.addChild(new Spacer(1));
-		this.addChild(
-			new Text(
-				theme.fg(
-					"dim",
-					`  ${keyDisplayText("tui.select.confirm")} to select · ${keyDisplayText("app.thinking.save")} to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`,
-				),
-				0,
-				0,
-			),
-		);
+		const confirmKey = keyDisplayText("tui.select.confirm");
+		const saveKey = onSelectAsDefault ? keyDisplayText("app.thinking.save") : "";
+		const cancelKey = keyDisplayText("tui.select.cancel");
+		const hints = [
+			confirmKey && `${confirmKey} to select`,
+			saveKey && `${saveKey} to set as default`,
+			cancelKey && `${cancelKey} to cancel`,
+		].filter(Boolean);
+		this.addChild(new Text(theme.fg("dim", `  ${hints.join(" · ")}`), 0, 0));
 
 		// Add bottom border
 		this.addChild(new DynamicBorder());

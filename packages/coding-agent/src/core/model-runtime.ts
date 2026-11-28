@@ -202,6 +202,9 @@ function mergeHeaders(
 	return merged;
 }
 
+// Idle pooled sockets outlive this by minutes, so a tighter cadence would only add requests.
+const PREWARM_INTERVAL_MS = 30_000;
+
 /** Configured pi-ai Models collection used by coding-agent and SDK consumers. */
 export class ModelRuntime implements Models {
 	private readonly models: MutableModels;
@@ -228,6 +231,8 @@ export class ModelRuntime implements Models {
 	private readonly providerAvailabilitySeq = new Map<string, number>();
 	private availabilityError: string | undefined;
 	private readonly credentialOperations = new Map<string, Promise<unknown>>();
+	/** When each provider/model connection was last warmed, so typing does not resolve auth per keystroke. */
+	private readonly prewarmedAt = new Map<string, number>();
 
 	private constructor(
 		credentials: RuntimeCredentials,
@@ -893,6 +898,25 @@ export class ModelRuntime implements Models {
 			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 		}
 		await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
+	}
+
+	/**
+	 * Opens, or keeps alive, the connection the next request of `model` will use, when its provider can. Throttled to
+	 * once per model every 30 seconds. Best effort: never rejects, and the real request reports any failure.
+	 */
+	async prewarmConnection(model: Model<Api>): Promise<void> {
+		if (!this.models.getProvider(model.provider)?.prewarm) return;
+		const key = `${model.provider}\0${model.id}`;
+		const now = Date.now();
+		const last = this.prewarmedAt.get(key);
+		if (last !== undefined && now - last < PREWARM_INTERVAL_MS) return;
+		this.prewarmedAt.set(key, now);
+		try {
+			const prepared = await this.prepareRequest(model, undefined);
+			await prepared.provider.prewarm?.(prepared.model, prepared.options);
+		} catch {
+			// Best effort: the next request resolves auth and connects again, and reports what fails.
+		}
 	}
 
 	async generateImages(

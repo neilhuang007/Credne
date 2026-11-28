@@ -66,6 +66,8 @@ export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
 	tokensBefore: number;
+	/** Estimated context tokens right after the compaction; absent for compactions stored without it. */
+	tokensAfter?: number;
 	timestamp: number;
 }
 
@@ -113,11 +115,13 @@ export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
 	timestamp: string,
+	tokensAfter?: number,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary: summary,
 		tokensBefore,
+		...(tokensAfter !== undefined ? { tokensAfter } : {}),
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

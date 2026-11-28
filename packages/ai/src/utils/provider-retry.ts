@@ -1,3 +1,5 @@
+import { isSubscriptionUsageLimit } from "./usage-limit.ts";
+
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
 interface ProviderRetryOptions {
@@ -117,7 +119,12 @@ export async function retryProviderRequest<T>(
 			return await request();
 		} catch (error) {
 			if (options.signal?.aborted) throw createAbortError();
-			if (retriesRemaining <= 0 || !isProviderError(error) || !isRetryableProviderError(error)) throw error;
+			if (!isProviderError(error)) throw error;
+			if (error.status === 429 && isSubscriptionUsageLimit(error.message, error.headers)) {
+				if (isSubscriptionUsageLimit(error.message)) throw error;
+				throw new Error(`Subscription usage limit reached: ${error.message}`, { cause: error });
+			}
+			if (retriesRemaining <= 0 || !isRetryableProviderError(error)) throw error;
 			if (error.status !== undefined && options.noRetryStatuses?.includes(error.status)) throw error;
 
 			const retryIndex = maxRetries - retriesRemaining;

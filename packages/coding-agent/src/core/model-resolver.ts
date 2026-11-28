@@ -621,6 +621,17 @@ export function resolveCliModel(options: {
 	};
 }
 
+export function selectScopedDefault(
+	scopedModels: readonly ScopedModel[],
+	defaultProvider: string | undefined,
+	defaultModelId: string | undefined,
+): ScopedModel | undefined {
+	return (
+		scopedModels.find(({ model }) => model.provider === defaultProvider && model.id === defaultModelId) ??
+		scopedModels[0]
+	);
+}
+
 export interface InitialModelResult {
 	model: Model<Api> | undefined;
 	thinkingLevel: ThinkingLevel;
@@ -629,7 +640,7 @@ export interface InitialModelResult {
 
 /**
  * Find the initial model to use based on priority:
- * 1. First model from scoped models (if not continuing/resuming)
+ * 1. Saved default within the model scope, otherwise the first scoped model (also on Credne resume fallback)
  * 2. Saved default from settings
  * 3. First available model with valid API key
  */
@@ -656,8 +667,11 @@ export async function findInitialModel(options: {
 	let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
 
 	// In Credne even a resume fallback must stay inside an existing billing scope.
-	if (scopedModels.length > 0 && (!isContinuing || USES_BROKER_AUTH)) {
-		const scopedModel = scopedModels[0];
+	const scopedModel =
+		!isContinuing || USES_BROKER_AUTH
+			? selectScopedDefault(scopedModels, defaultProvider, defaultModelId)
+			: undefined;
+	if (scopedModel) {
 		const perModel = modelThinkingLevels?.[`${scopedModel.model.provider}/${scopedModel.model.id}`];
 		return {
 			model: scopedModel.model,

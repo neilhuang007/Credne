@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AuthCredential, FetchImpl } from "@oh-my-pi/pi-ai";
+import * as cowork from "@oh-my-pi/pi-ai/providers/cowork-fetch";
 import { type Account, type AccountRecord, Accounts, accountKey } from "../src/accounts.ts";
 import { Gateway } from "../src/gateway.ts";
 import { object } from "../src/wire.ts";
@@ -190,6 +191,7 @@ export function piText(events: PiEvent[]): string {
  */
 export function fakeNetwork(
 	respond: (request: Request) => Response | Promise<Response> = () => new Response(null, { status: 404 }),
+	anthropicFixture?: string,
 ) {
 	const realFetch = globalThis.fetch;
 	const network: { fetch: FetchImpl } = globalThis;
@@ -198,9 +200,24 @@ export function fakeNetwork(
 		const url = new URL(input instanceof Request ? input.url : String(input));
 		if (url.hostname === "127.0.0.1" || url.hostname === "localhost") return realFetch(input, init);
 		external.push(url.href);
-		return respond(new Request(input, init));
+		const request = new Request(input, init);
+		if (
+			anthropicFixture &&
+			url.origin === "https://api.anthropic.com" &&
+			["/v1/messages", "/api/oauth/usage"].includes(url.pathname)
+		) {
+			return realFetch(new Request(new URL(url.pathname + url.search, anthropicFixture), request));
+		}
+		return respond(request);
 	});
-	return { external, restore: () => spy.mockRestore() };
+	const native = spyOn(cowork, "coworkFetch").mockImplementation((input, init) => network.fetch(input, init));
+	return {
+		external,
+		restore() {
+			native.mockRestore();
+			spy.mockRestore();
+		},
+	};
 }
 
 export interface Harness {
@@ -227,7 +244,7 @@ export async function harness(
 	origin: string,
 	respond?: (request: Request) => Response | Promise<Response>,
 ): Promise<Harness> {
-	const network = fakeNetwork(respond);
+	const network = fakeNetwork(respond, origin);
 	const home = await mkdtemp(join(tmpdir(), "credne-gateway-"));
 	const accounts = new Accounts({ home, anthropicBaseUrl: origin, openaiBaseUrl: origin, typesafeBaseUrl: origin });
 	await accounts.load();

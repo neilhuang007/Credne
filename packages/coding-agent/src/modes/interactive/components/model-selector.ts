@@ -33,6 +33,8 @@ interface ModelEntry {
 	item: ModelItem;
 	isGrouped: boolean;
 	alias?: string;
+	/** Marked as the current model: the model itself, or in the grouped view, the alias of its family. */
+	isCurrent: boolean;
 }
 
 /** A collapsible section header of the grouped view. */
@@ -341,7 +343,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private buildEntries(query: string): ListEntry[] {
 		if (this.isGroupedView(query)) return this.buildSectionEntries();
-		return this.searchModels(query).map((item): ModelEntry => ({ type: "model", item, isGrouped: false }));
+		return this.searchModels(query).map(
+			(item): ModelEntry => ({
+				type: "model",
+				item,
+				isGrouped: false,
+				isCurrent: modelsAreEqual(this.currentModel, item.model),
+			}),
+		);
 	}
 
 	private searchModels(query: string): ModelItem[] {
@@ -369,7 +378,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const header: SectionEntry = { type: "section", section, isExpanded };
 			if (!isExpanded) return [header];
 			const rows = section.rows.map(
-				(row): ModelEntry => ({ type: "model", item: toModelItem(row.model), isGrouped: true, alias: row.alias }),
+				(row): ModelEntry => ({
+					type: "model",
+					item: toModelItem(row.model),
+					isGrouped: true,
+					alias: row.alias,
+					isCurrent: row.isCurrent,
+				}),
 			);
 			return [header, ...rows];
 		});
@@ -378,9 +393,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	/** Callers only ask while sections are listed, so the first section exists when none holds the current model. */
 	private getExpandedSections(): Set<string> {
 		if (this.expandedSections) return this.expandedSections;
-		const currentSection = this.sections.find((section) =>
-			section.rows.some((row) => modelsAreEqual(this.currentModel, row.model)),
-		);
+		const currentSection = this.sections.find((section) => section.rows.some((row) => row.isCurrent));
 		this.expandedSections = new Set([(currentSection ?? this.sections[0]).key]);
 		return this.expandedSections;
 	}
@@ -403,9 +416,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		if (preferredIndex >= 0) return preferredIndex;
 		if (query) return 0;
 		if (this.isGroupedView(query)) {
-			const currentIndex = this.entries.findIndex(
-				(entry) => entry.type === "model" && modelsAreEqual(this.currentModel, entry.item.model),
-			);
+			const currentIndex = this.entries.findIndex((entry) => entry.type === "model" && entry.isCurrent);
 			return Math.max(0, currentIndex);
 		}
 		return Math.min(this.selectedIndex, Math.max(0, this.entries.length - 1));
@@ -477,7 +488,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private renderModelRow(entry: ModelEntry, isSelected: boolean): string {
 		const { item } = entry;
 		const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
-		const currentMarker = modelsAreEqual(this.currentModel, item.model) ? theme.fg("accent", "✓ ") : "  ";
+		const currentMarker = entry.isCurrent ? theme.fg("accent", "✓ ") : "  ";
 		const defaultBadge = this.isDefaultModel(item.model) ? theme.fg("muted", " · default") : "";
 		const name = getDistinctModelName({ id: item.id, name: item.model.name });
 

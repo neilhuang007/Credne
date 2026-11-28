@@ -179,7 +179,7 @@ describe("compaction model overrides", () => {
 		const manager = SettingsManager.inMemory({
 			compaction: { reserveTokens: 0, keepRecentTokens: 0 },
 		});
-		expect(manager.getCompactionSettings(model)).toEqual({ enabled: true, reserveTokens: 0, keepRecentTokens: 0 });
+		expect(manager.getCompactionSettings(model)).toEqual({ ...defaults, reserveTokens: 0, keepRecentTokens: 0 });
 		manager.applyOverrides({
 			compaction: {
 				reserveTokens: 1000,
@@ -187,6 +187,6 @@ describe("compaction model overrides", () => {
 				modelOverrides: { [modelKey]: { reserveTokens: 0, keepRecentTokens: 0 } },
 			},
 		});
-		expect(manager.getCompactionSettings(model)).toEqual({ enabled: true, reserveTokens: 0, keepRecentTokens: 0 });
+		expect(manager.getCompactionSettings(model)).toEqual({ ...defaults, reserveTokens: 0, keepRecentTokens: 0 });
 	});
 });

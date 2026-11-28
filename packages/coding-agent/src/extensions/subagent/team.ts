@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
+import type { SubagentRecord } from "../../core/compaction/subagent-card.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import type { ReadonlySessionManager } from "../../core/session-manager.ts";
 import { SUBAGENT_USAGE_ENTRY, type SubagentUsageSnapshot } from "../../core/session-usage.ts";
@@ -20,6 +21,7 @@ import {
 	createWorkerSession,
 	type DispatchDefaults,
 	emptyUsage,
+	getFinalOutput,
 	type OnUpdateCallback,
 	type ResolvedAgent,
 	type SingleResult,
@@ -140,6 +142,12 @@ export function getWorkerTeam(pi: ExtensionAPI, ctx: ExtensionContext): WorkerTe
 	return owner.team;
 }
 
+/** Returns the worker team of the current parent session when one was created, without creating one. */
+export function findWorkerTeam(ctx: Pick<ExtensionContext, "sessionManager">): WorkerTeam | undefined {
+	const owner = owners.get(ctx.sessionManager);
+	return owner?.sessionId === ctx.sessionManager.getSessionId() ? owner.team : undefined;
+}
+
 function getOwner(pi: ExtensionAPI, ctx: ExtensionContext): TeamOwner {
 	const cached = owners.get(ctx.sessionManager);
 	if (cached) return cached;
@@ -166,6 +174,7 @@ export class WorkerTeam {
 	private readonly listeners = new Set<() => void>();
 	private readonly jobs: BackgroundJobManager<WorkerRun, SingleResult>;
 	private readonly warmup = new PrefixWarmup();
+	private readonly foregroundWaits = new Set<() => void>();
 	private isDisposed = false;
 	private disposal?: Promise<void>;
 
@@ -179,11 +188,52 @@ export class WorkerTeam {
 		);
 	}
 
+	/** Waits on behalf of the parent until the work completes or the user backgrounds it. */
+	async waitInForeground<Result>(
+		signal: AbortSignal | undefined,
+		run: (signal: AbortSignal) => Promise<Result>,
+		onBackground: () => void,
+	): Promise<Result | undefined> {
+		const controller = new AbortController();
+		const released = Promise.withResolvers<undefined>();
+		const detach = () => {
+			onBackground();
+			signal?.removeEventListener("abort", abort);
+			this.foregroundWaits.delete(detach);
+			released.resolve(undefined);
+		};
+		const abort = () => {
+			this.foregroundWaits.delete(detach);
+			controller.abort(signal?.reason);
+		};
+		if (signal?.aborted) abort();
+		else {
+			this.foregroundWaits.add(detach);
+			signal?.addEventListener("abort", abort, { once: true });
+		}
+		try {
+			return await Promise.race([run(controller.signal), released.promise]);
+		} finally {
+			this.foregroundWaits.delete(detach);
+			signal?.removeEventListener("abort", abort);
+		}
+	}
+
+	/** Releases this session's foreground tool calls without cancelling their workers. */
+	backgroundForegroundWorkers(): boolean {
+		if (this.isDisposed || !this.foregroundWaits.size) return false;
+		for (const detach of this.foregroundWaits) detach();
+		return true;
+	}
+
 	/** Creates a stable worker identity and queues its first run. */
 	spawn(input: SpawnInput): { id: string; result: Promise<SingleResult> } {
 		this.assertActive();
 		const id = randomUUID();
-		const defaults = { ...input.defaults };
+		const defaults = {
+			...input.defaults,
+			requestedThinkingLevel: input.defaults.requestedThinkingLevel ?? input.defaults.thinkingLevel,
+		};
 		const worker: Worker = {
 			id,
 			// Workers are never removed from the map, so its size is the spawn order.
@@ -235,6 +285,29 @@ export class WorkerTeam {
 			assignmentCount: worker.assignments.length,
 			model: worker.input.defaults.model ?? worker.input.resolved.agent?.model,
 			reasoningEffort: worker.input.defaults.thinkingLevel,
+		}));
+	}
+
+	/**
+	 * Describes each running or queued worker for compaction: every prompt it was given (its runs' tasks, which include
+	 * queued assignments, follow-ups and messages delivered when a run starts, then messages still waiting in its inbox)
+	 * and the final output of each finished run, in order. Idle workers are left out.
+	 */
+	subagentRecords(): SubagentRecord[] {
+		if (this.isDisposed) return [];
+		const active = [...this.workers.values()].filter(
+			(worker) => worker.status === "running" || worker.status === "queued",
+		);
+		return active.map((worker) => ({
+			id: worker.id,
+			agent: worker.input.resolved.agent?.name ?? worker.input.name,
+			status: worker.status,
+			prompts: [...worker.runs.map((run) => run.task), ...worker.inbox],
+			messages: worker.runs.flatMap((run) => {
+				if (run.status === "pending" || run.status === "running") return [];
+				const output = getFinalOutput(run.messages) || run.errorMessage;
+				return output ? [output] : [];
+			}),
 		}));
 	}
 
@@ -350,17 +423,23 @@ export class WorkerTeam {
 			);
 		if (worker.modelChange)
 			throw new Error(`Worker ${id} already has a model change in progress. Wait for it to finish.`);
-		const configuration = dispatch.resolve(selection, {
+		const defaults = worker.input.defaults;
+		const {
+			model: reference,
+			thinkingLevel,
+			requestedThinkingLevel,
+		} = dispatch.resolveWithChoice(selection, {
 			...ctx,
-			thinkingLevel: worker.input.defaults.thinkingLevel ?? ctx.thinkingLevel,
+			thinkingLevel: defaults.requestedThinkingLevel ?? ctx.thinkingLevel,
 		});
 		const model = ctx.modelRegistry
 			.getAvailable()
-			.find((candidate) => `${candidate.provider}/${candidate.id}` === configuration.model)!;
+			.find((candidate) => `${candidate.provider}/${candidate.id}` === reference)!;
 		worker.modelChange = (async () => {
 			try {
-				await worker.session.setModel(model, configuration.thinkingLevel);
-				return configuration;
+				await worker.session.setModel(model, thinkingLevel);
+				defaults.requestedThinkingLevel = requestedThinkingLevel;
+				return { model: reference, thinkingLevel };
 			} finally {
 				this.notify();
 			}
@@ -398,9 +477,18 @@ export class WorkerTeam {
 			);
 			return "queued";
 		}
+		return this.deliverToWorker(to, `Message from ${sender}:\n${message}`);
+	}
+
+	/** Sends editor input to the worker as the user, outside the parent agent's conversation. */
+	sendUserMessage(to: string, message: string): Promise<string> {
+		return this.deliverToWorker(to, message);
+	}
+
+	private async deliverToWorker(to: string, content: string): Promise<string> {
+		this.assertActive();
 		const worker = this.getWorker(to);
 		if (worker.status === "cancelled") return "cancelled";
-		const content = `Message from ${sender}:\n${message}`;
 		if (worker.status === "running" && (await worker.session.send(content, "steer"))) return "delivered";
 		this.assertActive();
 		if (this.getWorker(to).status === "cancelled") return "cancelled";

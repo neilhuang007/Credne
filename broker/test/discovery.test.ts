@@ -34,6 +34,7 @@ test("a ChatGPT subscription serves the models its provider lists, and the pool 
 	const upstream = fakeUpstream(() => responsesReply(newModel));
 	const listings: Request[] = [];
 	const h = await harness(upstream.origin, (request) => {
+		if (request.url === "https://chatgpt.com/backend-api/codex/responses") return upstream.server.fetch(request);
 		if (!new URL(request.url).pathname.endsWith("/codex/models")) return new Response(null, { status: 404 });
 		listings.push(request);
 		return Response.json(codexListing);
@@ -105,16 +106,26 @@ test("a failed listing keeps the bundled models, and API keys are never listed t
 
 test("a Claude subscription lists its models with its own sign-in at the Anthropic endpoint", async () => {
 	const claudeModel = "claude-test-9";
-	const upstream = fakeUpstream((call) =>
-		call.path === "/v1/models"
-			? Response.json({ data: [{ id: claudeModel, display_name: "Claude Test 9", type: "model" }], has_more: false })
-			: anthropicReply("Hello."),
-	);
-	const h = await harness(upstream.origin);
+	const upstream = fakeUpstream(() => anthropicReply("Hello."));
+	const listings: Request[] = [];
+	const h = await harness(upstream.origin, (request) => {
+		if (new URL(request.url).origin !== "https://api.anthropic.com" || new URL(request.url).pathname !== "/v1/models")
+			return new Response(null, { status: 404 });
+		listings.push(request);
+		return Response.json({
+			data: [{ id: claudeModel, display_name: "Claude Test 9", type: "model" }],
+			has_more: false,
+		});
+	});
 	try {
-		const plan = await h.add("claude-plan", "claude", subscription("sk-ant-oat01-plan"), []);
+		const plan = await h.add("claude-plan", "claude", subscription("sk-ant-oat01-plan"), [], { disabled: true });
 		await h.accounts.refreshSubscriptionModels(plan);
-		const listing = upstream.calls.find((call) => call.path === "/v1/models");
+		expect(h.external).toHaveLength(0);
+		await h.accounts.mutate(plan, "enable");
+		await h.accounts.refreshSubscriptionModels(plan);
+		expect(upstream.calls).toHaveLength(0);
+		expect(plan.models.every((model) => new URL(model.baseUrl).origin === "https://api.anthropic.com")).toBe(true);
+		const [listing] = listings;
 		expect(listing?.headers.get("authorization")).toBe("Bearer sk-ant-oat01-plan");
 		expect(listing?.headers.get("anthropic-beta")).toContain("oauth-2025-04-20");
 		const listed = publicModels(plan);

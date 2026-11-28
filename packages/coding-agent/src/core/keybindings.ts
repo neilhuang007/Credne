@@ -48,12 +48,16 @@ const APP_KEYBINDINGS = {
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
 	"app.accounts.add": { defaultKeys: "ctrl+a", description: "Add an account" },
-	"app.accounts.remove": { defaultKeys: "delete", description: "Delete the marked accounts or highlighted account" },
-	"app.accounts.mark": { defaultKeys: "space", description: "Mark or unmark the highlighted account" },
+	"app.accounts.remove": { defaultKeys: "delete", description: "Delete the selected accounts or highlighted account" },
+	"app.accounts.mark": { defaultKeys: "space", description: "Select or deselect the highlighted account" },
 	"app.accounts.toolbar": { defaultKeys: "tab", description: "Move focus between account actions and the list" },
 	"app.accounts.manage": { defaultKeys: "ctrl+o", description: "Manage the selected account" },
 	"app.accounts.model": { defaultKeys: "ctrl+l", description: "Choose a model on the selected account or pool" },
 	"app.accounts.refresh": { defaultKeys: "ctrl+r", description: "Refresh selected account usage" },
+	"app.subagents.background": {
+		defaultKeys: "ctrl+b",
+		description: "Continue main with foreground workers in the background",
+	},
 	"app.subagents.select": { defaultKeys: "down", description: "Select agents below an empty prompt" },
 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
 	"app.thinking.toggle": {

@@ -138,6 +138,7 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 | `app.session.tree` | None | Open session tree navigator (`/tree`) |
 | `app.session.fork` | None | Fork current session (`/fork`) |
 | `app.session.resume` | None | Open session resume picker (`/resume`) |
+| `app.subagents.background` | `ctrl+b` | Let main continue while foreground workers finish in the background (`/continue`). With an interrupted main turn it resumes that turn; otherwise Ctrl+B keeps its editor binding. |
 | `app.subagents.select` | `down` | Focus the agent list below an empty editor when autocomplete is closed; Up/Down navigate rows (`/subagents` opens the separate session picker) |
 | `app.session.togglePath` | `ctrl+p` | Toggle path display |
 | `app.session.toggleSort` | `ctrl+s` | Toggle sort mode |
@@ -148,16 +149,16 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 
 ### Accounts panel
 
-These actions apply inside `/accounts`. Up/Down highlight an account or pool without switching to it. Enter uses the highlighted provider in this session and sets it as the default for new sessions. Escape closes, and PageUp/PageDown scroll the details. These keys use the configurable `tui.select.*` actions.
+These actions apply inside `/accounts`. Up/Down highlight an account or pool without switching to it. Enter selects or deselects the highlighted account. Escape closes, and PageUp/PageDown scroll the details. These keys use the configurable `tui.select.*` actions.
 
-Marking accounts does not change the highlighted provider. Tab moves focus between the list and toolbar. While the toolbar has focus, use Left/Right or Up/Down to choose an action and Enter to run it. You can also click the toolbar actions or the checkboxes next to accounts. Enable, Disable, and Delete apply to marked accounts, or to the highlighted account if none are marked. Pools, cached accounts, and accounts from `config.yaml` cannot be marked or modified through the toolbar.
+Selecting accounts does not change the highlighted provider. Tab moves focus between the list and toolbar. While the toolbar has focus, use Left/Right or Up/Down to choose an action and Enter to run it. You can also click the toolbar actions or the checkboxes next to accounts. Pin uses the one selected account, or the highlighted provider if none is selected, in this session and sets it as the default for new sessions. Enable, Disable, and Delete apply to selected accounts, or to the highlighted account if none are selected. Pools, cached accounts, and accounts from `config.yaml` cannot be selected or modified through the toolbar.
 
 | Keybinding id | Default | Description |
 |---|---|---|
 | `app.accounts.add` | `ctrl+a` | Add an account |
-| `app.accounts.mark` | `space` | Mark or unmark the highlighted account |
+| `app.accounts.mark` | `space` | Select or deselect the highlighted account, like Enter |
 | `app.accounts.toolbar` | `tab` | Move focus between account actions and the list |
-| `app.accounts.remove` | `delete` | Confirm deletion of the marked accounts, or the highlighted account if none are marked |
+| `app.accounts.remove` | `delete` | Confirm deletion of the selected accounts, or the highlighted account if none are selected |
 | `app.accounts.manage` | `ctrl+o` | Manage the highlighted account |
 | `app.accounts.model` | `ctrl+l` | Choose a model on the highlighted account or pool and set it as the default |
 | `app.accounts.refresh` | `ctrl+r` | Refresh usage for the highlighted account |

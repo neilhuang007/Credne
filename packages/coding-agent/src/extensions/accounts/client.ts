@@ -203,7 +203,18 @@ export class BrokerClient {
 	}
 
 	async accountUsage(key: string, signal?: AbortSignal): Promise<BrokerUsage> {
-		return parseUsage(await this.request("GET", `/accounts/${encodeURIComponent(key)}/usage`, undefined, signal));
+		return this.readUsage(key, await this.connect(signal), signal);
+	}
+
+	/** Read subscription usage without starting the daemon for a passive display. */
+	async accountUsageIfRunning(key: string, signal: AbortSignal): Promise<BrokerUsage | undefined> {
+		const connection = await this.connectExisting(signal);
+		if (connection) return this.readUsage(key, connection, signal);
+	}
+
+	private async readUsage(key: string, connection: BrokerConnection, signal?: AbortSignal): Promise<BrokerUsage> {
+		const path = `/accounts/${encodeURIComponent(key)}/usage`;
+		return parseUsage(await this.requestConnected(connection, "GET", path, undefined, signal));
 	}
 
 	async setDisabled(key: string, disabled: boolean): Promise<void> {
@@ -277,7 +288,16 @@ export class BrokerClient {
 	}
 
 	private async request(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
-		const connection = await this.connect(signal);
+		return this.requestConnected(await this.connect(signal), method, path, body, signal);
+	}
+
+	private async requestConnected(
+		connection: BrokerConnection,
+		method: string,
+		path: string,
+		body?: unknown,
+		signal?: AbortSignal,
+	): Promise<unknown> {
 		let response: Response;
 		try {
 			response = await fetchBroker(`${connection.url}/credne/v1${path}`, {

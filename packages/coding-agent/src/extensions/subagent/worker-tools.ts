@@ -19,6 +19,7 @@ const mainOnlyTools = new Set([
 	"cancel_tasks",
 	"get_subagent_context",
 	"checkpoint_context",
+	"compact",
 	"list_mcp_resources",
 	"list_mcp_resource_templates",
 	"read_mcp_resource",

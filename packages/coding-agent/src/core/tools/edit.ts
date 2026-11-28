@@ -39,10 +39,7 @@ const editSchema = Type.Object(
 
 export const editToolSystemPromptContribution = {
 	snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
-	guidelines: [
-		"Use edit for targeted changes. Batch changes to one file in a single call.",
-		"Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.",
-	],
+	guidelines: ["Use edit for targeted changes. Batch changes to one file in a single call."],
 } as const;
 
 export type EditToolInput = Static<typeof editSchema>;
@@ -144,7 +141,7 @@ export function createEditToolDefinition(
 		name: "edit",
 		label: "edit",
 		description:
-			"Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+			"Performs exact string replacements in files.\n\nUsage:\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- Keep `edits[].oldText` minimal — usually 1-3 lines, only enough to be unique in the file. Including excess context wastes tokens and is an error.\n- The edit will FAIL if `edits[].oldText` is not unique in the file. In that case, add the minimum extra context needed for uniqueness.",
 		promptSnippet: editToolSystemPromptContribution.snippet,
 		promptGuidelines: [...editToolSystemPromptContribution.guidelines],
 		parameters: editSchema,

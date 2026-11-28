@@ -2,15 +2,22 @@
 // parent conversation, when it has one, as the first block of its first message.
 import { readFileSync } from "node:fs";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { getSystemMessageText } from "@earendil-works/pi-ai";
+import type { Provider } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import type { ExtensionAPI } from "../../core/extensions/types.ts";
 import { buildSystemPromptSections } from "../../core/system-prompt.ts";
+import { upstreamIdentity } from "../accounts/catalog.ts";
+import { OMP_NATIVE_API } from "../accounts/omp-native.ts";
+import type { AccountProviderSpec } from "../accounts/provider.ts";
 
 /** Flag that marks a Pi process as a subagent worker. */
 export const WORKER_FLAG = "subagent-worker";
 
 /** Environment variable through which the runner passes the file holding the stripped parent conversation. */
 export const WORKER_CONVERSATION_ENV = "PI_SUBAGENT_CONVERSATION";
+
+const ompSystemSchema = Type.Object({ context: Type.Object({ systemPrompt: Type.Array(Type.String()) }) });
 
 /**
  * Registers the worker flag and, in a worker, the request layout.
@@ -22,24 +29,29 @@ export const WORKER_CONVERSATION_ENV = "PI_SUBAGENT_CONVERSATION";
  */
 export function registerWorkerPrompt(pi: ExtensionAPI): void {
 	pi.registerFlag(WORKER_FLAG, { description: "Internal isolated subagent worker", type: "boolean", default: false });
+	let layout: { prompt: string; claudeBlocks: string[] } | undefined;
 	pi.on("before_agent_start", (event) => {
 		if (!pi.getFlag(WORKER_FLAG)) return;
 		const { customPrompt, contextFiles, cwd } = event.systemPromptOptions;
 		const sections = buildSystemPromptSections({ customPrompt, contextFiles, cwd });
-		// A returned prompt is projected onto every request of the run, after all handlers changed
-		// their sections, so a later extension cannot add to it.
-		return {
-			systemPrompt: getSystemMessageText({
-				role: "system",
-				content: "",
-				sections: {
-					preamble: customPrompt ?? "",
-					...(sections.project_context ? { project_context: sections.project_context } : {}),
-					cwd: sections.cwd,
-				},
-				timestamp: 0,
-			}),
+		const workspace = [sections.project_context, sections.cwd].filter(Boolean).join("\n\n");
+		const prompt = [customPrompt, workspace].filter(Boolean).join("\n\n");
+		layout = {
+			prompt,
+			claudeBlocks: [...(customPrompt ? [customPrompt] : []), `<project-context>\n${workspace}\n</project-context>`],
 		};
+		return { systemPrompt: prompt };
+	});
+	pi.on("before_provider_request", ({ payload }, ctx) => {
+		if (!layout || ctx.model?.api !== OMP_NATIVE_API) return;
+		const provider: (Provider & Pick<AccountProviderSpec, "upstream">) | undefined = ctx.modelRegistry.getProvider(
+			ctx.model.provider,
+		);
+		if (upstreamIdentity(provider?.upstream, ctx.model.id)?.api !== "anthropic-messages") return;
+		if (!Value.Check(ompSystemSchema, payload)) return;
+		const { systemPrompt } = payload.context;
+		if (systemPrompt.length !== 1 || systemPrompt[0] !== layout.prompt) return;
+		return { ...payload, context: { ...payload.context, systemPrompt: layout.claudeBlocks } };
 	});
 	const conversationPath = process.env[WORKER_CONVERSATION_ENV];
 	if (!conversationPath) return;

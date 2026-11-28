@@ -17,6 +17,14 @@ import { matchesServingAccount, observeServingAccount } from "../serving-account
 import { resolveModelAlias } from "./model-aliases.ts";
 import { type ModelTier, resolveModelTier, type TierSelection } from "./model-tiers.ts";
 
+/** Model override accepted by child dispatch tools. */
+export const dispatchModelSchema = Type.Optional(
+	Type.String({
+		description:
+			"Leave unset to use the agent profile and tier-based model selection. Set only when the user requests a specific model; this overrides the default for this call.",
+	}),
+);
+
 /** Reasoning levels accepted by child dispatch tools. */
 export const reasoningEffortSchema = Type.Union([
 	Type.Literal("off"),
@@ -76,7 +84,7 @@ export interface SubagentDispatch {
 		selection: DispatchSelection,
 		ctx: ExtensionContext,
 		profile?: ProfileDefaults,
-	): DispatchResolution & { modelChoice: ModelChoice };
+	): DispatchResolution & { requestedThinkingLevel: ThinkingLevel; modelChoice: ModelChoice };
 	models(ctx: ExtensionContext, provider?: string): { provider: string; models: Model<Api>[] };
 }
 
@@ -156,6 +164,7 @@ export function createSubagentDispatch(pi: ExtensionAPI): SubagentDispatch {
 		return {
 			model: `${model.provider}/${model.id}`,
 			thinkingLevel,
+			requestedThinkingLevel: requested,
 			modelChoice: {
 				modelId: model.id,
 				decision: profile?.decision,

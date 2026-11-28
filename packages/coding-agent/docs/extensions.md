@@ -396,7 +396,7 @@ Other operations change the current session without replacing the runtime:
 
 | Operation | Events |
 |---|---|
-| `/compact` or automatic compaction | `session_before_compact` (can cancel or customize), then `session_compact` or `session_compact_failed` |
+| `/compact` or automatic compaction | `session_before_compact` (can cancel, fail, or customize), then `session_compact` or `session_compact_failed` |
 | `/tree` navigation | `session_before_tree` (can cancel or customize), then `session_tree` |
 | `/name` or `pi.setSessionName()` | `session_info_changed` |
 | `/model` or model cycling (`Ctrl+P`) | `thinking_level_select` if the level changes or is clamped, then `model_select` |
@@ -539,11 +539,15 @@ Fired on compaction. See [compaction.md](compaction.md) for details.
 pi.on("session_before_compact", async (event, ctx) => {
   const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;
 
-  // reason - "manual" (/compact), "threshold", or "overflow"
+  // reason - "manual" (/compact), "threshold", "overflow", or "agent" (ctx.requestCompaction())
   // willRetry - whether the aborted turn is retried after compaction (overflow recovery)
+  // event.systemPromptOptions - the run's prompt options (the base options while idle); see below
 
   // Cancel:
   return { cancel: true };
+
+  // Fail: nothing is stored and no summary is generated. A handler that throws fails the same way.
+  return { error: "What went wrong" };
 
   // Custom summary:
   return {
@@ -559,18 +563,22 @@ pi.on("session_before_compact", async (event, ctx) => {
 pi.on("session_compact", async (event, ctx) => {
   // event.compactionEntry - the saved compaction
   // event.fromExtension - whether extension provided it
-  // event.reason - "manual" (/compact), "threshold", or "overflow"
+  // event.reason - "manual" (/compact), "threshold", "overflow", or "agent" (ctx.requestCompaction())
   // event.willRetry - whether the aborted turn is retried after compaction (overflow recovery)
 });
 
 pi.on("session_compact_failed", async (event, ctx) => {
-  // event.reason - "manual" (/compact), "threshold", or "overflow"
+  // event.reason - "manual" (/compact), "threshold", "overflow", or "agent" (ctx.requestCompaction())
   // event.errorMessage - present for non-abort failures
   // event.aborted - true for cancelled/aborted compactions
   // event.willRetry - whether the aborted turn would have retried after compaction
-  // event.fromExtension - whether extension-provided compaction content was being used
+  // event.fromExtension - whether extension-provided compaction content was being used, or a handler failed the compaction
 });
 ```
+
+The compaction entry stores the prompt and tool state the compacted context starts with. Pi takes it when the entry is written: the tools active at that moment, so a tool a `session_before_compact` handler removed with `pi.setActiveTools()` is not declared in the compacted context, and the prompt sections the model had, with the section changes handlers made to `event.systemPromptOptions`. A run in progress continues with those options. A cancelled or failed compaction discards the changes; restore tools you removed in `session_compact_failed`.
+
+Use this to re-send guidance that only a removed message carried, such as a tool listing in a tool result: set a `closingSections` entry here so the compacted context's prompt has it, and set the same entry in [`before_agent_start`](#before_agent_start) while the compaction follows that message, so later runs keep it.
 
 #### session_before_tree / session_tree
 
@@ -634,6 +642,7 @@ pi.on("before_agent_start", async (event, ctx) => {
   //   .toolGuidelines - rule bullets keyed by tool name
   //   .promptGuidelines - additional custom rule bullets
   //   .sections - custom XML-wrapped sections keyed by tag name
+  //   .closingSections - XML-wrapped sections rendered after cwd, at the end of the prompt
   //   .appendSystemPrompt - text from --append-system-prompt flags
   //   .cwd - working directory
   //   .contextFiles - AGENTS.md files and other loaded context files
@@ -654,7 +663,7 @@ pi.on("before_agent_start", async (event, ctx) => {
 
 A returned `message` is added to either kind of run; check `messageType` to skip runs started by custom messages.
 
-The `systemPromptOptions` field gives extensions access to the same structured data Pi uses to build the system prompt. Collections are mutable. Prefer changing `sections`, `selectedTools`, or `promptGuidelines`: Pi diffs the resulting prompt sections against what the model already has and appends one system message patching only the changed sections. Returning `systemPrompt`, or setting `forceSystemPrompt`, replaces the whole prompt for the run: every provider receives the forced text as its leading system prompt (a cache miss when it changes), and the session transcript keeps recording the structured sections. Tool selection changes update both the prompt contributions and executable provider tools; calling `pi.setActiveTools()` inside the handler has the same effect as editing `selectedTools`. Models that accept system messages mid-conversation receive the patch in place and keep their cached prefix; other models get the replayed prompt as their system prompt, which is a cache miss once per change.
+The `systemPromptOptions` field gives extensions access to the same structured data Pi uses to build the system prompt. Collections are mutable. Prefer changing `sections`, `closingSections`, `selectedTools`, or `promptGuidelines`: Pi diffs the resulting prompt sections against what the model already has and appends one system message patching only the changed sections. `sections` render after the appended prompt text and before the project context and working directory; `closingSections` render after the working directory, in insertion order, so they end the prompt. Both take the same names (lowercase letters, digits, `_` and `-`, starting with a letter, not `preamble`), and a name cannot be in both. Returning `systemPrompt`, or setting `forceSystemPrompt`, replaces the whole prompt for the run: every provider receives the forced text as its leading system prompt (a cache miss when it changes), and the session transcript keeps recording the structured sections. Tool selection changes update both the prompt contributions and executable provider tools; calling `pi.setActiveTools()` inside the handler has the same effect as editing `selectedTools`. Models that accept system messages mid-conversation receive the patch in place and keep their cached prefix; other models get the replayed prompt as their system prompt, which is a cache miss once per change.
 
 Inside `before_agent_start`, `event.systemPrompt` and `ctx.getSystemPrompt()` both reflect the chained system prompt as of the current handler. Later `before_agent_start` handlers can still modify it again.
 
@@ -1297,6 +1306,25 @@ ctx.compact({
   },
   onError: (error) => {
     ctx.ui.notify(`Compaction failed: ${error.message}`, "error");
+  },
+});
+```
+
+`ctx.compact()` aborts the current run first, like `/compact`.
+
+### ctx.requestCompaction()
+
+Compact before the next assistant response of the current run, without aborting the run. The run continues after compaction. Has no effect when no run is in progress, and a request is dropped when its run ends. The compaction runs like threshold compaction, with reason `"agent"` in the compaction events, and does nothing when there is nothing to compact. The built-in `compact` tool uses it.
+
+```typescript
+pi.registerTool({
+  name: "compact_now",
+  label: "Compact now",
+  description: "Compact the conversation before the next response.",
+  parameters: Type.Object({}),
+  async execute(_id, _params, _signal, _onUpdate, ctx) {
+    ctx.requestCompaction();
+    return { content: [{ type: "text", text: "Compaction will run before your next response." }], details: {} };
   },
 });
 ```
@@ -2914,6 +2942,13 @@ ctx.ui.setWorkingIndicator({
 });
 ctx.ui.setWorkingIndicator({ frames: [] });  // Hide indicator
 ctx.ui.setWorkingIndicator();  // Restore default spinner
+
+// Compaction indicator line (optional method, interactive mode only). Replaces the text of the indicator shown
+// while a compaction runs, until that compaction ends; does nothing while none runs. The renderer gets the
+// available columns and the current spinner frame, which is drawn only if the line includes it. While the line
+// is shown in the input box's top border, the badge on the border's right is not drawn.
+ctx.ui.setCompactionStatus?.((width, spinner) => truncateToWidth(`${spinner} Condensing (3 of 12)`, width));
+ctx.ui.setCompactionStatus?.(undefined);  // Restore the default text
 
 // Widget above editor (default)
 ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"]);

@@ -78,7 +78,9 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 |---|---|---|---|
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
 | `compaction.reserveTokens` | number | `16384` | Free context tokens below which automatic compaction starts. |
-| `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
+| `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization by the `"summary"` strategy. |
+| `compaction.remindTokens` | number | `50000` | Free context tokens below which the agent is reminded that it can compact with the `compact` tool, capped at 20% of the context window. No reminder when the cap is not above `reserveTokens`. |
+| `compaction.strategy` | string | `"blocks"` | `"blocks"` condenses the conversation block by block with the account's tier models (the medium one, or the session model, for the user prompt and the next steps; the light one for the block accounts and worker cards), keeps no message, shows the last block's cleaned transcript and the next steps, and adds the `read_block` tool; if it fails, the compaction fails. `"summary"` writes one structured summary and keeps `keepRecentTokens` of recent messages. |
 | `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
 
 <a id="per-model-compaction-overrides"></a>

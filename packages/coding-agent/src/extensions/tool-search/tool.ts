@@ -262,7 +262,7 @@ export class Bm25Ranker implements ToolRanker {
 }
 
 export const toolSearchSchema = Type.Object({
-	query: Type.String({ description: "Search query for deferred tools." }),
+	query: Type.String({ description: '"notebook jupyter" — keyword search, up to limit best matches' }),
 	limit: Type.Optional(
 		Type.Number({ description: `Maximum number of tools to return. Defaults to ${DEFAULT_TOOL_SEARCH_LIMIT}.` }),
 	),

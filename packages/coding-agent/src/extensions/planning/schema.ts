@@ -59,7 +59,7 @@ export const taskUpdateSchema = Type.Object(
 					Type.Literal("failed"),
 					Type.Literal("superseded"),
 				],
-				{ description: "New task state. Use done only when all work is complete." },
+				{ description: "The task status (see Status Workflow below)" },
 			),
 		),
 		output: Type.Optional(

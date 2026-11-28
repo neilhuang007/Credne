@@ -1,12 +1,23 @@
 // Coordinates persisted plans and background workers with automatic task completion.
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "../../core/extensions/types.ts";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionUIContext,
+	NormalizedBuildSystemPromptOptions,
+} from "../../core/extensions/types.ts";
 import { MAIN_AGENT_PROMPT } from "../../core/main-agent-prompt.ts";
+import type { SessionEntry } from "../../core/session-manager.ts";
 import { truncateHead } from "../../core/tools/truncate.ts";
 import { type AgentConfig, discoverBundledAgents } from "../subagent/agents.ts";
 import { captureSubagentContext, listSubagentContext, turnSchema } from "../subagent/context.ts";
-import { createSubagentDispatch, dropBlankSelections, reasoningEffortSchema } from "../subagent/dispatch.ts";
+import {
+	createSubagentDispatch,
+	dispatchModelSchema,
+	dropBlankSelections,
+	reasoningEffortSchema,
+} from "../subagent/dispatch.ts";
 import { type ModelTier, modelTierSchema } from "../subagent/model-tiers.ts";
 import { type DispatchDefaults, getFinalOutput, type SingleResult } from "../subagent/runner.ts";
 import { type AssignmentInput, getWorkerTeam, revealTools, type WorkerTeam } from "../subagent/team.ts";
@@ -62,6 +73,7 @@ const taskIdsSchema = Type.Array(Type.String(), { minItems: 1, maxItems: 4, desc
 
 interface WorkerJob {
 	id: string;
+	background: boolean;
 	team: WorkerTeam;
 	result: Promise<SingleResult>;
 }
@@ -126,7 +138,22 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	function openPlanMode(): string | undefined {
 		if (planOpen) return undefined;
 		planOpen = true;
+		return listPlanTools();
+	}
+
+	/** Re-runs the loadout hooks and lists the active plan tools (see revealTools). */
+	function listPlanTools(): string | undefined {
 		return revealTools(pi, PLAN_MODE_TOOLS, "Here are the relevant tools for planning:");
+	}
+
+	/**
+	 * Sets the closing section that re-sends the plan tool listing and the examples, which a
+	 * compaction removed from context with the result that delivered them.
+	 */
+	function resendGuidance(options: NormalizedBuildSystemPromptOptions): void {
+		// Plan mode is open, so the loadout hooks listPlanTools re-runs change nothing.
+		const listing = listPlanTools();
+		options.closingSections.planning_tools = listing ? `${listing}\n\n${PLANNING_GUIDANCE}` : PLANNING_GUIDANCE;
 	}
 
 	// The widget above the input box and the side panel section show the same plan; the widget
@@ -233,7 +260,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	function launch(
 		spec: TaskSpec,
 		target: { kind: "new"; agent: AgentConfig; defaults: DispatchDefaults } | { kind: "existing"; workerId: string },
-		execution: "background" | "foreground",
+		background: boolean,
 		ctx: ExtensionContext,
 	): WorkerJob {
 		const workerGeneration = generation;
@@ -288,7 +315,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 				if (result.status !== "completed") workerPlans.delete(resultWorkerId);
 				const output =
 					getFinalOutput(result.messages) || result.errorMessage || result.stderr || "Worker returned no output";
-				const triggerTurn = execution === "background" || hasReturned;
+				const triggerTurn = job.background || hasReturned;
 				hasReturned = true;
 				save(
 					result.status !== "completed" ? failTask(plan, spec.id, output) : completeTask(plan, spec.id, output),
@@ -317,7 +344,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 						resolved: { agent: target.agent, available: [target.agent], cwd: ctx.cwd },
 					});
 		workerId = worker.id;
-		const job = { id: worker.id, team, result: worker.result };
+		const job = { id: worker.id, team, result: worker.result, background };
 		jobs.set(spec.id, job);
 		return job;
 	}
@@ -336,17 +363,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			const result = revealed
 				? { ...snapshotResult, content: [{ type: "text" as const, text: revealed }, ...snapshotResult.content] }
 				: snapshotResult;
-			const examplesShown = ctx.sessionManager
-				.getBranch()
-				.some(
-					(entry) =>
-						(entry.type === "custom" && entry.customType === "planning-examples-shown") ||
-						(entry.type === "message" &&
-							entry.message.role === "toolResult" &&
-							entry.message.toolName === "enter_plan_mode" &&
-							!entry.message.isError),
-				);
-			if (examplesShown) return result;
+			if (ctx.sessionManager.getBranch().some(deliversGuidance)) return result;
 			// Persist before returning so another call in this batch cannot insert the examples again.
 			pi.appendEntry("planning-examples-shown");
 			return { ...result, content: [{ type: "text", text: PLANNING_GUIDANCE }, ...result.content] };
@@ -356,7 +373,38 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "create_plan",
 		label: "Create plan",
-		description: "Create a structured task list. The harness generates and returns task IDs.",
+		description: `Use this tool to create a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
+It also helps the user understand the progress of the task and overall progress of their requests.
+
+## When to Use This Tool
+
+Use this tool proactively in these scenarios:
+
+- Complex multi-step tasks - When a task requires 3 or more distinct steps or actions
+- Non-trivial and complex tasks - Tasks that require careful planning or multiple operations
+- Plan mode - When using plan mode, create a task list to track the work
+- User explicitly requests todo list - When the user directly asks you to use the todo list
+- User provides multiple tasks - When users provide a list of things to be done (numbered or comma-separated)
+- After receiving new instructions - Immediately capture user requirements as tasks
+- When you start working on a task - Mark it as running BEFORE beginning work
+- After completing a task - Mark it as done and add any new follow-up tasks discovered during implementation
+
+## When NOT to Use This Tool
+
+Skip using this tool when:
+- There is only a single, straightforward task
+- The task is trivial and tracking it provides no organizational benefit
+- The task can be completed in less than 3 trivial steps
+- The task is purely conversational or informational
+
+NOTE that you should not use this tool if there is only one trivial task to do. In this case you are better off just doing the task directly.
+
+All tasks are created with status \`pending\`.
+
+## Tips
+
+- Create tasks with clear, specific names that describe the outcome
+- Check get_plan first to avoid creating duplicate tasks`,
 		parameters: Type.Object({
 			objective: Type.String({ description: "Overall outcome the plan should achieve." }),
 			tasks: Type.Array(taskCreateSchema, {
@@ -400,8 +448,34 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "task_update",
 		label: "Update task",
-		description:
-			"Use this tool to update a task in the task list.\n\n- ONLY mark a task as completed when you have FULLY accomplished it\n\nMake sure to read a task's latest state using `get_plan` before updating it.",
+		description: `Use this tool to update a task in the task list.
+
+## When to Use This Tool
+
+**Mark tasks as resolved:**
+- When you have completed the work described in a task
+- When a task is no longer needed or has been superseded
+- After resolving, call get_plan to find your next task
+
+- ONLY mark a task as done when you have FULLY accomplished it
+- If you encounter errors, blockers, or cannot finish, keep the task as running
+- When blocked, create a new task describing what needs to be resolved
+- Never mark a task as done if:
+  - Tests are failing
+  - Implementation is partial
+  - You encountered unresolved errors
+  - You couldn't find necessary files or dependencies
+
+**Update task details:**
+- When requirements change or become clearer
+
+## Status Workflow
+
+Status progresses: \`pending\` → \`running\` → \`done\`
+
+## Staleness
+
+Make sure to read a task's latest state using \`get_plan\` before updating it.`,
 		parameters: taskUpdateSchema,
 		executionMode: "sequential",
 		async execute(_id, args, _signal, _update, ctx) {
@@ -437,7 +511,8 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "get_plan",
 		label: "Get plan",
-		description: "Use this tool to list all tasks in the task list.",
+		description:
+			"Use this tool to list all tasks in the task list.\n\n## When to Use This Tool\n\n- To check overall progress on the project",
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String({ description: "Task ID to inspect; omit to return the whole plan." })),
 		}),
@@ -491,12 +566,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 					description: "Return immediately when true; wait for all first run results when false.",
 				}),
 			),
-			model: Type.Optional(
-				Type.String({
-					description:
-						"Model ID, unique name, or family alias such as sol, opus or flash (newest of that family) on the current account. Discover IDs with search_models. An explicit provider/model ID selects that route.",
-				}),
-			),
+			model: dispatchModelSchema,
 			tier: Type.Optional(modelTierSchema),
 			reasoningEffort: Type.Optional(reasoningEffortSchema),
 			turn: Type.Optional(turnSchema),
@@ -522,7 +592,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			const ratings = await classifyTiers(pi, dispatch, requests, ctx, signal);
 			if (signal?.aborted) throw new Error("Task assignment aborted before starting");
 			const resolved = ratings.map((rating) =>
-				dispatch.resolve(
+				dispatch.resolveWithChoice(
 					{ model: configuredModel, tier: args.tier, reasoningEffort: args.reasoningEffort },
 					ctx,
 					// The rated tier replaces the profile's tier, and the rated effort the effort of its tier row;
@@ -534,20 +604,27 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			// Workers may have reported while the classifier ran, so queue the tasks on the plan as it is now.
 			const next = queueTasks(requirePlan(args.revision), args.taskIds);
 			save(next, ctx);
-			const dispatched = args.taskIds.map((id, index) => ({
-				taskId: id,
-				job: launch(
-					next.tasks.find((task) => task.spec.id === id)!.spec,
+			const dispatched = args.taskIds.map((taskId, index) => {
+				const { model, thinkingLevel, requestedThinkingLevel } = resolved[index];
+				const job = launch(
+					next.tasks.find((task) => task.spec.id === taskId)!.spec,
 					{
 						kind: "new",
 						agent,
-						defaults: { ...resolved[index], context, extraArgs: ["--planning-worker", "--subagent-worker"] },
+						defaults: {
+							model,
+							thinkingLevel,
+							requestedThinkingLevel,
+							context,
+							extraArgs: ["--planning-worker", "--subagent-worker"],
+						},
 					},
-					background ? "background" : "foreground",
+					background,
 					ctx,
-				),
-			}));
-			const workers = dispatched.map(({ taskId, job }, index) => ({ taskId, workerId: job.id, ...resolved[index] }));
+				);
+				return { job, worker: { taskId, workerId: job.id, model, thinkingLevel } };
+			});
+			const workers = dispatched.map(({ worker }) => worker);
 			const completed = background
 				? undefined
 				: await waitForWorkers(
@@ -562,7 +639,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 				errorMessage: result.errorMessage,
 			}));
 			const result = snapshot();
-			const assignment = { workers, turn: args.turn ?? 0, background };
+			const assignment = { workers, turn: args.turn ?? 0, background: completed === undefined };
 			return {
 				content: [...result.content, { type: "text", text: bounded(JSON.stringify({ ...assignment, results })) }],
 				details: { ...result.details, assignment, results },
@@ -598,15 +675,15 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			const job = launch(
 				next.tasks.find((task) => task.spec.id === args.taskId)!.spec,
 				{ kind: "existing", workerId: args.workerId },
-				background ? "background" : "foreground",
+				background,
 				ctx,
 			);
-			const completed = background ? undefined : (await waitForWorkers([job], signal))[0];
+			const completed = background ? undefined : (await waitForWorkers([job], signal))?.[0];
 			const result = snapshot();
 			const assignment = {
 				taskId: args.taskId,
 				workerId: job.id,
-				background,
+				background: job.background,
 				status: completed?.status ?? "queued",
 				output: completed ? getFinalOutput(completed.messages) : undefined,
 			};
@@ -639,18 +716,30 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		if (isWorker() && toolNames.includes(event.toolName))
 			return { block: true, reason: "Planning workers cannot invoke planning tools" };
 	});
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (!pi.getActiveTools().includes("enter_plan_mode")) return;
 		// A named section rather than a replaced prompt: a replaced prompt is rebuilt at the head of
 		// every request, so later prompt and tool changes could not be appended and would discard
 		// the provider's prompt cache. Workers leave enter_plan_mode out of their tools.
 		event.systemPromptOptions.sections.planning = MAIN_AGENT_PROMPT.planning;
+		if (planOpen) {
+			const branch = ctx.sessionManager.getBranch();
+			const delivered = branch.findIndex(deliversGuidance);
+			if (delivered >= 0 && branch.findLastIndex((entry) => entry.type === "compaction") > delivered)
+				resendGuidance(event.systemPromptOptions);
+		}
 		if (!plan) return;
 		const current = `Current plan revision ${plan.revision}: ${plan.objective}. ${plan.tasks
 			.filter((task) => task.state.status !== "superseded")
 			.map((task) => `${task.spec.id}: ${task.state.status}`)
 			.join(", ")}.`;
 		return { message: { customType: "planning-context", content: current, display: false } };
+	});
+	// The compaction about to be stored follows every entry of the branch, so it removes the
+	// guidance whenever an entry delivered it. The section goes into the compacted context's prompt.
+	pi.on("session_before_compact", async (event) => {
+		if (planOpen && pi.getActiveTools().includes("enter_plan_mode") && event.branchEntries.some(deliversGuidance))
+			resendGuidance(event.systemPromptOptions);
 	});
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
 	pi.on("session_tree", async (_event, ctx) => restore(ctx));
@@ -660,20 +749,42 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", stopWorkers);
 }
 
-async function waitForWorkers(jobs: WorkerJob[], signal: AbortSignal | undefined): Promise<SingleResult[]> {
-	let cancellation: Promise<void> | undefined;
-	const cancel = () => {
-		cancellation ??= Promise.all(jobs.map((job) => job.team.cancel(job.id))).then(() => {});
-		void cancellation.catch(() => {});
-	};
-	if (signal?.aborted) cancel();
-	else signal?.addEventListener("abort", cancel, { once: true });
-	try {
-		return await Promise.all(jobs.map((job) => job.result));
-	} finally {
-		signal?.removeEventListener("abort", cancel);
-		await cancellation;
-	}
+/** Whether the entry delivered the planning examples: the first enter_plan_mode call's marker, or a successful result. */
+function deliversGuidance(entry: SessionEntry): boolean {
+	return (
+		(entry.type === "custom" && entry.customType === "planning-examples-shown") ||
+		(entry.type === "message" &&
+			entry.message.role === "toolResult" &&
+			entry.message.toolName === "enter_plan_mode" &&
+			!entry.message.isError)
+	);
+}
+
+async function waitForWorkers(
+	jobs: WorkerJob[],
+	parentSignal: AbortSignal | undefined,
+): Promise<SingleResult[] | undefined> {
+	return jobs[0].team.waitInForeground(
+		parentSignal,
+		async (signal) => {
+			let cancellation: Promise<void> | undefined;
+			const cancel = () => {
+				cancellation ??= Promise.all(jobs.map((job) => job.team.cancel(job.id))).then(() => {});
+				void cancellation.catch(() => {});
+			};
+			if (signal?.aborted) cancel();
+			else signal?.addEventListener("abort", cancel, { once: true });
+			try {
+				return await Promise.all(jobs.map((job) => job.result));
+			} finally {
+				signal?.removeEventListener("abort", cancel);
+				await cancellation;
+			}
+		},
+		() => {
+			for (const job of jobs) job.background = true;
+		},
+	);
 }
 
 /** What the tier classifier is asked about one task of a plan: the task itself, with the objective and step names as background. */

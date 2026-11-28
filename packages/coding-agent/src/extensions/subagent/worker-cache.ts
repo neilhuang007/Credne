@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
+import { OMP_NATIVE_API } from "../accounts/omp-native.ts";
+import { brokerPromptCacheKind } from "../accounts/provider.ts";
 import { PARENT_CONVERSATION_TAG } from "./parent-conversation.ts";
 import type { RequestParent } from "./worker-channel.ts";
 
@@ -16,16 +18,19 @@ export function registerWorkerCache(pi: ExtensionAPI, requestParent?: RequestPar
 	if (!process.env.PI_SUBAGENT_WORKER_ID) return;
 	let identity: CacheIdentity | undefined;
 	let isReady = false;
+	const resetPrefix = () => {
+		identity = undefined;
+		isReady = false;
+	};
+	pi.on("model_select", resetPrefix);
+	pi.on("thinking_level_select", resetPrefix);
 	pi.on("before_provider_request", async (event, ctx) => {
 		// Provider payloads are a wire boundary: each adapter owns its request shape.
 		const next = preparePayload(event.payload, ctx, isReady ? identity : undefined);
 		if (!next) return;
-		if (!next.identity) return next.payload;
-		if (!isReady || !identity) identity = next.identity;
+		identity = next.identity;
 		if (!isReady) await requestParent?.({ type: "cache_wait", ...identity }, undefined);
-		return Value.Check(keyedPayloadSchema, next.payload)
-			? { ...next.payload, prompt_cache_key: `subagent-${identity.sharedKey.slice(0, 48)}` }
-			: next.payload;
+		return next.payload;
 	});
 	pi.on("provider_stream_event", async (event, ctx) => {
 		if (!identity || isReady || event.provider !== ctx.model?.provider || event.model !== ctx.model.id) return;
@@ -64,7 +69,21 @@ const anthropicPayloadSchema = Type.Object({
 	messages: Type.Array(messageSchema),
 });
 
-const keyedPayloadSchema = Type.Object({ prompt_cache_key: Type.String() });
+const ompPayloadSchema = Type.Object({
+	modelId: Type.String(),
+	context: Type.Object({
+		systemPrompt: Type.Optional(Type.Array(Type.String())),
+		tools: Type.Optional(Type.Array(Type.Unknown())),
+		inactiveTools: Type.Optional(Type.Array(Type.Unknown())),
+		messages: Type.Array(messageSchema),
+	}),
+	options: Type.Object({
+		sessionId: Type.String(),
+		cacheRetention: Type.Optional(Type.String()),
+		reasoning: Type.Optional(Type.String()),
+		toolChoice: Type.Optional(Type.Unknown()),
+	}),
+});
 const responsesPayloadSchema = Type.Object({
 	...prefixFields,
 	prompt_cache_key: Type.String(),
@@ -85,19 +104,61 @@ function preparePayload(
 	payload: unknown,
 	ctx: ExtensionContext,
 	identity: CacheIdentity | undefined,
-): { payload: unknown; identity?: CacheIdentity } | undefined {
+): { payload: unknown; identity: CacheIdentity } | undefined {
+	if (ctx.model?.api === OMP_NATIVE_API) {
+		if (!Value.Check(ompPayloadSchema, payload) || payload.options.cacheRetention === "none") return undefined;
+		const kind = brokerPromptCacheKind(ctx.modelRegistry.getProvider(ctx.model.provider), payload.modelId);
+		if (kind === undefined) return undefined;
+		const { context, options } = payload;
+		if (kind === "anthropic" && options.cacheRetention === undefined && process.env.PI_CACHE_RETENTION === "none")
+			return undefined;
+		const prefix =
+			identity ??
+			identifyPrefix(
+				{
+					model: payload.modelId,
+					tools: kind === "anthropic" ? [context.tools, context.inactiveTools] : context.tools,
+					reasoning: options.reasoning,
+					tool_choice: options.toolChoice,
+				},
+				context.systemPrompt,
+				context.messages,
+				ctx,
+			);
+		if (kind === "anthropic") {
+			// OMP marks its request head, not the block before the task. Don't gate a reference it cannot warm.
+			return {
+				identity: { key: prefix.sharedKey, sharedKey: prefix.sharedKey },
+				payload: { ...payload, cacheAffinity: "anthropic-shared-prefix", cacheAffinityKey: routingKey(prefix) },
+			};
+		}
+		return {
+			identity: prefix,
+			payload: {
+				...payload,
+				cacheAffinity: "shared-prefix",
+				options: { ...options, promptCacheKey: routingKey(prefix) },
+			},
+		};
+	}
 	if (Value.Check(anthropicPayloadSchema, payload)) {
 		const marked = markConversationEnd(payload);
 		if (!marked) return undefined;
 		return { payload: marked, identity: identity ?? identifyPrefix(marked, marked.system, marked.messages, ctx) };
 	}
 	if (Value.Check(responsesPayloadSchema, payload)) {
-		return { payload, identity: identity ?? identifyPrefix(payload, payload.instructions, payload.input, ctx) };
+		const prefix = identity ?? identifyPrefix(payload, payload.instructions, payload.input, ctx);
+		return { identity: prefix, payload: { ...payload, prompt_cache_key: routingKey(prefix) } };
 	}
 	if (Value.Check(chatPayloadSchema, payload)) {
-		return { payload, identity: identity ?? identifyPrefix(payload, undefined, payload.messages, ctx) };
+		const prefix = identity ?? identifyPrefix(payload, undefined, payload.messages, ctx);
+		return { identity: prefix, payload: { ...payload, prompt_cache_key: routingKey(prefix) } };
 	}
 	return undefined;
+}
+
+function routingKey(identity: CacheIdentity): string {
+	return `subagent-${identity.sharedKey.slice(0, 48)}`;
 }
 
 function identifyPrefix(
@@ -140,25 +201,32 @@ function identifyPrefix(
 function markConversationEnd(payload: AnthropicPayload): AnthropicPayload | undefined {
 	const marker = payload.system.at(-1)?.cache_control;
 	if (marker === undefined) return undefined;
-	// Tools precede system. Their marker and OAuth's identity marker are redundant with the
-	// final system boundary, and proxies may need the fourth slot for automatic caching.
 	const system = payload.system.map((block, index) =>
 		index === payload.system.length - 1 ? block : withoutMarker(block),
 	);
-	const tools = payload.tools?.map(withoutMarker);
 	const firstUser = payload.messages.findIndex((message) => message.role === "user");
 	const firstContent = payload.messages[firstUser]?.content;
-	const hasConversation =
-		typeof firstContent !== "string" && firstContent?.[0]?.text?.startsWith(PARENT_CONVERSATION_TAG);
+	const reference =
+		typeof firstContent !== "string" && firstContent?.[0]?.text?.startsWith(PARENT_CONVERSATION_TAG)
+			? firstContent[0]
+			: undefined;
 	const tail = payload.messages
 		.flatMap((message) => (typeof message.content === "string" ? [] : (message.content ?? [])))
 		.findLast((block) => block.cache_control !== undefined);
-	const messages = payload.messages.map((message, index) => {
+	// The tool-only checkpoint can hit after a system change. Give it the remaining slot, if any.
+	const used =
+		1 +
+		Number(reference !== undefined) +
+		Number(tail !== undefined && tail !== reference) +
+		Number(payload.cache_control !== undefined);
+	const toolCheckpoint = used < 4 ? payload.tools?.findLast((tool) => tool.cache_control !== undefined) : undefined;
+	const tools = payload.tools?.map((tool) => (tool === toolCheckpoint ? tool : withoutMarker(tool)));
+	const messages = payload.messages.map((message) => {
 		if (typeof message.content === "string" || !message.content) return message;
 		return {
 			...message,
-			content: message.content.map((block, blockIndex) => {
-				if (hasConversation && index === firstUser && blockIndex === 0) return { ...block, cache_control: marker };
+			content: message.content.map((block) => {
+				if (block === reference) return { ...block, cache_control: marker };
 				return block === tail ? block : withoutMarker(block);
 			}),
 		};
@@ -204,6 +272,14 @@ function hasStartedReply(api: string, data: unknown): boolean {
 		);
 	}
 	if (!Value.Check(providerEventSchema, data)) return false;
+	if (api === OMP_NATIVE_API) {
+		return (
+			data.type === "text_delta" ||
+			data.type === "thinking_delta" ||
+			data.type === "toolcall_delta" ||
+			data.type === "done"
+		);
+	}
 	if (api === "anthropic-messages") return data.type === "message_start";
 	if (data.type === "response.completed" || data.type === "response.incomplete") {
 		return (

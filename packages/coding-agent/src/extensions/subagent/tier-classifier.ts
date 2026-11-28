@@ -318,13 +318,16 @@ async function rateWithClassifier(
 	}
 }
 
-/** The available classifier model to use: a Jev model, then `gpt-6-luna`, then any other. */
-async function selectClassifier(registry: ModelRegistry, signal: AbortSignal): Promise<ClassifierRef | undefined> {
+/** The available classifier model to use: a Jev model, then `gpt-6-luna`, then any other; undefined when none is available. */
+export async function selectClassifier(
+	registry: ModelRegistry,
+	signal: AbortSignal,
+): Promise<ClassifierRef | undefined> {
 	try {
 		const available = await registry.getAvailableOfType("classifier", undefined, { signal });
 		return available.toSorted((a, b) => classifierRank(a) - classifierRank(b))[0];
 	} catch {
-		// A credential lookup that fails or runs into the deadline means no classifier for this dispatch.
+		// A credential lookup that fails or runs into the deadline means no classifier for this call.
 		return undefined;
 	}
 }
@@ -422,7 +425,7 @@ async function rateWithChat(
 ): Promise<(TierOverride | undefined)[]> {
 	// A call aborted while the classifiers were looked up is not rated.
 	if (signal?.aborted) return eligible.map(() => undefined);
-	const model = findChatModel(dispatch, ctx);
+	const model = findTierModel("light", dispatch, ctx);
 	if (!model) {
 		for (const request of eligible) if (request) recordSkip(setup, request, "no-rater");
 		return eligible.map(() => undefined);
@@ -436,11 +439,16 @@ async function rateWithChat(
 	}
 }
 
-function findChatModel(dispatch: Pick<SubagentDispatch, "models">, ctx: ExtensionContext): Model<Api> | undefined {
+/** The chat model of a tier on the current account, or undefined while the account is unknown or serves no model of the tier. */
+export function findTierModel(
+	tier: ModelTier,
+	dispatch: Pick<SubagentDispatch, "models">,
+	ctx: ExtensionContext,
+): Model<Api> | undefined {
 	try {
-		return resolveModelTier("light", dispatch.models(ctx).models)?.model;
+		return resolveModelTier(tier, dispatch.models(ctx).models)?.model;
 	} catch {
-		// Dispatch throws while a pool's serving account is still unknown, and nothing is rated until it is known.
+		// Dispatch throws while a pool's serving account is still unknown, and no tier model is known until it is.
 		return undefined;
 	}
 }

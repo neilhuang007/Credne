@@ -18,11 +18,9 @@ const DISCOVERY_TIMEOUT_MS = 10_000;
  * entry; a newer one is built from the discovered row. Only the OAuth access token is used: OMP's key cascade could
  * fall back to an environment API key, which would list a key's models as the subscription's.
  */
-export async function discoverSubscriptionModels(
-	account: Account,
-	anthropicBaseUrl: string,
-): Promise<Model<Api>[] | undefined> {
-	if (account.record.kind !== "oauth") return undefined;
+export async function discoverSubscriptionModels(account: Account): Promise<Model<Api>[] | undefined> {
+	if (account.record.kind !== "oauth" || (account.provider !== "anthropic" && account.provider !== "openai-codex"))
+		return undefined;
 	const signal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
 	const access = await account.storage.oauth.access(account.provider, undefined, { signal });
 	if (!access) return undefined;
@@ -36,10 +34,11 @@ export async function discoverSubscriptionModels(
 		});
 		specs = result?.rejectedStatus === undefined ? result?.models : undefined;
 	} else if (account.provider === "anthropic") {
+		const baseUrl = getBundledModels("anthropic")[0]!.baseUrl;
 		const rows = await anthropicModelManagerOptions({
 			apiKey: access.accessToken,
-			baseUrl: anthropicBaseUrl,
-			fetch: providerOnly(anthropicBaseUrl, signal),
+			baseUrl,
+			fetch: providerOnly(baseUrl, signal),
 		}).fetchDynamicModels?.();
 		// The model list also names embedding and judge rows; the bundled catalog knows which they are.
 		const kinds = new Map(getBundledModels("anthropic").map((model) => [model.id, model.kind]));

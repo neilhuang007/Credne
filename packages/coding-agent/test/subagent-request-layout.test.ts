@@ -262,7 +262,7 @@ describe("subagent request layout", () => {
 				"change_agent_model",
 				"create_plan",
 				"revise_plan",
-				"review_task",
+				"task_update",
 				"cancel_tasks",
 				"get_subagent_context",
 				"checkpoint_context",

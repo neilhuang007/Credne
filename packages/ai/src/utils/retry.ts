@@ -1,5 +1,7 @@
 import type { AssistantMessage } from "../types.ts";
 
+import { isSubscriptionUsageLimit } from "./usage-limit.ts";
+
 function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
 	return new RegExp(patterns.join("|"), "i");
 }
@@ -281,6 +283,7 @@ export async function retryAssistantCall(
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage) return false;
 	const errorMessage = message.errorMessage;
-	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
+	if (isSubscriptionUsageLimit(errorMessage) || NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage))
+		return false;
 	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
 }

@@ -131,6 +131,7 @@ Created when context is compacted. Stores a summary of earlier messages and a co
 `firstKeptEntryId` is required. It identifies the first entry retained from before the compaction entry. When rebuilding context, Pi replaces older summarized entries with the compaction summary and keeps the range beginning at this entry. A retain-none compaction stores its own ID in this field, so no preceding entries are retained.
 
 Optional fields:
+- `tokensAfter`: Estimated context tokens right after the compaction. Pi shows it with `tokensBefore` as `Compacted from 640,154 to 32,301 tokens (95% saved)`. It is absent on older entries and on compactions that extensions append at a turn boundary.
 - `systemMessage`: The replayed prompt sections and tool declarations at the compaction boundary; it becomes the leading system message of the compacted context, and system messages among the kept entries are dropped in its favor. It is absent on older session entries.
 - `usage`: LLM usage from generating the summary; included in session token and cost totals
 - `details`: Implementation-specific data (e.g., `{ readFiles: string[], modifiedFiles: string[] }` for default, or custom data for extensions)

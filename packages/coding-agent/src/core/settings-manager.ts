@@ -13,6 +13,7 @@ import { SETTINGS_DEFAULTS, SIDE_PANEL_WIDTH_PERCENT_PATTERN } from "./settings-
 import type {
 	CacheWarmingMode,
 	CompactionModelOverride,
+	CompactionStrategy,
 	DefaultProjectTrust,
 	FullscreenExitOutput,
 	MermaidRenderingMode,
@@ -33,6 +34,7 @@ export type {
 	CodemodeSettings,
 	CompactionModelOverride,
 	CompactionSettings,
+	CompactionStrategy,
 	DefaultProjectTrust,
 	FullscreenExitOutput,
 	ImageSettings,
@@ -56,6 +58,7 @@ export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfi
 const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
 	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
 	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
+	remindTokens: SETTINGS_DEFAULTS.compaction.remindTokens,
 };
 
 const sidePanelWidthPercentage = new RegExp(SIDE_PANEL_WIDTH_PERCENT_PATTERN);
@@ -82,6 +85,44 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
 	}
 
 	return result;
+}
+
+/**
+ * Resolve a compaction token setting of `compaction` (merged settings) through the model override,
+ * the ordinary setting, then the built-in default. Throws for invalid values.
+ */
+export function resolveCompactionTokenSetting(
+	compaction: Settings["compaction"],
+	field: keyof CompactionModelOverride,
+	model?: Pick<Model<string>, "provider" | "id">,
+): number {
+	const ordinary = compaction?.[field];
+	if (ordinary !== undefined && (typeof ordinary !== "number" || !Number.isSafeInteger(ordinary) || ordinary < 0)) {
+		throw new Error(
+			`Invalid compaction.${field} setting: ${String(ordinary)}. Expected a non-negative safe integer.`,
+		);
+	}
+
+	const modelKey = model ? `${model.provider}/${model.id}` : undefined;
+	const entry = modelKey !== undefined ? compaction?.modelOverrides?.[modelKey] : undefined;
+	if (entry !== undefined && !isMergeableObject(entry)) {
+		throw new Error(
+			`Invalid compaction.modelOverrides["${modelKey}"] setting: ${String(entry)}. Expected an object.`,
+		);
+	}
+	const override = entry?.[field];
+	if (override !== undefined && (typeof override !== "number" || !Number.isSafeInteger(override) || override < 0)) {
+		throw new Error(
+			`Invalid compaction.modelOverrides["${modelKey}"].${field} setting: ${String(override)}. Expected a non-negative safe integer.`,
+		);
+	}
+	return override ?? ordinary ?? DEFAULT_COMPACTION_TOKEN_SETTINGS[field];
+}
+
+/** The compaction strategy of `compaction` (merged settings); an unset or unknown value means the default. */
+export function resolveCompactionStrategy(compaction: Settings["compaction"]): CompactionStrategy {
+	// Settings files are not validated, so only a known value selects the other strategy.
+	return compaction?.strategy === "summary" ? "summary" : SETTINGS_DEFAULTS.compaction.strategy;
 }
 
 /** Tools enabled at startup when `defaultTools` does not change them. */
@@ -856,40 +897,22 @@ export class SettingsManager {
 		this.save();
 	}
 
-	private getCompactionTokenSetting(
-		field: keyof CompactionModelOverride,
-		model?: Pick<Model<string>, "provider" | "id">,
-	): number {
-		const compaction = this.settings.compaction;
-		const ordinary = compaction?.[field];
-		if (ordinary !== undefined && (typeof ordinary !== "number" || !Number.isSafeInteger(ordinary) || ordinary < 0)) {
-			throw new Error(
-				`Invalid compaction.${field} setting: ${String(ordinary)}. Expected a non-negative safe integer.`,
-			);
-		}
-
-		const modelKey = model ? `${model.provider}/${model.id}` : undefined;
-		const entry = modelKey !== undefined ? compaction?.modelOverrides?.[modelKey] : undefined;
-		if (entry !== undefined && !isMergeableObject(entry)) {
-			throw new Error(
-				`Invalid compaction.modelOverrides["${modelKey}"] setting: ${String(entry)}. Expected an object.`,
-			);
-		}
-		const override = entry?.[field];
-		if (override !== undefined && (typeof override !== "number" || !Number.isSafeInteger(override) || override < 0)) {
-			throw new Error(
-				`Invalid compaction.modelOverrides["${modelKey}"].${field} setting: ${String(override)}. Expected a non-negative safe integer.`,
-			);
-		}
-		return override ?? ordinary ?? DEFAULT_COMPACTION_TOKEN_SETTINGS[field];
-	}
-
 	getCompactionReserveTokens(model?: Pick<Model<string>, "provider" | "id">): number {
-		return this.getCompactionTokenSetting("reserveTokens", model);
+		return resolveCompactionTokenSetting(this.settings.compaction, "reserveTokens", model);
 	}
 
 	getCompactionKeepRecentTokens(model?: Pick<Model<string>, "provider" | "id">): number {
-		return this.getCompactionTokenSetting("keepRecentTokens", model);
+		return resolveCompactionTokenSetting(this.settings.compaction, "keepRecentTokens", model);
+	}
+
+	/** Free context tokens below which the agent is reminded that it can compact. */
+	getCompactionRemindTokens(model?: Pick<Model<string>, "provider" | "id">): number {
+		return resolveCompactionTokenSetting(this.settings.compaction, "remindTokens", model);
+	}
+
+	/** How compaction condenses the conversation: one summary, or condensed blocks. */
+	getCompactionStrategy(): CompactionStrategy {
+		return resolveCompactionStrategy(this.settings.compaction);
 	}
 
 	/** Resolve each token setting through model override, ordinary setting, then built-in default. */

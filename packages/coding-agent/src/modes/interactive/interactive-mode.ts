@@ -140,6 +140,7 @@ import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { choosePoolModelAccount } from "../../extensions/accounts/model-choice.ts";
 import { addMcpServerConfig } from "../../extensions/mcp/config.ts";
 import { modelAliasRows } from "../../extensions/subagent/model-aliases.ts";
+import { findWorkerTeam } from "../../extensions/subagent/team.ts";
 import type { SubagentWidget } from "../../extensions/subagent/widget.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
@@ -1154,7 +1155,7 @@ export class InteractiveMode {
 					hint("app.exit", "to exit (empty)"),
 					hint("app.suspend", "to suspend"),
 					keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
-					hint("app.thinking.cycle", "to cycle thinking level"),
+					hint("app.thinking.cycle", "to cycle and save thinking level"),
 					rawKeyHint(
 						`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`,
 						"to cycle models",
@@ -1207,6 +1208,9 @@ export class InteractiveMode {
 		}
 		if (this.renderer.mode === "fullscreen") this.showFullscreenModelScopeNotice();
 		this.ui.requestRender();
+		// Open the model API connection while the user reads the first frame. Deferred a turn of the event loop so
+		// the connection work never lands ahead of the first paint.
+		setImmediate(() => this.session.prewarmModelConnection());
 
 		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
 		// so slow downloads do not make startup appear frozen.
@@ -2502,6 +2506,7 @@ export class InteractiveMode {
 					}
 				})();
 			},
+			requestCompaction: () => this.session.requestCompaction(),
 			getSystemPrompt: () => this.session.systemPrompt,
 		});
 
@@ -2696,6 +2701,7 @@ export class InteractiveMode {
 		this.clearExtensionWidgets();
 		this.sidePanel.clearSections();
 		this.footerDataProvider.clearExtensionStatuses();
+		this.defaultEditor.setMainBorderBadge(undefined);
 		this.footer.invalidate();
 		this.autocompleteProviderWrappers = [];
 		this.setCustomEditorComponent(undefined);
@@ -2890,6 +2896,16 @@ export class InteractiveMode {
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
+			setMainEditorBadge: (render) => {
+				this.defaultEditor.setMainBorderBadge(render);
+				this.ui.requestRender();
+			},
+			// The line belongs to the running compaction's indicator and goes when compaction_end clears it.
+			setCompactionStatus: (render) => {
+				if (!(this.activeStatusIndicator instanceof CompactionStatusIndicator)) return;
+				this.activeStatusIndicator.setLine(render);
+				this.ui.requestRender();
+			},
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
 				if (this.activeStatusIndicator?.kind === "working") {
@@ -3349,6 +3365,12 @@ export class InteractiveMode {
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => this.handleDebugCommand();
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+		this.defaultEditor.onAction("app.subagents.background", () => {
+			if (this.backgroundWorkers()) return true;
+			if (!this.session.canContinueInterruptedRun) return false;
+			void this.continueInterruptedRun(this.session);
+			return true;
+		});
 		this.defaultEditor.onAction("app.subagents.select", () => {
 			const widget = this.extensionWidgetsBelow.get("subagents") as SubagentWidget | undefined;
 			widget?.activate((data) => {
@@ -3378,6 +3400,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.sidePanel.scrollUp", () => this.sidePanel.scrollDiffPage(-1));
 
 		this.defaultEditor.onChange = (text: string) => {
+			// Typing signals an imminent turn; refresh the API connection now so the handshake overlaps composition
+			// instead of delaying the send. Throttled, and a no-op mid-turn.
+			if (text) this.session.prewarmModelConnection();
 			const wasBashMode = this.isBashMode;
 			this.isBashMode = text.trimStart().startsWith("!");
 			if (wasBashMode !== this.isBashMode) {
@@ -3619,7 +3644,7 @@ export class InteractiveMode {
 			}
 			if (text === "/continue") {
 				this.editor.setText("");
-				await this.continueInterruptedRun(this.session);
+				if (!this.backgroundWorkers()) await this.continueInterruptedRun(this.session);
 				return;
 			}
 			if (text === "/resume") {
@@ -3757,7 +3782,12 @@ export class InteractiveMode {
 					const retainedEntries = entries.slice(1);
 					this.renderSessionEntries(retainedEntries.filter((entry) => !entriesAfterCompaction.has(entry.id)));
 					this.addMessageToChat(
-						createCompactionSummaryMessage(event.entry.summary, event.entry.tokensBefore, event.entry.timestamp),
+						createCompactionSummaryMessage(
+							event.entry.summary,
+							event.entry.tokensBefore,
+							event.entry.timestamp,
+							event.entry.tokensAfter,
+						),
 					);
 					if (event.entry.usage) {
 						this.addCompactionCostNotice({
@@ -4007,6 +4037,7 @@ export class InteractiveMode {
 							event.result.summary,
 							event.result.tokensBefore,
 							new Date().toISOString(),
+							event.result.estimatedTokensAfter,
 						),
 					);
 					if (event.result.usage) {
@@ -4821,9 +4852,21 @@ export class InteractiveMode {
 		}
 	}
 
+	private backgroundWorkers(): boolean {
+		if (!findWorkerTeam(this.session)?.backgroundForegroundWorkers()) return false;
+		if (this.mainView) this.setExtensionMainView(undefined);
+		this.showStatus("Main is continuing. Subagents will report from the background.");
+		return true;
+	}
+
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
 		if (!text) return;
+		if (this.mainView && !text.startsWith("/")) {
+			this.editor.setText("");
+			this.editor.onSubmit?.(text);
+			return;
+		}
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting || this.session.isStreaming) {
@@ -4885,14 +4928,22 @@ export class InteractiveMode {
 	}
 
 	private cycleThinkingLevel(): void {
-		const newLevel = this.session.cycleThinkingLevel();
-		if (newLevel === undefined) {
-			this.showStatus("Current model does not support thinking");
-		} else {
-			this.footer.invalidate();
-			this.updateEditorBorderColor();
-			this.showStatus(`Thinking level: ${newLevel}`);
+		try {
+			const newLevel = this.session.cycleThinkingLevel({ persist: true });
+			if (newLevel === undefined) {
+				this.showStatus("Current model does not support thinking");
+			} else {
+				this.showThinkingLevelSaved(newLevel);
+			}
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
 		}
+	}
+
+	private showThinkingLevelSaved(level: ThinkingLevel): void {
+		this.footer.invalidate();
+		this.updateEditorBorderColor();
+		this.showStatus(`Default thinking level: ${level}`);
 	}
 
 	private async cycleModel(direction: "forward" | "backward"): Promise<void> {
@@ -5525,15 +5576,13 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.selectThinkingLevel(level, false);
+		this.selectThinkingLevel(level);
 	}
 
-	private selectThinkingLevel(level: ThinkingLevel, persist: boolean): void {
+	private selectThinkingLevel(level: ThinkingLevel): void {
 		try {
-			this.session.setThinkingLevel(level, { persist });
-			this.footer.invalidate();
-			this.updateEditorBorderColor();
-			this.showStatus(persist ? `Default thinking level: ${level}` : `Thinking level: ${level}`);
+			this.session.setThinkingLevel(level, { persist: true });
+			this.showThinkingLevelSaved(level);
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -5541,19 +5590,19 @@ export class InteractiveMode {
 
 	private showThinkingSelector(): void {
 		this.showSelector((done) => {
-			const selectLevel = (level: ThinkingLevel, persist: boolean) => {
-				this.selectThinkingLevel(level, persist);
+			const selectLevel = (level: ThinkingLevel) => {
+				this.selectThinkingLevel(level);
 				done();
 			};
 			const selector = new ThinkingSelectorComponent(
 				this.session.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
 				this.session.getAvailableThinkingLevels(),
-				(level) => selectLevel(level, false),
+				selectLevel,
 				() => {
 					done();
 					this.ui.requestRender();
 				},
-				(level) => selectLevel(level, true),
+				selectLevel,
 				this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
 			);
 			return { component: selector, focus: selector };
@@ -7335,7 +7384,8 @@ export class InteractiveMode {
 | \`${clear}\` | Clear editor (first) / exit (second) |
 | \`${exit}\` | Exit (when editor is empty) |
 | \`${suspend}\` | Suspend to background |
-| \`${cycleThinkingLevel}\` | Cycle thinking level |
+| \`${this.getAppKeyDisplay("app.subagents.background")}\` | Continue main while foreground workers run in the background |
+| \`${cycleThinkingLevel}\` | Cycle and save thinking level |
 | \`${cycleModelForward}\` / \`${cycleModelBackward}\` | Cycle models |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |

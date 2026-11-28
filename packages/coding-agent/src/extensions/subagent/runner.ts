@@ -8,6 +8,7 @@ import { type Api, type AssistantMessage, type Message, type Model, type Usage, 
 import { ToolCallArgumentsStream } from "@earendil-works/pi-ai/utils/streaming-json";
 import { Value } from "typebox/value";
 import { APP_NAME, getRuntimePackageDir, isBunBinary, USES_BROKER_AUTH } from "../../config.ts";
+import { collectEditedFiles, type EditedFile } from "../../core/compaction/transcript-cleaner.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "../../core/session-manager.ts";
 import { withFileMutationQueue } from "../../core/tools/file-mutation-queue.ts";
 import { createUsageTotals, type UsageTotals } from "../../core/usage-totals.ts";
@@ -49,6 +50,7 @@ export interface SingleResult {
 	exitCode: number | null;
 	messages: Message[];
 	streamingMessage?: AssistantMessage;
+	pendingSteering?: readonly string[];
 	stderr: string;
 	/** Provider usage during this run, including active refreshes; later idle refreshes stay in the private session. */
 	usage: UsageStats;
@@ -57,6 +59,12 @@ export interface SingleResult {
 	errorMessage?: string;
 	terminationSignal?: NodeJS.Signals;
 	step?: number;
+	/**
+	 * The files the run changed with successful edit and write calls, each at its absolute path, with the lines each edit
+	 * changed. Set when a run that started ends, whether it completed, failed or was aborted, since the changes stay on disk. Compaction lists
+	 * them after the worker's report; the result text the main agent reads leaves them out.
+	 */
+	editedFiles?: EditedFile[];
 }
 
 export interface SubagentDetails {
@@ -78,6 +86,8 @@ export interface DispatchDefaults {
 	context: SubagentContextSnapshot;
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
+	/** The effort before clamping, retained by the team for future model changes. */
+	requestedThinkingLevel?: ThinkingLevel;
 	extraArgs?: string[];
 }
 
@@ -321,6 +331,7 @@ class ProcessWorker implements WorkerSession {
 	}
 
 	async send(message: string, mode: "steer" | "followUp"): Promise<boolean> {
+		if (this.starting) await this.initialization?.catch(() => {});
 		const active = this.active;
 		if (!active?.accepting || this.failure || this.disposed) return false;
 		active.deliveries++;
@@ -546,6 +557,11 @@ class ProcessWorker implements WorkerSession {
 			return;
 		}
 		if (!active) return;
+		if (event.type === "queue_update") {
+			active.result.pendingSteering = event.steering;
+			active.update();
+			return;
+		}
 		if (event.type === "agent_settled") {
 			active.accepting = false;
 			active.settled = true;
@@ -696,6 +712,8 @@ class ProcessWorker implements WorkerSession {
 		active.cleanup();
 		active.warmupController.abort();
 		this.endWarmup(active, false);
+		delete active.result.pendingSteering;
+		active.result.editedFiles = collectEditedFiles(active.result.messages, this.resolved.cwd);
 		active.result.status = active.aborted ? "aborted" : status;
 		active.result.errorMessage = error ?? active.result.errorMessage;
 		active.result.exitCode = status === "completed" ? 0 : active.result.exitCode;

@@ -44,6 +44,7 @@ export interface Account {
 	judges: Model<Api>[];
 	cooldown: number;
 	lastStatus?: number;
+	subscriptionLimit?: boolean;
 	/** When a subscription's model list may be read from its provider again (epoch ms). */
 	nextDiscovery: number;
 	/** The subscription model read in progress, which a pool request waits for before choosing an account. */
@@ -127,7 +128,11 @@ export function publicAccount(account: Account): Record<string, unknown> {
 		status: record.disabled ? "disabled" : cooling ? "error" : "active",
 		disabled: record.disabled === true,
 		unavailable: cooling,
-		quotaExceeded: cooling && (account.lastStatus === 429 || account.lastStatus === 402),
+		quotaExceeded:
+			cooling &&
+			(account.lastStatus === 402 ||
+				(account.lastStatus === 429 && (!isChatSubscription(account) || account.subscriptionLimit === true))),
+		quotaReason: cooling && account.subscriptionLimit ? "subscription_usage_limit" : undefined,
 		retryAfter: cooling ? new Date(account.cooldown).toISOString() : undefined,
 		lastError: account.lastStatus
 			? { message: `Provider returned HTTP ${account.lastStatus}.`, httpStatus: account.lastStatus }
@@ -135,6 +140,10 @@ export function publicAccount(account: Account): Record<string, unknown> {
 		modelCount: account.models.length,
 	};
 }
+export function isChatSubscription(account: Account): boolean {
+	return (account.provider === "anthropic" || account.provider === "openai-codex") && account.record.kind === "oauth";
+}
+
 /** TypeSafe accounts answer System One classifier requests only; they never serve chat. */
 export const classifierAccount = (account: Account): boolean => account.provider === "typesafe";
 
@@ -142,7 +151,8 @@ export const classifierAccount = (account: Account): boolean => account.provider
 export const cooldownStatuses: readonly number[] = [429, 402, 503];
 
 /** Records a failed provider response and, for a cooldown status, benches the account until its retry hint. */
-export function recordFailure(account: Account, status: number, retryAfter?: string): void {
+export function recordFailure(account: Account, status: number, retryAfter?: string, subscriptionLimit = false): void {
+	account.subscriptionLimit = subscriptionLimit;
 	account.lastStatus = status;
 	if (!cooldownStatuses.includes(status)) return;
 	const seconds = Number(retryAfter);
@@ -351,7 +361,7 @@ export class Accounts {
 									? "openai-codex-responses"
 									: "openai-responses",
 						provider,
-						baseUrl: "",
+						baseUrl: upstream.models[0]!.baseUrl,
 						reasoning: false,
 						input: ["text", "image"],
 						contextWindow: 200000,
@@ -372,6 +382,7 @@ export class Accounts {
 		const legacy = provider === "anthropic" || provider === "openai" || provider === "openai-codex";
 		model.provider = provider;
 		model.preferWebsockets = false;
+		if (record.kind === "oauth") return model;
 		// OMP sends a model's headers with its requests; configured routing headers ride on the model.
 		if (record.headers) model.headers = { ...model.headers, ...record.headers };
 		if (record.baseUrl && record.provider === "codex" && record.source === "config") {
@@ -391,10 +402,11 @@ export class Accounts {
 	 * current models and is retried sooner. Concurrent callers share one read.
 	 */
 	refreshSubscriptionModels(account: Account): Promise<void> {
-		if (account.record.kind !== "oauth" || Date.now() < account.nextDiscovery) return Promise.resolve();
+		if (account.record.kind !== "oauth" || account.record.disabled || Date.now() < account.nextDiscovery)
+			return Promise.resolve();
 		account.discovering ??= (async () => {
 			try {
-				const models = await discoverSubscriptionModels(account, this.options.anthropicBaseUrl);
+				const models = await discoverSubscriptionModels(account);
 				if (models) account.models = models.map((model) => this.routed(account.record, account.provider, model));
 				account.nextDiscovery = Date.now() + (models ? DISCOVERY_INTERVAL_MS : DISCOVERY_RETRY_MS);
 			} catch {
@@ -531,6 +543,7 @@ export class Accounts {
 			if (action === "reset") {
 				account.cooldown = 0;
 				account.lastStatus = undefined;
+				account.subscriptionLimit = false;
 				for (const row of account.storage.credentials.list()) account.storage.blocks.deleteAll(row.id);
 				return;
 			}
@@ -559,7 +572,7 @@ export async function boundedText(response: Response, limit: number): Promise<st
 			if (next.done) break;
 			size += next.value.byteLength;
 			if (size > limit) {
-				await reader.cancel();
+				void reader.cancel().catch(() => {});
 				throw new HttpError(502, "Provider response exceeded the size limit.");
 			}
 			chunks.push(next.value);

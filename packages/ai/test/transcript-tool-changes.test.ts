@@ -170,16 +170,17 @@ describe("transcript system messages", () => {
 		expect(update).toMatchObject({
 			role: "system",
 			content: [
-				{ type: "text" },
+				{ type: "text", cache_control: { type: "ephemeral" } },
 				{ type: "tool_removal", tool: { type: "tool_reference", name: "base_tool" } },
 				{
 					type: "tool_addition",
 					tool: { type: "tool_definition", definition: { name: "late_tool", description: "late_tool tool" } },
-					cache_control: { type: "ephemeral" },
 				},
 			],
 		});
-		// Cache control goes on the block, never on the inline definition; nothing is deferred.
+		// Claude rejects cache control on tool directives and inline definitions.
+		expect(update?.content[1]?.cache_control).toBeUndefined();
+		expect(update?.content[2]?.cache_control).toBeUndefined();
 		const definition = update?.content[2]?.tool?.definition;
 		expect(definition?.cache_control).toBeUndefined();
 		expect(definition?.defer_loading).toBeUndefined();
@@ -227,6 +228,11 @@ describe("transcript system messages", () => {
 			],
 		});
 		expect(payload.messages.at(-1)?.content).toHaveLength(1);
+		expect(payload.messages.at(-1)?.content[0].cache_control).toBeUndefined();
+		expect(payload.messages.at(-2)).toEqual({
+			role: "user",
+			content: [{ type: "text", text: "before", cache_control: { type: "ephemeral" } }],
+		});
 	});
 
 	test("sends the current Anthropic tool list without an initial tool", async () => {

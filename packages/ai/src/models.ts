@@ -33,6 +33,7 @@ import type {
 	ClassifierModel,
 	ClassifierOptions,
 	ClassifierResult,
+	ConnectionPrewarmOptions,
 	Context,
 	DeferredCancelOptions,
 	DeferredFetchOptions,
@@ -238,6 +239,8 @@ export interface Provider<TApi extends Api = Api> {
 		options?: DeferredFetchOptions,
 	): AssistantMessageEventStream;
 	cancelDeferred?(model: Model<TApi>, handle: DeferredHandle, options?: DeferredCancelOptions): Promise<void>;
+	/** Present when an API of the provider can open the connection of a model ahead of its next request. */
+	prewarm?(model: Model<TApi>, options?: ConnectionPrewarmOptions): Promise<void>;
 
 	/** Present when the provider supports dedicated image models. Never rejects. */
 	generateImages?(
@@ -1227,6 +1230,11 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 				);
 			}
 			await implementation.cancelDeferred(model, handle, options);
+		};
+	}
+	if (streams.some((entry) => entry.prewarm !== undefined)) {
+		provider.prewarm = async (model, options) => {
+			await apiFor(model)?.prewarm?.(model, options);
 		};
 	}
 	if (images && imageImplementations.length > 0) {

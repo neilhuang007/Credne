@@ -1,14 +1,21 @@
-// The broker's only seam into OMP's provider requests: it watches upstream answers and changes nothing.
+// Observes OMP's upstream answers, shares Codex cache routing, and bounds opt-in cache refreshes.
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Api, FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import { parseJsonBody } from "@oh-my-pi/pi-ai/error";
 import { coworkFetch } from "@oh-my-pi/pi-ai/providers/cowork-fetch";
-import { type Account, boundedText } from "./accounts.ts";
+import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
+import { isSubscriptionUsageLimit } from "../../packages/ai/src/utils/usage-limit.ts";
+import { type Account, boundedText, isChatSubscription } from "./accounts.ts";
+import { object, text } from "./wire.ts";
 
 /** One try of a request on one account. The transport reports what it sees; the gateway decides what to do about it. */
 export interface Attempt {
 	account: Account;
 	/** The model OMP serves for this attempt; the gateway picked it together with the account. */
 	model: Model<Api>;
+	codexCacheAffinity?: string;
+	/** A cache refresh gets one outbound fetch, regardless of OMP retry or recovery paths. */
+	cacheRefresh?: "ready" | "sent";
 	/** Whether the transport may cut the attempt short so the pool can move on to its next account. */
 	failover: boolean;
 	controller: AbortController;
@@ -16,6 +23,7 @@ export interface Attempt {
 	/** Status and retry hint of the last upstream answer; a request that failed to complete reads as 502. */
 	status?: number;
 	retryAfter?: string;
+	subscriptionLimit?: boolean;
 	/** Why the attempt failed when no provider status explains it. */
 	failure?: string;
 	/** True once the transport aborted the attempt because of a failover status. */
@@ -75,14 +83,36 @@ export function defaultTransport(model: Model<Api>): FetchImpl {
 }
 
 /**
- * The `fetch` for an account's router. It calls OMP's default transport with the request exactly as OMP built it,
- * returns the answer untouched, and records the status and retry hint for the running attempt.
+ * The `fetch` for an account's router. Codex uses the session header for cache routing, but OMP's pi-native
+ * gateway does not accept its server-only `parentSessionId`. Share just that header on opted-in worker calls.
  */
 export function observingFetch(): FetchImpl {
 	return async (input, init) => {
 		const attempt = currentAttempt();
+		if (attempt.cacheRefresh === "sent") {
+			const error = new Error("Cache refresh cannot retry the provider request.");
+			attempt.controller.abort(error);
+			throw error;
+		}
+		if (attempt.cacheRefresh === "ready") {
+			attempt.signal.throwIfAborted();
+			attempt.cacheRefresh = "sent";
+			const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+			init = {
+				...init,
+				signal: signal ? AbortSignal.any([signal, attempt.signal]) : attempt.signal,
+				redirect: "error",
+			};
+		}
 		let response: Response;
 		try {
+			if (attempt.codexCacheAffinity) {
+				const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+				if (headers.has(OPENAI_HEADERS.SESSION_ID)) {
+					headers.set(OPENAI_HEADERS.SESSION_ID, attempt.codexCacheAffinity);
+					init = { ...init, headers };
+				}
+			}
 			response = await defaultTransport(attempt.model)(input, init);
 		} catch (error) {
 			// An abort is the caller's or the broker's own; anything else means the provider never answered.
@@ -97,6 +127,7 @@ export function observingFetch(): FetchImpl {
 function failAttempt(attempt: Attempt, failure: string): void {
 	attempt.status = 502;
 	attempt.retryAfter = undefined;
+	attempt.subscriptionLimit = false;
 	attempt.failure = failure;
 	decide(attempt);
 }
@@ -105,6 +136,24 @@ async function observe(attempt: Attempt, response: Response): Promise<void> {
 	attempt.status = response.status;
 	attempt.retryAfter = response.headers.get("retry-after") ?? undefined;
 	attempt.failure = undefined;
+	attempt.subscriptionLimit = false;
+	if (response.status === 429 && isChatSubscription(attempt.account)) {
+		const detail = await boundedText(response.clone(), creditLimit).catch(() => "");
+		const envelope = parseJsonBody(detail);
+		const error = object(envelope?.error ?? envelope);
+		const message = text(error.message) ?? (envelope ? "" : detail);
+		const code = text(error.code) ?? text(error.type) ?? "";
+		if (isSubscriptionUsageLimit(`${code}: ${message}`, response.headers)) {
+			attempt.subscriptionLimit = true;
+			attempt.failure = "Subscription usage limit reached.";
+			const reset =
+				attempt.model.api === "anthropic-messages"
+					? Number(response.headers.get("anthropic-ratelimit-unified-reset"))
+					: error.resets_at;
+			if (typeof reset === "number" && reset * 1000 > Date.now() && reset * 1000 <= 8.64e15)
+				attempt.failure += ` Resets at ${new Date(reset * 1000).toISOString()}.`;
+		}
+	}
 	// Anthropic answers an empty credit balance with a 400. It is billing, not a malformed request, so it benches the
 	// account like a 402. The clone leaves OMP's copy of the body unread.
 	if (response.status === 400 && (await creditExhausted(response.clone()))) {
@@ -122,10 +171,14 @@ async function creditExhausted(response: Response): Promise<boolean> {
 function decide(attempt: Attempt): void {
 	const status = attempt.status!;
 	if (attempt.isDecided) return;
-	// OMP refreshes the credential after a 401 or 403 and retries; only the end of the attempt shows whether it worked.
-	if (status === 401 || status === 403) return;
+	// An ordinary OMP request can recover from auth failure; a cache refresh cannot retry.
+	if (!attempt.cacheRefresh && (status === 401 || status === 403)) return;
 	attempt.isDecided = true;
-	if (attempt.failover && isFailoverStatus(status)) {
+	if (
+		(attempt.cacheRefresh && status >= 400) ||
+		attempt.subscriptionLimit ||
+		(attempt.failover && isFailoverStatus(status))
+	) {
 		attempt.cut = true;
 		attempt.controller.abort();
 	}

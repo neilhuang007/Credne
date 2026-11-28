@@ -11,10 +11,10 @@
 		"test": "bun test test"
 	},
 	"dependencies": {
-		"@oh-my-pi/pi-ai": "19.0.0",
-		"@oh-my-pi/pi-catalog": "19.0.0",
-		"@oh-my-pi/pi-natives": "19.0.0",
-		"@oh-my-pi/pi-utils": "19.0.0",
+		"@oh-my-pi/pi-ai": "19.1.0",
+		"@oh-my-pi/pi-catalog": "19.1.0",
+		"@oh-my-pi/pi-natives": "19.1.0",
+		"@oh-my-pi/pi-utils": "19.1.0",
 		"proper-lockfile": "4.1.2",
 		"yaml": "2.9.0"
 	},

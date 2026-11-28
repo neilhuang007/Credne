@@ -28,6 +28,11 @@ export interface BuildSystemPromptOptions {
 	appendSystemPrompt?: string;
 	/** Additional XML-wrapped prompt sections keyed by tag name. */
 	sections?: Record<string, string>;
+	/**
+	 * XML-wrapped prompt sections keyed by tag name, rendered after the working directory in insertion
+	 * order, so they close the prompt. A name cannot be in both `sections` and `closingSections`.
+	 */
+	closingSections?: Record<string, string>;
 	/** Working directory. */
 	cwd: string;
 	/** Pre-loaded context files. */
@@ -44,6 +49,7 @@ export type NormalizedBuildSystemPromptOptions = BuildSystemPromptOptions & {
 	promptGuidelines: string[];
 	appendSystemPrompt: string;
 	sections: Record<string, string>;
+	closingSections: Record<string, string>;
 	contextFiles: Array<{ path: string; content: string }>;
 	skills: Skill[];
 };
@@ -70,6 +76,7 @@ export function normalizeBuildSystemPromptOptions(input: BuildSystemPromptOption
 		promptGuidelines: [...(input.promptGuidelines ?? [])],
 		appendSystemPrompt: input.appendSystemPrompt ?? "",
 		sections: { ...(input.sections ?? {}) },
+		closingSections: { ...(input.closingSections ?? {}) },
 		cwd: input.cwd,
 		contextFiles: (input.contextFiles ?? []).map((file) => ({ ...file })),
 		skills: (input.skills ?? []).map((skill) => ({ ...skill })),
@@ -133,15 +140,18 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 		promptGuidelines,
 		appendSystemPrompt,
 		sections: customSections,
+		closingSections,
 		cwd,
 		contextFiles,
 	} = options;
 
-	for (const name of Object.keys(customSections)) {
+	for (const name of [...Object.keys(customSections), ...Object.keys(closingSections)]) {
 		if (!SYSTEM_PROMPT_SECTION_NAME.test(name) || name === "preamble") {
 			throw new Error(`Invalid system prompt section name: ${name}`);
 		}
 	}
+	const sharedName = Object.keys(closingSections).find((name) => Object.hasOwn(customSections, name));
+	if (sharedName) throw new Error(`System prompt section ${sharedName} is both a section and a closing section`);
 
 	const declaredTools = selectedTools.filter((name) => !hiddenTools.includes(name));
 	const promptSections: Record<string, string> = {};
@@ -162,6 +172,9 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 	}
 	if (contextFiles.length > 0) promptSections.project_context = renderProjectContext(contextFiles);
 	promptSections.cwd = cwd.replace(/\\/g, "/");
+	for (const [name, content] of Object.entries(closingSections)) {
+		if (content) promptSections[name] = content;
+	}
 
 	const sections: SystemPromptSections = { preamble: promptSections.preamble };
 	for (const [name, content] of Object.entries(promptSections)) {

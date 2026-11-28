@@ -13,12 +13,27 @@ function timeoutSetting(options?: TSchemaOptions) {
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+	remindTokens: Type.Optional(nonNegativeSafeInteger()),
 });
+
+function compactionStrategy(options?: TSchemaOptions) {
+	return Type.Union([Type.Literal("summary"), Type.Literal("blocks")], options);
+}
+
+const CompactionStrategySchema = compactionStrategy();
 
 const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	remindTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.remindTokens })),
+	strategy: Type.Optional(
+		compactionStrategy({
+			description:
+				'How compaction condenses the conversation. "blocks" cuts the conversation into blocks, condenses the user\'s prompt and every block with a cheaper model, and notes where the session stopped. "summary" writes one structured summary.',
+			default: SETTINGS_DEFAULTS.compaction.strategy,
+		}),
+	),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
@@ -515,6 +530,8 @@ type SettingsInput = Static<typeof SettingsSchema>;
 
 export interface CompactionModelOverride extends Static<typeof CompactionModelOverrideSchema> {}
 export interface CompactionSettings extends Static<typeof CompactionSettingsSchema> {}
+/** How compaction condenses the conversation: one summary, or condensed blocks. */
+export type CompactionStrategy = Static<typeof CompactionStrategySchema>;
 export interface BranchSummarySettings extends Static<typeof BranchSummarySettingsSchema> {}
 export interface ProviderRetrySettings extends Static<typeof ProviderRetrySettingsSchema> {}
 export interface RetrySettings extends Omit<Static<typeof RetrySettingsSchema>, "maxDelayMs"> {}

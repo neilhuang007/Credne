@@ -8,13 +8,15 @@ import { writeRenderers } from "./renderers/write.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
 const writeSchema = Type.Object({
-	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
+	path: Type.String({
+		description: "This tool will overwrite the existing file if there is one at the provided path.",
+	}),
 	content: Type.String({ description: "Content to write to the file" }),
 });
 
 export const writeToolSystemPromptContribution = {
 	snippet: "Create or overwrite files",
-	guidelines: ["Use write only for new files or complete rewrites."],
+	guidelines: [],
 } as const;
 
 export type WriteToolInput = Static<typeof writeSchema>;
@@ -49,7 +51,7 @@ export function createWriteToolDefinition(
 		name: "write",
 		label: "write",
 		description:
-			"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+			"Writes a file to the local filesystem.\n\nUsage:\n- Prefer the edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.\n- NEVER create documentation files (*.md) or README files unless explicitly requested by the User.",
 		promptSnippet: writeToolSystemPromptContribution.snippet,
 		promptGuidelines: [...writeToolSystemPromptContribution.guidelines],
 		parameters: writeSchema,

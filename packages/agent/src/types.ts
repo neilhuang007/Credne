@@ -8,6 +8,7 @@ import type {
 	Message,
 	Model,
 	SimpleStreamOptions,
+	SystemMessage,
 	TextContent,
 	Tool,
 	ToolResultMessage,
@@ -366,12 +367,21 @@ export interface CustomAgentMessages {
 	// Empty by default - apps extend via declaration merging
 }
 
+/** A system message in agent history, before tool declarations are projected to the model. */
+export interface AgentSystemMessage extends SystemMessage {
+	/** Names of callable tools hidden from this point on. An empty list reveals all tools. */
+	hiddenToolDeclarations?: readonly string[];
+}
+
 /**
  * AgentMessage: Union of LLM messages + custom messages.
  * This abstraction allows apps to add custom message types while maintaining
  * type safety and compatibility with the base LLM messages.
  */
-export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
+export type AgentMessage =
+	| Exclude<Message, SystemMessage>
+	| AgentSystemMessage
+	| CustomAgentMessages[keyof CustomAgentMessages];
 
 /**
  * Public agent state.
@@ -394,8 +404,8 @@ export interface AgentState {
 	/**
 	 * Executable tools. Assigning a new array copies the top-level array.
 	 *
-	 * Differences from the tools declared in the transcript are announced to the model
-	 * with a system message before the next request.
+	 * Changes are recorded in a system message before the next request. Tools marked
+	 * `omitFromDeclaration` stay executable but are not advertised to the model.
 	 */
 	set tools(tools: AgentTool<any>[]);
 	get tools(): AgentTool<any>[];
@@ -478,6 +488,8 @@ type IsAny<T> = boolean extends (T extends never ? true : false) ? true : false;
 export interface AgentTool<TParameters extends object = object, TDetails = any> extends Tool<TParameters> {
 	/** Human-readable label for UI display. */
 	label: string;
+	/** Keep this tool executable without declaring it to the model. Not part of the tool definition. */
+	omitFromDeclaration?: true;
 	/**
 	 * Optional compatibility shim for raw tool-call arguments before schema validation.
 	 * Must return an object that matches `TParameters`.
@@ -512,7 +524,7 @@ export interface AgentTool<TParameters extends object = object, TDetails = any> 
 
 /** Context snapshot passed into the low-level agent loop. */
 export interface AgentContext {
-	/** Transcript visible to the model. */
+	/** Transcript before request-only transformations. */
 	messages: AgentMessage[];
 	/** Tools available for execution in this run. */
 	tools?: AgentTool<any>[];

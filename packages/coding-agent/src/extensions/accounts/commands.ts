@@ -12,7 +12,7 @@ import type { BrokerAccount, BrokerClient, BrokerUsage } from "./client.ts";
 import { sessionAccountCosts } from "./costs.ts";
 import { enrollAccount } from "./enrollment.ts";
 import { choosePoolModelAccount } from "./model-choice.ts";
-import { type AccountPanelResult, AccountsPanel } from "./panel.ts";
+import { type AccountPanelLayout, type AccountPanelResult, AccountsPanel } from "./panel.ts";
 import type { AccountProviderSpec } from "./provider.ts";
 import type { AccountRegistry } from "./registry.ts";
 
@@ -35,6 +35,9 @@ export const ACCOUNT_SUBCOMMANDS = [
 	"reset",
 ] as const;
 
+/** The panel reopens after every action and on each `/accounts`, so a dragged divider is kept here. */
+const panelLayout: AccountPanelLayout = {};
+
 const LEGACY_CLAUDE_MESSAGE =
 	"Local Claude subscriptions are no longer supported. Sign in again with /accounts add claude-subscription, then select the broker account with /accounts switch. Existing credentials were left untouched.";
 
@@ -56,6 +59,7 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 					defaultId: deps.pi.getSettings().defaultProvider,
 					selectedId,
 					markedIds,
+					layout: panelLayout,
 					entries: deps.registry.providers().map((spec) => {
 						const account = accounts.find((entry) => entry.providerId === spec.id);
 						return {
@@ -519,6 +523,8 @@ function accountUsage(
 /** Short availability summary from broker state. */
 function accountState(account: BrokerAccount): string {
 	if (account.disabled) return "disabled";
+	if (account.quotaReason === "subscription_usage_limit" && account.quotaExceeded)
+		return "subscription usage limit reached";
 	if (account.retryAfter) return `cooling down until ${new Date(account.retryAfter).toLocaleTimeString()}`;
 	if (account.quotaExceeded) return "quota exceeded";
 	if (account.unavailable) return account.statusMessage ? `unavailable: ${account.statusMessage}` : "unavailable";

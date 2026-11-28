@@ -1061,8 +1061,8 @@ describe("accounts panel command", () => {
 		return { setModel, select, confirm, panels, broker, notifications: ctx.ui.notify.mock.calls };
 	}
 
-	it("default opens a custom panel and Enter remembers the account and model for new sessions", async () => {
-		const result = await runPanel([["\x1b[B", "\r"]]);
+	it("Enter selects an account and Pin remembers it and its model for new sessions", async () => {
+		const result = await runPanel([["\x1b[B", "\r", "\t", "\r"]]);
 		expect(result.setModel).toHaveBeenCalledExactlyOnceWith(
 			expect.objectContaining({ provider: ACCT_B, id: claudeModel.id }),
 			{ persist: true },
@@ -1094,7 +1094,7 @@ describe("accounts panel command", () => {
 		);
 		expect(result.panels[1]).toEqual(
 			expect.arrayContaining([
-				expect.stringContaining("3 marked"),
+				expect.stringContaining("3 selected"),
 				expect.stringMatching(/^› \[x\].*Claude · a .*●.*│/),
 				expect.stringMatching(/^ {2}\[x\].*b@example\.com.*│/),
 				expect.stringMatching(/^ {2}\[x\].*c@example\.com.*◆.*│/),
@@ -1130,7 +1130,7 @@ describe("accounts panel command", () => {
 		expect(result.notifications).toContainEqual([expect.stringContaining("Could not delete account"), "error"]);
 		expect(result.panels[1]).toEqual(
 			expect.arrayContaining([
-				expect.stringContaining("1 marked"),
+				expect.stringContaining("1 selected"),
 				expect.stringMatching(/^› \[x\].*b@example\.com/),
 			]),
 		);

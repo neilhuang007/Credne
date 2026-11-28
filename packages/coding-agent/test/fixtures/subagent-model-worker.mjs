@@ -67,6 +67,12 @@ async function command(input) {
 		await prompt(input.message);
 		return;
 	}
+	if (input.type === "steer") {
+		history.push(input.message);
+		emit({ type: "queue_update", steering: [input.message], followUp: [] });
+		respond({ disposition: "queued" });
+		return;
+	}
 	if (input.type === "set_model") {
 		record(input.type, { requested: { provider: input.provider, id: input.modelId } });
 		if (input.modelId === "model-error") throw new Error("Fixture rejected model");

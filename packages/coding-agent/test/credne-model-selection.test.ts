@@ -332,17 +332,11 @@ describe("Credne model picker", () => {
 		}
 	});
 
-	it("shows the current model by ID at the top of its section when no alias resolves to it", async () => {
+	it("marks the alias row of the current model's family when the alias resolves to another version", async () => {
 		const { session } = await newSession({ model: runtime.getModel(globalPool, olderSol) });
 		const { selector, render, onSelect } = makePicker(session);
 		try {
-			expect(listRows(render())).toEqual([
-				"  ⊟ ChatGPT / OpenAI (2)",
-				"→   ✓ gpt-6.1-sol",
-				"      sol gpt-6.2-sol",
-				"  ⊞ llama.cpp (1)",
-			]);
-			selector.handleInput(down);
+			expect(listRows(render())).toEqual(["  ⊟ ChatGPT / OpenAI (1)", "→   ✓ sol gpt-6.2-sol", "  ⊞ llama.cpp (1)"]);
 			selector.handleInput(enter);
 			expect(onSelect).toHaveBeenCalledWith({
 				model: expect.objectContaining({ provider: globalPool, id: sol }),

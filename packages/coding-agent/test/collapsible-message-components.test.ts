@@ -52,6 +52,17 @@ describe("collapsible message components", () => {
 		expect(renderText(component)).not.toContain("compaction details");
 	});
 
+	test("shows the size after a compaction and the share saved when it is known and smaller", () => {
+		const message = { role: "compactionSummary" as const, summary: "details", timestamp: Date.now() };
+		const saved = new CompactionSummaryMessageComponent({ ...message, tokensBefore: 640_154, tokensAfter: 32_301 });
+		expect(renderText(saved)).toContain("Compacted from 640,154 to 32,301 tokens (95% saved)");
+		saved.setExpanded(true);
+		expect(renderText(saved)).toContain("Compacted from 640,154 to 32,301 tokens (95% saved)");
+
+		const grown = new CompactionSummaryMessageComponent({ ...message, tokensBefore: 100, tokensAfter: 120 });
+		expect(renderText(grown)).toContain("Compacted from 100 tokens (");
+	});
+
 	test("toggles a branch summary when clicked", () => {
 		const component = new BranchSummaryMessageComponent({
 			role: "branchSummary",

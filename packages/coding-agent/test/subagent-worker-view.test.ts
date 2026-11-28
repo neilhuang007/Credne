@@ -1,19 +1,34 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
-import type { AssistantMessage, Message, ToolResultMessage } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	fauxAssistantMessage,
+	fauxToolCall,
+	type Message,
+	type ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import { type Component, Container, TuiMainScreen, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { defaultEditorTheme } from "../../tui/test/test-themes.ts";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import type { ExtensionMainView, ExtensionUIContext } from "../src/core/extensions/types.ts";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import * as editDiff from "../src/core/tools/edit-diff.ts";
 import { createAllToolRenderers } from "../src/core/tools/renderers/index.ts";
+import subagentExtension from "../src/extensions/subagent/index.ts";
 import { emptyUsage, type SingleResult } from "../src/extensions/subagent/runner.ts";
-import type { WorkerView } from "../src/extensions/subagent/team.ts";
+import { findWorkerTeam, type WorkerView } from "../src/extensions/subagent/team.ts";
 import { showWorkerView, type WorkerViewTeam } from "../src/extensions/subagent/worker-view.ts";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
+import { CustomEditor } from "../src/modes/interactive/components/custom-editor.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
 import { getMarkdownTheme, initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
+
+import { createHarness } from "./suite/harness.ts";
 
 const opened: Array<{ dispose?(): void }> = [];
 
@@ -56,7 +71,7 @@ function setup(status: WorkerView["status"], runs: SingleResult[] = []) {
 				unsubscribe();
 			};
 		},
-		send: vi.fn(async () => "delivered"),
+		sendUserMessage: vi.fn(async () => "delivered"),
 		continue: vi.fn(async () => "queued"),
 	};
 	let view: ExtensionMainView | undefined;
@@ -387,35 +402,86 @@ describe("worker main view", () => {
 		expect(component.render(100).map(stripVTControlCharacters).join("\n")).toBe(rendered);
 	});
 
-	it.each(["running", "completed", "failed", "queued"] as const)(
-		"sends editor text directly to a %s worker",
-		async (status) => {
-			const { view, team } = setup(status);
-			view.onSubmit("look again");
-			await vi.waitFor(() => expect(team.send).toHaveBeenCalledWith("worker-1", "look again"));
-			expect(team.continue).not.toHaveBeenCalled();
-		},
-	);
+	it("steers a starting worker directly and releases the foreground wait before its one completion report", async () => {
+		const parent = await createHarness({ extensionFactories: [subagentExtension] });
+		const originalScript = process.argv[1];
+		process.argv[1] = fileURLToPath(new URL("./fixtures/subagent-model-worker.mjs", import.meta.url));
+		const ctx = parent.session.extensionRunner.createContext();
+		try {
+			const releaseFile = join(parent.tempDir, "release");
+			parent.setResponses([
+				fauxAssistantMessage(
+					fauxToolCall("subagent", {
+						agent: "explorer",
+						model: parent.getModel().id,
+						task: JSON.stringify({ log: join(parent.tempDir, "worker.jsonl"), releaseFile }),
+					}),
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("main continued"),
+				fauxAssistantMessage("received report"),
+			]);
+			const mainTurn = parent.session.prompt("Start the explorer");
+			await vi.waitFor(() => expect(findWorkerTeam(ctx)?.list()[0]?.status).toBe("running"));
+			const team = findWorkerTeam(ctx)!;
+			const workerId = team.list()[0].id;
+			const setMainView = vi.fn<(view: ExtensionMainView | undefined) => void>();
+			showWorkerView({ setMainView, notify: vi.fn() } as unknown as ExtensionUIContext, team, workerId);
+			setMainView.mock.calls[0][0]!.onSubmit("Inspect the parser first");
+			await vi.waitFor(() =>
+				expect(team.getViews()[0].runs[0].pendingSteering).toEqual(["Inspect the parser first"]),
+			);
+			expect(parent.faux.state.callCount).toBe(1);
+			const editor = new CustomEditor(
+				new TuiMainScreen(new VirtualTerminal()),
+				defaultEditorTheme,
+				new KeybindingsManager(),
+			);
+			editor.onAction("app.subagents.background", () => team.backgroundForegroundWorkers());
+			editor.setText("draft");
+			editor.handleInput("\x02");
+			await mainTurn;
+			expect(editor.getText()).toBe("draft");
+			expect(team.list()).toMatchObject([{ id: workerId, status: "running" }]);
+			expect(parent.session.messages).toContainEqual(
+				expect.objectContaining({ role: "toolResult", details: expect.objectContaining({ jobIds: [workerId] }) }),
+			);
+			editor.handleInput("\x02");
+			expect(editor.getCursor().col).toBe(4);
+			writeFileSync(releaseFile, "");
+			await vi.waitFor(() => expect(parent.faux.state.callCount).toBe(3));
+			await parent.session.waitForIdle();
+			expect(
+				parent.session.messages.filter(
+					(message) => message.role === "custom" && message.customType === "subagent-result",
+				),
+			).toHaveLength(1);
+		} finally {
+			await findWorkerTeam(ctx)?.dispose();
+			process.argv[1] = originalScript;
+			parent.cleanup();
+		}
+	});
 
 	it("continues an interrupted worker directly", async () => {
 		const { view, team } = setup("interrupted");
 		view.onSubmit("resume");
 		await vi.waitFor(() => expect(team.continue).toHaveBeenCalledWith("worker-1", "resume"));
-		expect(team.send).not.toHaveBeenCalled();
+		expect(team.sendUserMessage).not.toHaveBeenCalled();
 	});
 
 	it("retains editor text when an interrupted worker becomes active before submission", async () => {
 		const { view, team } = setup("interrupted");
 		vi.mocked(team.continue).mockResolvedValueOnce("already_active");
 		view.onSubmit("keep this message");
-		await vi.waitFor(() => expect(team.send).toHaveBeenCalledWith("worker-1", "keep this message"));
+		await vi.waitFor(() => expect(team.sendUserMessage).toHaveBeenCalledWith("worker-1", "keep this message"));
 	});
 
 	it.each(["queued_until_continue", "retained_until_continue: Resolve the pending assignment"])(
 		"reports retained messages instead of implying delivery (%s)",
 		async (result) => {
 			const { view, team, notify } = setup("completed");
-			vi.mocked(team.send).mockResolvedValueOnce(result);
+			vi.mocked(team.sendUserMessage).mockResolvedValueOnce(result);
 			view.onSubmit("hello");
 			await vi.waitFor(() =>
 				expect(notify).toHaveBeenCalledWith(expect.stringMatching(/queued|retained/), "warning"),
@@ -425,7 +491,7 @@ describe("worker main view", () => {
 
 	it("surfaces send errors", async () => {
 		const { view, team, notify } = setup("running");
-		vi.mocked(team.send).mockRejectedValueOnce(new Error("Worker transport unavailable"));
+		vi.mocked(team.sendUserMessage).mockRejectedValueOnce(new Error("Worker transport unavailable"));
 		view.onSubmit("hello");
 		await vi.waitFor(() => expect(notify).toHaveBeenCalledWith("Worker transport unavailable", "error"));
 	});
@@ -434,12 +500,12 @@ describe("worker main view", () => {
 		const { view, team, notify, component, views } = setup("cancelled");
 		view.onSubmit("hello");
 		await vi.waitFor(() => expect(notify).toHaveBeenCalledWith("explorer has been cancelled.", "warning"));
-		expect(team.send).not.toHaveBeenCalled();
+		expect(team.sendUserMessage).not.toHaveBeenCalled();
 		views.length = 0;
 		view.onSubmit("hello again");
 		await vi.waitFor(() => expect(notify).toHaveBeenCalledWith("Worker worker-1 no longer exists.", "warning"));
 		expect(component.render(100).join("\n")).toContain("no longer exists");
-		expect(team.send).not.toHaveBeenCalled();
+		expect(team.sendUserMessage).not.toHaveBeenCalled();
 	});
 
 	it("unsubscribes when switching away from the worker", () => {

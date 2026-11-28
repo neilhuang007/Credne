@@ -1,6 +1,7 @@
 import type { InlineExtension } from "../core/extensions/types.ts";
 import accountsExtension from "./accounts/index.ts";
 import codemodeExtension from "./codemode/index.ts";
+import compactExtension from "./compact/index.ts";
 import llamaExtension from "./llama/index.ts";
 import mcpExtension from "./mcp/index.ts";
 import planningExtension from "./planning/index.ts";
@@ -20,6 +21,7 @@ export const builtInExtensions: InlineExtension[] = [
 	...getBuiltInModelExtensions(),
 	{ name: "web-search", factory: webSearchExtension, replaceable: true, builtin: true },
 	{ name: "planning", factory: planningExtension, builtin: true },
+	{ name: "compact", factory: compactExtension, builtin: true },
 	{ name: "subagent", factory: subagentExtension, replaceable: true, builtin: true },
 	// Replaceable: an extension that registers `codemode`, `tool_search`, or `/mcp` (such as a third-party
 	// MCP extension) takes over instead of running alongside the built-in one.

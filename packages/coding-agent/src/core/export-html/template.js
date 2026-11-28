@@ -1424,10 +1424,15 @@
         }
 
         if (entry.type === 'compaction') {
+          // Entries stored without the size after, or that did not shrink the context, show the size before only.
+          const after = entry.tokensAfter;
+          const size = typeof after === 'number' && after < entry.tokensBefore
+            ? `${entry.tokensBefore.toLocaleString()} to ${after.toLocaleString()} tokens (${Math.round((1 - after / entry.tokensBefore) * 100)}% saved)`
+            : `${entry.tokensBefore.toLocaleString()} tokens`;
           return `<div class="compaction" id="${entryDomId}" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
             <div class="compaction-label">[compaction]</div>
-            <div class="compaction-collapsed">Compacted from ${entry.tokensBefore.toLocaleString()} tokens</div>
-            <div class="compaction-content"><strong>Compacted from ${entry.tokensBefore.toLocaleString()} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
+            <div class="compaction-collapsed">Compacted from ${size}</div>
+            <div class="compaction-content"><strong>Compacted from ${size}</strong>\n\n${escapeHtml(entry.summary)}</div>
           </div>`;
         }
 

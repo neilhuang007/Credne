@@ -6,7 +6,7 @@
  */
 
 import { createInterface } from "node:readline";
-import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
@@ -56,7 +56,12 @@ import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import { resolveCliModel, resolveModelScopeWithDiagnostics, type ScopedModel } from "./core/model-resolver.ts";
+import {
+	resolveCliModel,
+	resolveModelScopeWithDiagnostics,
+	type ScopedModel,
+	selectScopedDefault,
+} from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
@@ -560,13 +565,11 @@ function buildSessionOptions(
 	}
 
 	if (!options.model && scopedModels.length > 0 && !hasExistingSession) {
-		// Check if saved default is in scoped models - use it if so, otherwise first scoped model
-		const savedProvider = settingsManager.getDefaultProvider();
-		const savedModelId = settingsManager.getDefaultModel();
-		const savedModel = savedProvider && savedModelId ? modelRuntime.getModel(savedProvider, savedModelId) : undefined;
-		const savedInScope = savedModel ? scopedModels.find((sm) => modelsAreEqual(sm.model, savedModel)) : undefined;
-
-		options.model = savedInScope?.model ?? scopedModels[0].model;
+		options.model = selectScopedDefault(
+			scopedModels,
+			settingsManager.getDefaultProvider(),
+			settingsManager.getDefaultModel(),
+		)?.model;
 	}
 
 	// An explicit CLI thinking level takes precedence over model-specific defaults.

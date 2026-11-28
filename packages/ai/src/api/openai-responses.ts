@@ -7,7 +7,6 @@ import type {
 	CacheRetention,
 	Model,
 	OpenAIResponsesCompat,
-	ProviderEnv,
 	ProviderHeaders,
 	SimpleStreamOptions,
 	StreamFunction,
@@ -19,12 +18,12 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
-import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { getConfiguredCacheRetention } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
-import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
+import { clampOpenAIPromptCacheKey, isOpenAIHeaderSafePromptCacheKey } from "./openai-prompt-cache.ts";
 import {
 	convertResponsesMessages,
 	convertResponsesTools,
@@ -72,20 +71,6 @@ function getClientApiKey(provider: string, apiKey: string | undefined, headers: 
 
 function detectSessionAffinityFormat(model: Pick<Model<"openai-responses">, "provider" | "baseUrl">) {
 	return model.provider === "openrouter" || model.baseUrl.includes("openrouter.ai") ? "openrouter" : "openai";
-}
-
-/**
- * Resolve cache retention preference.
- * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
- */
-function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
-	if (cacheRetention) {
-		return cacheRetention;
-	}
-	if (getProviderEnvValue("PI_CACHE_RETENTION", env) === "long") {
-		return "long";
-	}
-	return "short";
 }
 
 function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCompat> {
@@ -184,22 +169,12 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 		};
 
 		try {
-			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
-			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
+			const cacheRetention = getConfiguredCacheRetention(options?.cacheRetention, options?.env) ?? "short";
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				getDeclaredTools(normalizedContext.messages),
 				compat.supportsOpenAIGrammarTools,
-			);
-			const client = createClient(
-				model,
-				normalizedContext,
-				apiKey,
-				options?.headers,
-				options?.identity,
-				options?.fetch,
-				cacheSessionId,
 			);
 			let params = buildParams(
 				model,
@@ -208,11 +183,31 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				compat,
 				grammarToolInputProperties,
 				configurationUpdateEffort,
+				cacheRetention,
 			);
+			const originalCacheKey = params.prompt_cache_key;
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
+			const payloadCacheKey: unknown = params?.prompt_cache_key;
+			const routingCacheKey =
+				cacheSessionId &&
+				compat.promptCacheKeyMode !== "disabled" &&
+				payloadCacheKey !== originalCacheKey &&
+				isOpenAIHeaderSafePromptCacheKey(payloadCacheKey)
+					? payloadCacheKey
+					: undefined;
+			const client = createClient(
+				model,
+				normalizedContext,
+				apiKey,
+				options?.headers,
+				options?.identity,
+				options?.fetch,
+				cacheSessionId,
+				routingCacheKey,
+			);
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -300,6 +295,7 @@ function createClient(
 	identity?: ClientIdentity,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
+	routingCacheKey?: string,
 ) {
 	const compat = getCompat(model);
 	const headers: ProviderHeaders = { ...getIdentityHeaders(model, identity), ...model.headers };
@@ -317,7 +313,7 @@ function createClient(
 			headers["x-session-id"] = sessionId;
 		} else {
 			if (compat.sessionAffinityFormat === "openai") {
-				headers["session-id"] = sessionId;
+				headers["session-id"] = routingCacheKey ?? sessionId;
 			}
 			headers["x-client-request-id"] = sessionId;
 		}
@@ -344,6 +340,7 @@ function buildParams(
 	compat: Required<OpenAIResponsesCompat>,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	configurationUpdateEffort: string | undefined,
+	cacheRetention: CacheRetention,
 ) {
 	const transcriptTools = resolveTranscriptTools(context.messages, getResponsesToolSupport(compat));
 	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
@@ -358,7 +355,6 @@ function buildParams(
 		configurationUpdateEffort,
 	});
 
-	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	const sendPromptCacheKey = cacheRetention !== "none" && compat.promptCacheKeyMode !== "disabled";
 	// Sign in with ChatGPT rejects these request fields.
 	const omitUnsupportedFields = isChatGPTSignIn(model, options?.apiKey);

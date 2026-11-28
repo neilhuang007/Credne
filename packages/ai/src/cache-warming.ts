@@ -2,7 +2,7 @@
 // whether a refresh pays for itself. Hosts own the scheduling; this module owns the numbers.
 import { calculateCost } from "./models.ts";
 import type { Api, Model, SimpleStreamOptions, Usage } from "./types.ts";
-import { getProviderEnvValue } from "./utils/provider-env.ts";
+import { getConfiguredCacheRetention } from "./utils/provider-env.ts";
 
 /** Whether a refresh is sent ("warm") or warming ends until the next real request ("stop"). */
 export type CacheWarmingAction = "warm" | "stop";
@@ -53,11 +53,15 @@ export function getCacheWarmingDelayMs(ttlMs: number): number | undefined {
  * request used. Undefined when the model has no lifetime for that tier or caching is off.
  */
 export function getPromptCacheTtlMs(model: Model<Api>, options: SimpleStreamOptions | undefined): number | undefined {
-	const retention =
-		options?.cacheRetention ??
-		(getProviderEnvValue("PI_CACHE_RETENTION", options?.env) === "long" ? "long" : "short");
+	const retention = getConfiguredCacheRetention(options?.cacheRetention, options?.env) ?? "short";
 	if (retention === "none") return undefined;
-	const seconds = model.promptCache?.[retention];
+	const tier =
+		retention === "long" &&
+		model.api === "anthropic-messages" &&
+		(model as Model<"anthropic-messages">).compat?.supportsLongCacheRetention === false
+			? "short"
+			: retention;
+	const seconds = model.promptCache?.[tier];
 	return seconds === undefined ? undefined : seconds * 1000;
 }
 
@@ -67,6 +71,8 @@ export function getPromptCacheTtlMs(model: Model<Api>, options: SimpleStreamOpti
  * different budget, which Anthropic keys the message cache on, and the model could still think for thousands of tokens.
  */
 export function isCacheWarmingReplayable(model: Model<Api>, options: SimpleStreamOptions | undefined): boolean {
+	// Codex rejects a caller-supplied output cap, so a refresh could generate an entire reply.
+	if (options?.disableContinuation || model.api === "openai-codex-responses") return false;
 	if (!options?.reasoning || model.api !== "anthropic-messages") return true;
 	return (model as Model<"anthropic-messages">).compat?.forceAdaptiveThinking === true;
 }

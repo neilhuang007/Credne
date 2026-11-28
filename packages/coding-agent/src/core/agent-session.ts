@@ -23,11 +23,14 @@ import {
 	type AgentEvent,
 	type AgentMessage,
 	type AgentState,
+	type AgentSystemMessage,
 	type AgentTool,
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	getHiddenToolDeclarations,
 	type PrepareNextTurnContext,
+	projectToolDeclarations,
 	runToolCall,
 	type StreamFn,
 	type ThinkingLevel,
@@ -37,7 +40,11 @@ import {
 	getCurrentSystemMessage,
 	getCurrentTools,
 	getSystemMessageText,
+	getToolStateChanges,
+	hasApi,
+	hasNonAdditiveToolChanges,
 	retryDelayMs,
+	toToolDeclaration,
 } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
@@ -47,6 +54,7 @@ import type {
 	ProviderHeaders,
 	SystemMessage,
 	TextContent,
+	Tool,
 	ToolResultMessage,
 	Usage,
 	UserMessage,
@@ -63,6 +71,7 @@ import {
 	resetApiProviders,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
+import { retainOmpToolDeclarations } from "../extensions/accounts/omp-native.ts";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { processImage } from "../utils/image-process.ts";
@@ -74,6 +83,7 @@ import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
 	type CompactionPreparation,
+	type CompactionReason,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
@@ -153,6 +163,7 @@ import {
 	diffSystemPromptSections,
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
+	type SystemPromptSections,
 } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
@@ -227,13 +238,13 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_start"; reason: CompactionReason }
 	| { type: "entry_appended"; entry: SessionEntry }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
-			reason: "manual" | "threshold" | "overflow";
+			reason: CompactionReason;
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -252,7 +263,7 @@ export type AgentSessionEvent =
 	| {
 			type: "summarization_retry_attempt_start";
 			source: "compaction";
-			reason: "manual" | "threshold" | "overflow";
+			reason: CompactionReason;
 	  }
 	| { type: "summarization_retry_finished" }
 	| { type: "bash_execution_update"; id?: string; delta: string };
@@ -419,6 +430,11 @@ function getNextCycleIndex(
 
 const INTERRUPTED_RUN_ENTRY = "core:interrupted-run";
 const DISMISSED_INTERRUPTED_RUN_ENTRY = "core:interrupted-run-dismissed";
+const COMPLETED_TOOL_RUN_ENTRY = "core:tool-run-completed";
+
+function isToolUseEntry(entry: SessionEntry | undefined): boolean {
+	return entry?.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "toolUse";
+}
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -458,6 +474,8 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	/** Set by `requestCompaction()`; compaction runs before the next assistant response of the run. */
+	private _compactionRequested = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -573,10 +591,11 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
+		const hasCustomPrepareRequest = this.agent.prepareRequest !== undefined;
 		this._installAgentRequestProjection();
 		this._installAgentBoundaryHooks();
 		this._installHiddenDeclarationsProjection();
-		this._installAgentForcedPromptProjection();
+		this._installAgentForcedPromptProjection(hasCustomPrepareRequest);
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -856,13 +875,22 @@ export class AgentSession {
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+		const requested = this._compactionRequested;
+		this._compactionRequested = false;
 		const projection = this.sessionManager.buildSessionProjection();
+		// An interrupt during a tool batch still reaches this hook, and abort() cannot cancel a compaction
+		// that starts after it. An interrupted run compacts neither on request nor at the threshold; the
+		// check before the next prompt compacts if the context is still over the limit.
+		if (this._agentRunAbortRequested) return { ...context, messages: projection.messages };
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
-		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
-			return { ...context, messages: projection.messages };
-		}
-		await this._runAutoCompaction("threshold", false);
+		const exceeded =
+			!requested &&
+			model !== undefined &&
+			!isVirtualModel(model) &&
+			this._exceedsCompactionThreshold(model, projection);
+		if (!requested && !exceeded) return { ...context, messages: projection.messages };
+		await this._runAutoCompaction(requested ? "agent" : "threshold", false);
 		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
 	}
 
@@ -916,8 +944,8 @@ export class AgentSession {
 				if (entry) this._emit({ type: "entry_appended", entry });
 			}
 			// The route stands: the router already decided this request. The state entry does not change
-			// the projection.
-			if (this._exceedsCompactionThreshold(route.model, projection)) {
+			// the projection. An interrupted run does not compact, as in _compactBeforeNextAssistantResponse.
+			if (!this._agentRunAbortRequested && this._exceedsCompactionThreshold(route.model, projection)) {
 				await this._runAutoCompaction("threshold", false);
 				({ previous, context } = await prepare());
 			}
@@ -989,13 +1017,7 @@ export class AgentSession {
 			const nextContext = previousSnapshot?.context ?? context;
 			let updateMessage: SystemMessage | undefined;
 			if (this._recordedRunSystemPrompt === undefined) {
-				const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
-				const options = normalizeBuildSystemPromptOptions({
-					...runOptions,
-					selectedTools: this.getActiveToolNames(),
-					toolSnippets: { ...this._baseSystemPromptOptions.toolSnippets, ...runOptions.toolSnippets },
-					toolGuidelines: { ...this._baseSystemPromptOptions.toolGuidelines, ...runOptions.toolGuidelines },
-				});
+				const options = this._livePromptOptions();
 				updateMessage = this._preparePromptAndToolLoadout(options, nextContext.messages);
 				// Keep session.systemPrompt and ctx.getSystemPrompt() in step with what the provider sees.
 				this._runSystemPromptOptions = options;
@@ -1014,6 +1036,21 @@ export class AgentSession {
 				thinkingLevel: this.agent.state.thinkingLevel,
 			};
 		};
+	}
+
+	/**
+	 * A copy of `runOptions` (by default the run's prompt options, or the base options while no run has
+	 * any) for the active tools, with the snippets and guidelines of tools registered since the run started.
+	 */
+	private _livePromptOptions(
+		runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions,
+	): NormalizedBuildSystemPromptOptions {
+		return normalizeBuildSystemPromptOptions({
+			...runOptions,
+			selectedTools: this.getActiveToolNames(),
+			toolSnippets: { ...this._baseSystemPromptOptions.toolSnippets, ...runOptions.toolSnippets },
+			toolGuidelines: { ...this._baseSystemPromptOptions.toolGuidelines, ...runOptions.toolGuidelines },
+		});
 	}
 
 	// =========================================================================
@@ -1048,10 +1085,9 @@ export class AgentSession {
 					entryId = manager.appendContextEdit(draft.targetId, draft.replacement);
 					break;
 				case "compaction": {
-					const tokensBefore = estimateProjectedContextTokens(
-						manager.buildSessionProjection(),
-						manager.getBranch(),
-					).tokens;
+					const projection = manager.buildSessionProjection();
+					const tokensBefore = estimateProjectedContextTokens(projection, manager.getBranch()).tokens;
+					const snapshot = getCurrentSystemMessage(projection.messages);
 					entryId = manager.appendCompaction(
 						draft.summary,
 						draft.firstKeptEntryId,
@@ -1059,6 +1095,7 @@ export class AgentSession {
 						draft.details,
 						true,
 						draft.usage,
+						this._withCompactionToolVisibility(snapshot, projection.messages),
 					);
 					break;
 				}
@@ -1575,6 +1612,17 @@ export class AgentSession {
 		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
+	/**
+	 * Warms the active model's API connection while idle, so the next turn skips connection setup, as oh-my-pi's
+	 * agent does. Only providers that can warm a connection act (the account broker). Throttled and best effort; a
+	 * no-op mid-turn, where the pooled socket is busy and a warm-up would open a redundant one.
+	 */
+	prewarmModelConnection(): void {
+		const model = this.routedModel?.model ?? this.model;
+		if (!model || this.isStreaming) return;
+		void this._modelRuntime.prewarmConnection(model);
+	}
+
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
 		return (
@@ -1589,7 +1637,7 @@ export class AgentSession {
 	}
 
 	/**
-	 * Get the names of currently active tools, which are the tools declared to the model.
+	 * Get the names of currently active tools, including those whose declarations are hidden.
 	 * Tools with `codemode` or `deferred` exposure are callable from other tools without being active.
 	 */
 	getActiveToolNames(): string[] {
@@ -1684,10 +1732,8 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set the agent's tools for the given active tool names and return them. The active tools are
-	 * the registered, non-hidden ones; they are declared to the model. Active tools with a
-	 * `prepareLoadout` hook can change the declared descriptions and hide declarations from
-	 * requests (see {@link _installHiddenDeclarationsProjection}).
+	 * Set the agent's tools for the given active tool names and return them. A `prepareLoadout`
+	 * hook can change their model-facing descriptions or hide declarations without disabling execution.
 	 *
 	 * The active tools are a set: tools that stay active keep their current order and newly active
 	 * ones are appended, so reordering the same names does not change the prompt (#11495).
@@ -1704,7 +1750,7 @@ export class AgentSession {
 			return entry?.definition.prepareLoadout ? [entry] : [];
 		});
 		const hidden = new Set<string>();
-		let declared = tools;
+		let active = tools;
 		if (hooks.length > 0) {
 			const loadout: ToolLoadout = {
 				declared: tools,
@@ -1731,14 +1777,15 @@ export class AgentSession {
 					});
 				}
 			}
-			declared = tools.map((tool) => {
-				const description = descriptions.get(tool.name);
-				return description === undefined ? tool : { ...tool, description };
+			active = tools.map((tool) => {
+				const description = descriptions.get(tool.name) ?? tool.description;
+				if (hidden.has(tool.name)) return { ...tool, description, omitFromDeclaration: true };
+				return description === tool.description ? tool : { ...tool, description };
 			});
 		}
 		this._hiddenDeclarations = hidden;
-		this.agent.state.tools = declared;
-		return declared;
+		this.agent.state.tools = active;
+		return active;
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -1871,47 +1918,41 @@ export class AgentSession {
 		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
 	}
 
-	/**
-	 * Send a forced prompt as the provider's leading system prompt without recording it.
-	 *
-	 * A `before_agent_start` handler that returns `systemPrompt` needs that exact text at the
-	 * head of the request; a mid-conversation system message would leave the original prompt
-	 * in place. The forced text is a rendering of the current prompt, so the transcript keeps
-	 * its structured sections and the request is projected instead: the system messages
-	 * collapse into one head holding the forced text and the current tools. Runs after the
-	 * `context` extension handlers.
-	 */
-	/**
-	 * Remove the declarations that `prepareLoadout` hooks hide from every request. The whole
-	 * transcript is filtered with the current set, so the projected declarations stay consistent
-	 * across requests and only change when the loadout does.
-	 */
+	/** Replay visibility before request-only prompt handling; older histories have no snapshots. */
 	private _installHiddenDeclarationsProjection(): void {
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
 			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
-			const hidden = this._hiddenDeclarations;
-			if (hidden.size === 0) return transformed;
-			return transformed.map((message) => {
-				if (message.role !== "system" || (!message.toolsAdded && !message.toolsRemoved)) return message;
-				const { toolsAdded, toolsRemoved, ...rest } = message;
-				const added = toolsAdded?.filter((tool) => !hidden.has(tool.name)) ?? [];
-				const removed = toolsRemoved?.filter((tool) => !hidden.has(tool.name)) ?? [];
-				return {
-					...rest,
-					...(added.length > 0 ? { toolsAdded: added } : {}),
-					...(removed.length > 0 ? { toolsRemoved: removed } : {}),
-				};
-			});
+			return projectToolDeclarations(transformed, this._hiddenDeclarations);
 		};
 	}
 
-	private _installAgentForcedPromptProjection(): void {
+	/**
+	 * Send a forced prompt as the provider's leading system prompt without recording it.
+	 *
+	 * Runs after the context hooks. Supported direct transports keep additive tool changes in place
+	 * without the original prompt text. Otherwise the system messages collapse into one head with
+	 * the exact forced text and the current tools. The broker can still recover inactive definitions
+	 * or append-only tool additions without reintroducing the original system messages.
+	 */
+	private _installAgentForcedPromptProjection(hasCustomPrepareRequest: boolean): void {
 		const previousTransformContext = this.agent.transformContext;
+		const prepareRequest = this.agent.prepareRequest;
 		this.agent.transformContext = async (messages, signal) => {
+			const model = this.model;
 			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
 			const forced = this._runSystemPromptOptions?.forceSystemPrompt;
 			if (forced === undefined) return transformed;
+			// Only use the selected direct transport if neither request nor context hooks changed it.
+			if (
+				model &&
+				model === this.model &&
+				!hasCustomPrepareRequest &&
+				this.agent.prepareRequest === prepareRequest
+			) {
+				const direct = this._projectDirectForcedToolAdditions(model, transformed, forced);
+				if (direct) return direct;
+			}
 			const current = getCurrentSystemMessage(transformed);
 			const head: SystemMessage = {
 				role: "system",
@@ -1919,26 +1960,99 @@ export class AgentSession {
 				...(current?.toolsAdded ? { toolsAdded: current.toolsAdded } : {}),
 				timestamp: current?.timestamp ?? Date.now(),
 			};
-			return [head, ...transformed.filter((message) => message.role !== "system")];
+			let removed = false;
+			let sawAssistant = false;
+			let hasLaterAdditions = false;
+			const conversation = transformed.filter((message) => {
+				if (message.role !== "system") {
+					if (message.role === "assistant") sawAssistant = true;
+					return true;
+				}
+				if (message.toolsRemoved?.length) removed = true;
+				if (sawAssistant && message.toolsAdded?.length) hasLaterAdditions = true;
+				return false;
+			});
+			if (removed || hasLaterAdditions) retainOmpToolDeclarations(head, transformed, { removed, hasLaterAdditions });
+			return [head, ...conversation];
 		};
+	}
+
+	/** Keep only native tool additions after the first reply; other changes use the current-tool head. */
+	private _projectDirectForcedToolAdditions(
+		model: Model<string>,
+		messages: AgentMessage[],
+		forced: string,
+	): AgentMessage[] | undefined {
+		const anthropic = hasApi(model, "anthropic-messages");
+		if (anthropic) {
+			if (!model.compat?.supportsMidConvoSystemMessages || !model.compat.supportsMidConvoToolChanges) return;
+		} else if (hasApi(model, "openai-responses") || hasApi(model, "openai-codex-responses")) {
+			if (!model.compat?.supportsMidConvoSystemMessages || !model.compat.supportsAdditionalTools) return;
+			// Codex substitutes its own instructions for an empty system prompt.
+			if (model.api === "openai-codex-responses" && forced.length === 0) return;
+		} else {
+			return;
+		}
+		if (hasNonAdditiveToolChanges(messages)) return;
+
+		const initialTools: Tool[] = [];
+		const projected: AgentMessage[] = [];
+		let timestamp: number | undefined;
+		let sawAssistant = false;
+		let hasLaterAdditions = false;
+		for (const message of messages) {
+			if (message.role !== "system") {
+				if (message.role === "assistant" && message.stopReason !== "aborted" && message.stopReason !== "error") {
+					sawAssistant = true;
+				}
+				projected.push(message);
+				continue;
+			}
+			timestamp ??= message.timestamp;
+			if (!message.toolsAdded?.length) continue;
+			if (sawAssistant) {
+				hasLaterAdditions = true;
+				projected.push({
+					role: "system",
+					content: "",
+					toolsAdded: message.toolsAdded,
+					timestamp: message.timestamp,
+				});
+			} else {
+				initialTools.push(...message.toolsAdded);
+			}
+		}
+		// Anthropic needs an active request-level tool to anchor inline tool definitions.
+		if (!hasLaterAdditions || (anthropic && initialTools.length === 0)) return;
+		return [
+			{
+				role: "system",
+				content: forced,
+				...(initialTools.length > 0 ? { toolsAdded: initialTools } : {}),
+				...(anthropic ? {} : { toolAdditionNotices: "omit" }),
+				timestamp: timestamp ?? Date.now(),
+			},
+			...projected,
+		];
 	}
 
 	/**
 	 * Restore the active tool loadout declared by the session transcript, if it declares one.
-	 * Tools reachable only from other tools are never declared, but they do not depend on the active
-	 * set, so the transcript's declarations are the whole loadout.
+	 * The recorded declarations include tools hidden by `prepareLoadout`, unlike provider requests.
 	 * @param modifiers `+name`/`-name` entries applied to the restored loadout.
 	 */
 	private _restoreToolsFromTranscript(modifiers: readonly string[] = []): void {
 		this._pendingToolNames.clear();
 		this._restoredToolNames.clear();
-		// All system messages on the branch, including those before a compaction. Compaction snapshots
-		// are derived from these, so replaying them gives the current loadout.
-		const systemMessages = this.sessionManager
-			.getBranch()
-			.flatMap((entry) => (entry.type === "message" && entry.message.role === "system" ? [entry.message] : []));
+		const systemMessages = this.sessionManager.getBranch().flatMap((entry) => {
+			if (entry.type === "message" && entry.message.role === "system") return [entry.message];
+			if (entry.type === "compaction" && entry.systemMessage) return [entry.systemMessage];
+			return [];
+		});
 		// No recorded loadout: keep the current tools.
 		if (systemMessages.length === 0) return;
+		// A compaction checkpoint can record tool changes not yet in the ordinary deltas.
+		const recorded = getCurrentTools(this.sessionManager.buildSessionProjection().messages).map((tool) => tool.name);
 		// Tools the branch ever added or removed. Removed tools stay inactive.
 		const mentioned = new Set(
 			systemMessages
@@ -1952,19 +2066,11 @@ export class AgentSession {
 				!mentioned.has(name) && !this._baseToolDefinitions.has(name) && this._isActivatedOnRegistration(name),
 		);
 		// The recorded loadout plus the new tools, with `--tools +name`/`-name` applied.
-		const names = applyToolModifiers(
-			[...getCurrentTools(systemMessages).map((tool) => tool.name), ...newTools],
-			modifiers,
-		);
+		const names = applyToolModifiers([...recorded, ...newTools], modifiers);
 		// Recorded tools that are not registered yet, such as MCP tools of servers still connecting, are
 		// activated when they register. Excluded tools never register, so they are not kept pending.
 		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
-		this._restoredToolNames = new Set(
-			applyToolModifiers(
-				getCurrentTools(systemMessages).map((tool) => tool.name),
-				modifiers,
-			),
-		);
+		this._restoredToolNames = new Set(applyToolModifiers(recorded, modifiers));
 		// Ignores names that are not registered.
 		this._setActiveTools(names);
 	}
@@ -1991,6 +2097,7 @@ export class AgentSession {
 			}
 		} catch (error) {
 			this._isAgentRunActive = false;
+			this._compactionRequested = false;
 			this._runSystemPromptOptions = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
@@ -2031,16 +2138,21 @@ export class AgentSession {
 				if (this._agentRunAbortRequested) break;
 				await this._continueAgent();
 			}
+			if (!this._agentRunAbortRequested && isToolUseEntry(this._findInterruptedRun())) {
+				this.sessionManager.appendCustomEntry(COMPLETED_TOOL_RUN_ENTRY);
+			}
 		} finally {
 			try {
 				if (this._agentRunAbortRequested) this._finishCancelledRetry();
 				this._failedResponse = undefined;
+				// A request belongs to its run; it never compacts a later one.
+				this._compactionRequested = false;
 				this._lastAssistantMessage = undefined;
 				this._flushPendingBashMessages();
 				this._flushPendingCustomMessages();
 				// Aborting during tools can leave results without an aborted assistant response.
 				const entryId =
-					this._agentRunAbortRequested && this._hasInterruptedRunContext()
+					this._agentRunAbortRequested && this._getInterruptedRunContext() !== undefined
 						? this.sessionManager.appendCustomEntry(INTERRUPTED_RUN_ENTRY)
 						: this._findInterruptedRun()?.id;
 				if (entryId && this._runSystemPromptOptions) {
@@ -2064,7 +2176,7 @@ export class AgentSession {
 			last?.role === "assistant" &&
 			(last.stopReason === "error" || last.stopReason === "aborted") &&
 			(this._failedResponse || !this.agent.hasQueuedMessages()) &&
-			this._hasInterruptedRunContext()
+			this._getInterruptedRunContext() !== undefined
 		) {
 			// A retry or boundary continuation may still have a rejected attempt in raw history.
 			// Use the provider projection; ordinary queued prompts still use Agent.continue().
@@ -2689,7 +2801,9 @@ export class AgentSession {
 
 	/** Whether the idle branch has an unfinished turn that can be continued. */
 	get canContinueInterruptedRun(): boolean {
-		return this.isIdle && this._findInterruptedRun() !== undefined && this._hasInterruptedRunContext();
+		if (!this.isIdle) return false;
+		const entry = this._findInterruptedRun();
+		return entry !== undefined && this._getInterruptedRunContext(entry) !== undefined;
 	}
 
 	/** Decline continuation on this branch without changing the conversation. */
@@ -2699,11 +2813,13 @@ export class AgentSession {
 		this._interruptedRun = undefined;
 	}
 
-	/** Resume an interrupted or failed run from the transcript without adding a user message. */
+	/** Resume an unfinished or failed run from the transcript without adding a user message. */
 	async continueInterruptedRun(): Promise<"continued" | "busy" | "nothing-to-continue"> {
 		if (!this.isIdle || this._isEmittingAgentSettled || this._promptPreflightCount > 0) return "busy";
 		const entry = this._findInterruptedRun();
-		if (!entry || !this._hasInterruptedRunContext()) return "nothing-to-continue";
+		if (!entry) return "nothing-to-continue";
+		const missingResults = this._getInterruptedRunContext(entry);
+		if (!missingResults) return "nothing-to-continue";
 
 		const run = this._interruptedRun;
 		const promptOptions =
@@ -2725,14 +2841,23 @@ export class AgentSession {
 		this._pendingToolNames.clear();
 		// Agent.continue() rejects a trailing raw assistant entry, even when the provider
 		// projection omits it. Start from that projection instead of resubmitting a prompt.
-		await this._runAgent(() => this.agent.prompt(updateMessage ? [updateMessage] : []));
+		const messages: AgentMessage[] = [...missingResults].map(([toolCallId, toolName]) => ({
+			role: "toolResult",
+			toolCallId,
+			toolName,
+			content: [{ type: "text", text: "No result was saved before the turn ended. The tool may already have run." }],
+			isError: true,
+			timestamp: Date.now(),
+		}));
+		if (updateMessage) messages.push(updateMessage);
+		await this._runAgent(() => this.agent.prompt(messages));
 		return "continued";
 	}
 
 	private _findInterruptedRun(): SessionEntry | undefined {
 		const manager = this.sessionManager;
 		let retained: Set<string> | undefined;
-		let retainedFailure: SessionEntry | undefined;
+		let retainedRun: SessionEntry | undefined;
 		for (
 			let entry = manager.getLeafEntry();
 			entry;
@@ -2740,13 +2865,14 @@ export class AgentSession {
 		) {
 			if (entry.type === "custom") {
 				if (entry.customType === INTERRUPTED_RUN_ENTRY) return retained ? undefined : entry;
-				if (entry.customType === DISMISSED_INTERRUPTED_RUN_ENTRY) return undefined;
+				if (entry.customType === DISMISSED_INTERRUPTED_RUN_ENTRY || entry.customType === COMPLETED_TOOL_RUN_ENTRY) {
+					return undefined;
+				}
 			}
 			if (entry.type === "branch_summary") return undefined;
 			if (entry.type === "compaction") {
 				if (retained) return undefined;
-				// A summary is not the turn's input. Only cross this boundary if both the
-				// failed response and its original user message are still in the retained range.
+				// Continue across compaction only when the unfinished turn remains in context.
 				retained = new Set(
 					manager
 						.buildSessionProjection()
@@ -2755,47 +2881,48 @@ export class AgentSession {
 				);
 			}
 			if (entry.type !== "message") continue;
-			if (entry.message.role === "user") return retained?.has(entry.id) ? retainedFailure : undefined;
+			if (entry.message.role === "user") {
+				return !retained || retained.has(entry.id) ? (retainedRun ?? entry) : undefined;
+			}
 			if (entry.message.role === "assistant") {
 				const stop = entry.message.stopReason;
-				if (stop === "aborted" || stop === "error") {
-					if (!retained) return entry;
-					if (!retainedFailure) {
-						if (!retained.has(entry.id)) return undefined;
-						retainedFailure = entry;
-					}
-				} else if (!retainedFailure || stop !== "toolUse") {
-					return undefined;
-				}
+				if (stop !== "aborted" && stop !== "error" && stop !== "toolUse") return undefined;
+				if (!retained) return entry;
+				if (retainedRun) continue;
+				if (!retained.has(entry.id)) return undefined;
+				retainedRun = entry;
 			}
 		}
 		return undefined;
 	}
 
-	private _hasInterruptedRunContext(): boolean {
+	private _getInterruptedRunContext(entry?: SessionEntry): Map<string, string> | undefined {
 		const lastTurnMessage = this.messages.findLast(
 			(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
 		);
 		// A context-only message after a completed reply does not reopen that turn.
-		if (lastTurnMessage?.role === "assistant" && lastTurnMessage.stopReason === "stop") return false;
-		// The provider projection drops aborted/failed attempts. Keep earlier tool exchanges,
-		// but do not send an incomplete batch (for example, after navigating to one result).
+		if (lastTurnMessage?.role === "assistant" && lastTurnMessage.stopReason === "stop") return undefined;
+		if (entry?.type === "message" && entry.message.role === "user" && entry.message !== lastTurnMessage) {
+			if (lastTurnMessage?.role !== "user" || this._findPersistedMessageEntryId(lastTurnMessage) !== entry.id) {
+				return undefined;
+			}
+		}
 		const messages = convertToLlm(this.messages);
-		const last = messages.findLast((message) => message.role !== "system");
-		if (last?.role !== "user" && last?.role !== "toolResult") return false;
-		const pending = new Set<string>();
+		const pending = new Map<string, string>();
 		for (const message of messages) {
 			if (message.role === "system") continue;
 			if (message.role === "toolResult") {
-				if (!pending.delete(message.toolCallId)) return false;
+				if (!pending.delete(message.toolCallId)) return undefined;
 			} else {
-				if (pending.size > 0) return false;
+				if (pending.size > 0) return undefined;
 				if (message.role === "assistant") {
-					for (const part of message.content) if (part.type === "toolCall") pending.add(part.id);
+					for (const part of message.content) if (part.type === "toolCall") pending.set(part.id, part.name);
 				}
 			}
 		}
-		return pending.size === 0;
+		if (pending.size > 0) return isToolUseEntry(entry) ? pending : undefined;
+		const last = messages.findLast((message) => message.role !== "system");
+		return last?.role === "user" || last?.role === "toolResult" ? pending : undefined;
 	}
 
 	/**
@@ -2830,6 +2957,8 @@ export class AgentSession {
 		source: "set" | "cycle" | "restore",
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
+		// Every model change passes here; the handshake overlaps the extension handlers below.
+		this.prewarmModelConnection();
 		await this._extensionRunner.emit({
 			type: "model_select",
 			model: nextModel,
@@ -3077,7 +3206,7 @@ export class AgentSession {
 		model: Model<any>,
 		customInstructions: string | undefined,
 		signal: AbortSignal,
-		reason: "manual" | "threshold" | "overflow",
+		reason: CompactionReason,
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
@@ -3100,6 +3229,51 @@ export class AgentSession {
 	private _clearManualCompactionState(): void {
 		this._compactionAbortController = undefined;
 		this._resolveIdleWaitIfIdle();
+	}
+
+	/** Build the sections `options` renders for the live tool loadout, and record that loadout in `options`. */
+	private _buildLiveSections(options: NormalizedBuildSystemPromptOptions): SystemPromptSections {
+		options.selectedTools = this.getActiveToolNames();
+		// The tool list and rules must match the declarations the request carries.
+		options.hiddenTools = [...this._hiddenDeclarations];
+		return buildSystemPromptSections(options);
+	}
+
+	/**
+	 * The prompt and tool state a compaction entry stores: the state the transcript replays to, with
+	 * the live tools and the section changes made to `options` since `before` was built from it, by
+	 * `session_before_compact` handlers or by tool changes. Taking the tools live keeps a tool that a
+	 * handler withdrew out of the compacted context, instead of declaring it and removing it later.
+	 */
+	private _buildCompactionSnapshot(
+		options: NormalizedBuildSystemPromptOptions,
+		before: SystemPromptSections,
+	): AgentSystemMessage | undefined {
+		const { messages } = this.sessionManager.buildSessionProjection();
+		const current = getCurrentSystemMessage(messages);
+		// Without a recorded prompt there is no state to carry over; the next request declares it.
+		if (!current) return undefined;
+		const update: SystemMessage = {
+			role: "system",
+			content: "",
+			sections: diffSystemPromptSections(before, this._buildLiveSections(options)),
+			...getToolStateChanges(current.toolsAdded ?? [], this.agent.state.tools.map(toToolDeclaration)),
+			timestamp: current.timestamp,
+		};
+		return this._withCompactionToolVisibility(getCurrentSystemMessage([current, update]), messages);
+	}
+
+	/** Keep a reveal not yet declared out of the new head; it belongs at the next request boundary. */
+	private _withCompactionToolVisibility(
+		snapshot: SystemMessage | undefined,
+		messages: AgentMessage[],
+	): AgentSystemMessage | undefined {
+		if (!snapshot) return undefined;
+		const hidden = new Set(getHiddenToolDeclarations(messages));
+		const hiddenToolDeclarations = snapshot.toolsAdded
+			?.filter((tool) => hidden.has(tool.name) || this._hiddenDeclarations.has(tool.name))
+			.map((tool) => tool.name);
+		return hiddenToolDeclarations?.length ? { ...snapshot, hiddenToolDeclarations } : snapshot;
 	}
 
 	/**
@@ -3143,6 +3317,11 @@ export class AgentSession {
 				throw new Error("Nothing to compact (session too small)");
 			}
 
+			// No run is active (abort() above ended it), but continueInterruptedRun() resumes the interrupted
+			// one with its recorded options, so the compaction builds on those and updates them below.
+			const interrupted = this._interruptedRun;
+			const promptOptions = this._livePromptOptions(interrupted?.promptOptions);
+			const sectionsBefore = this._buildLiveSections(promptOptions);
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
@@ -3154,11 +3333,18 @@ export class AgentSession {
 					reason: "manual",
 					willRetry: false,
 					signal: this._compactionAbortController.signal,
+					systemPromptOptions: promptOptions,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (result?.cancel) {
 					cancelledByExtension = true;
 					throw new Error("Compaction cancelled");
+				}
+
+				// A failure the handler reports ends the compaction; no summary is generated in its place.
+				if (result?.error !== undefined) {
+					fromExtension = true;
+					throw new Error(result.error);
 				}
 
 				if (result?.compaction) {
@@ -3200,10 +3386,21 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+				this._buildCompactionSnapshot(promptOptions, sectionsBefore),
+				estimateMessagesTokens,
+			);
+			// A continued run then keeps the sections handlers added, as an active run does after automatic
+			// compaction, instead of removing them with its second request.
+			if (interrupted) this._interruptedRun = { ...interrupted, promptOptions };
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
-			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -3224,7 +3421,7 @@ export class AgentSession {
 				summary,
 				firstKeptEntryId,
 				tokensBefore,
-				estimatedTokensAfter,
+				estimatedTokensAfter: savedCompactionEntry?.tokensAfter,
 				usage,
 				details,
 			};
@@ -3270,6 +3467,14 @@ export class AgentSession {
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+	}
+
+	/**
+	 * Compact before the next assistant response of the current run, without aborting the run. Has no
+	 * effect when no run is in progress; a request the run does not reach is dropped when it ends.
+	 */
+	requestCompaction(): void {
+		if (this._isAgentRunActive) this._compactionRequested = true;
 	}
 
 	/**
@@ -3437,16 +3642,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Execute threshold or overflow compaction. Manual compaction uses
+	 * Execute threshold, overflow, or agent-requested compaction. Manual compaction uses
 	 * `AgentSession.compact()` instead. Both paths call the lower-level `compact()`
 	 * function imported from `./compaction/index.ts` after preparation and extension
 	 * interception.
 	 *
-	 * @param reason Automatic trigger selected by `_checkCompaction()`
+	 * @param reason Automatic trigger selected by `_checkCompaction()`, or `"agent"` for `requestCompaction()`
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(reason: Exclude<CompactionReason, "manual">, willRetry: boolean): Promise<boolean> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		let abortController: AbortController | undefined;
@@ -3471,6 +3676,8 @@ export class AgentSession {
 			this._emit({ type: "compaction_start", reason });
 			abortController.signal.throwIfAborted();
 
+			const promptOptions = this._livePromptOptions();
+			const sectionsBefore = this._buildLiveSections(promptOptions);
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
@@ -3482,11 +3689,18 @@ export class AgentSession {
 					reason,
 					willRetry,
 					signal: abortController.signal,
+					systemPromptOptions: promptOptions,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
 					cancelledByExtension = true;
 					throw new Error("Compaction cancelled");
+				}
+
+				// A failure the handler reports ends the compaction; no summary is generated in its place.
+				if (extensionResult?.error !== undefined) {
+					fromExtension = true;
+					throw new Error(extensionResult.error);
 				}
 
 				if (extensionResult?.compaction) {
@@ -3526,10 +3740,21 @@ export class AgentSession {
 			}
 			abortController.signal.throwIfAborted();
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+				this._buildCompactionSnapshot(promptOptions, sectionsBefore),
+				estimateMessagesTokens,
+			);
+			// A run in progress sends its next requests with the options the snapshot was built from, so
+			// the sections that handlers added stay instead of being removed by the next turn's update.
+			if (this._runSystemPromptOptions) this._runSystemPromptOptions = promptOptions;
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
-			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
 
 			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
@@ -3550,7 +3775,7 @@ export class AgentSession {
 				summary,
 				firstKeptEntryId,
 				tokensBefore,
-				estimatedTokensAfter,
+				estimatedTokensAfter: savedCompactionEntry?.tokensAfter,
 				usage,
 				details,
 			};
@@ -3814,6 +4039,7 @@ export class AgentSession {
 						}
 					})();
 				},
+				requestCompaction: () => this.requestCompaction(),
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
 				executeTool: (callerId, name, args, options) => this._executeNestedToolCall(callerId, name, args, options),
@@ -4079,7 +4305,7 @@ export class AgentSession {
 	 * the TUI needs to render the retry and recreate the underlying indicator.
 	 */
 	private _summarizationRetryCallbacks(
-		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
+		source: { source: "branchSummary" } | { source: "compaction"; reason: CompactionReason },
 	): RetryCallbacks {
 		return {
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {

@@ -8,6 +8,8 @@ export interface ModelSectionRow {
 	model: Model<Api>;
 	/** The alias the row stands for. Rows without one are shown by model ID. */
 	alias?: string;
+	/** The row stands for the current model: the model itself, or the alias of the current model's family. */
+	isCurrent: boolean;
 }
 
 export interface ModelSection {
@@ -30,7 +32,8 @@ const vendorTitles: Record<string, string> = {
  * Sections in a stable order: vendors in alias file order, then providers in the order of `choices`. An alias row
  * resolves to its family's latest model on the pinned account when served there, or among `choices` otherwise.
  * Broker models no alias covers stay out, except `currentModel`, which is listed by ID so the selection is visible.
- * `choices` is the order of preference when equal IDs are served by several providers.
+ * A current broker model of an aliased family marks its alias row instead, even when the alias resolves to another
+ * version. `choices` is the order of preference when equal IDs are served by several providers.
  */
 export function buildModelSections(
 	choices: readonly Model<Api>[],
@@ -42,26 +45,29 @@ export function buildModelSections(
 		getSection(sections, `provider:${provider}`, getProviderName(provider) ?? provider);
 	const listed = new Set<Model<Api>>();
 	const pinnedModels = getPinnedAccountModels(choices, currentModel?.provider);
+	const current = choices.find((model) => modelsAreEqual(currentModel, model));
+	// The current model is among `choices`, so its family's alias row always resolves and is listed below.
+	const currentAliasRow = current && isBrokerProvider(current.provider) ? findAliasRowOfModel(current.id) : undefined;
 	for (const row of modelAliasRows) {
 		const model = resolveAliasRow(row, pinnedModels) ?? resolveAliasRow(row, choices);
 		if (!model) continue;
 		listed.add(model);
-		getSection(sections, `vendor:${row.provider}`, vendorTitle(row.provider)).rows.push({ model, alias: row.alias });
+		const isCurrent = model === current || row === currentAliasRow;
+		getSection(sections, `vendor:${row.provider}`, vendorTitle(row.provider)).rows.push({
+			model,
+			alias: row.alias,
+			isCurrent,
+		});
 	}
 
-	const current = choices.find((model) => modelsAreEqual(currentModel, model));
-	if (current && !listed.has(current)) {
+	if (current && !listed.has(current) && !currentAliasRow) {
 		listed.add(current);
-		const row = isBrokerProvider(current.provider) ? findAliasRowOfModel(current.id) : undefined;
-		const section = row
-			? getSection(sections, `vendor:${row.provider}`, vendorTitle(row.provider))
-			: providerSection(current.provider);
-		section.rows.unshift({ model: current });
+		providerSection(current.provider).rows.unshift({ model: current, isCurrent: true });
 	}
 
 	for (const model of choices) {
 		if (listed.has(model) || isBrokerProvider(model.provider)) continue;
-		providerSection(model.provider).rows.push({ model });
+		providerSection(model.provider).rows.push({ model, isCurrent: false });
 	}
 	return [...sections.values()];
 }

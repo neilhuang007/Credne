@@ -2,23 +2,29 @@
 // oh-my-pi's own client posts one to its auth gateway, and the broker's oh-my-pi runtime reshapes the request for the
 // provider, sends it and streams its own events back. The wire is JSON, so oh-my-pi is not a dependency.
 import { randomUUID } from "node:crypto";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
 	type CacheRetention,
+	type ConnectionPrewarmOptions,
 	calculateCost,
 	contentText,
 	createAssistantMessageEventStream,
 	formatThrownValue,
 	getCurrentSystemMessage,
 	getCurrentTools,
+	getDeclaredTools,
+	getInitialSystemMessage,
 	type ImageContent,
 	type JsonObject,
+	type JsonValue,
 	type Message,
 	type Model,
 	type ProviderStreams,
+	resolveTranscriptTools,
 	type SamplingParams,
 	type SimpleStreamOptions,
 	type StopReason,
@@ -33,13 +39,22 @@ import {
 	type ToolChoice,
 	type TranscriptContext,
 	type Usage,
+	type UserMessage,
 } from "@earendil-works/pi-ai";
 import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
 import { headersToRecord, providerHeadersToRecord } from "@earendil-works/pi-ai/utils/headers";
+import { getConfiguredCacheRetention } from "@earendil-works/pi-ai/utils/provider-env";
 import { APP_NAME } from "../../config.ts";
 
 /** Pi API id of broker chat models: the broker's oh-my-pi runtime builds the provider request. */
 export const OMP_NATIVE_API = "omp-native";
+
+/** Local-only opt-in to the broker's bounded cache refresh route. */
+export interface OmpCacheRefreshOptions {
+	brokerCacheRefresh?: true;
+}
+
+type OmpStreamOptions = SimpleStreamOptions & OmpCacheRefreshOptions;
 
 /** The provider and API oh-my-pi resolved for a model, as the broker reports them (`anthropic`, `anthropic-messages`). */
 export interface OmpIdentity {
@@ -50,8 +65,62 @@ export interface OmpIdentity {
 /** Finds the oh-my-pi identity of a model served through a Pi provider, when the account catalog knows one. */
 export type OmpIdentityLookup = (piProvider: string, modelId: string) => OmpIdentity | undefined;
 
+/** Reads the actual upstream identity of a finished broker turn, including restored session history. */
+export function getOmpTurnIdentity(message: AssistantMessage): OmpIdentity | undefined {
+	if (message.api !== OMP_NATIVE_API) return undefined;
+	const upstream = replayObject(message.providerState?.ompIdentity);
+	// Provider state restored from disk predates this field or may have a different shape.
+	if (typeof upstream?.provider !== "string" || typeof upstream.api !== "string") return undefined;
+	return { provider: upstream.provider, api: upstream.api };
+}
+
+/** An upstream API that can add tools in the middle of a request. */
+export type OmpToolTimelineApi = "openai-codex-responses" | "openai-responses";
+
+type OmpToolTimelineApiLookup = (modelId: string) => readonly OmpToolTimelineApi[];
+
+interface OmpRequestCatalog {
+	identify: OmpIdentityLookup;
+	toolTimelineApis?: OmpToolTimelineApiLookup;
+}
+
+interface OmpToolAddition {
+	at: number;
+	names: string[];
+}
+
+type ToolAdditionAnchor = AssistantMessage | UserMessage;
+
+interface ToolAdditionCandidate {
+	anchor?: { after: WeakRef<ToolAdditionAnchor>; turn: WeakRef<AssistantMessage> };
+	names: string[];
+}
+
+interface ForcedToolDeclarations {
+	inactiveSource?: readonly Tool[];
+	timeline?: ToolAdditionCandidate[];
+}
+
+const forcedToolDeclarations = new WeakMap<SystemMessage, ForcedToolDeclarations>();
+
+/** Retains only tool declarations and their positions when a forced prompt replaces the system messages. */
+export function retainOmpToolDeclarations(
+	head: SystemMessage,
+	messages: AgentMessage[],
+	changes: { removed: boolean; hasLaterAdditions: boolean },
+): void {
+	const declared = changes.removed ? getDeclaredTools(messages) : undefined;
+	const inactiveSource = declared && declared.length > (head.toolsAdded?.length ?? 0) ? declared : undefined;
+	const timeline = changes.hasLaterAdditions ? collectToolAdditions(messages) : undefined;
+	if (inactiveSource || timeline?.length) forcedToolDeclarations.set(head, { inactiveSource, timeline });
+}
+
 /** Route of oh-my-pi's pi-native protocol below a broker route base. */
 const PI_STREAM_PATH = "/pi/stream";
+/** Separate from chat so an older broker cannot silently ignore the one-attempt contract. */
+const PI_CACHE_REFRESH_PATH = "/pi/cache-refresh";
+/** Route below a broker route base that warms the provider connection of a model. */
+const PREWARM_PATH = "/prewarm";
 /** Text of a redacted reasoning block, as in Pi's Anthropic adapter. */
 const REDACTED_THINKING_TEXT = "[Reasoning redacted]";
 const MAX_ERROR_BODY_CHARS = 4000;
@@ -103,6 +172,10 @@ interface OmpAssistantMessage {
 	stopReason: OmpStopReason;
 	errorMessage?: string;
 	timestamp: number;
+	/** Controls an Anthropic request declared (tool declaration, effort), replayed so later requests keep its prefix. */
+	requestControls?: JsonObject;
+	/** Transport-native history of the response, such as OpenAI Responses items, replayed instead of being rebuilt. */
+	providerPayload?: JsonObject;
 }
 
 type OmpMessage =
@@ -151,9 +224,11 @@ interface OmpOptions extends OmpSampling {
 
 interface OmpRequest {
 	modelId: string;
-	context: { systemPrompt?: string[]; messages: OmpMessage[]; tools?: OmpTool[] };
+	context: { systemPrompt?: string[]; messages: OmpMessage[]; tools?: OmpTool[]; inactiveTools?: OmpTool[] };
 	options: OmpOptions;
 	stream: true;
+	/** Credne broker hint. The complete active tools remain in the pi-native context as the fallback. */
+	toolTimeline?: { apis: readonly OmpToolTimelineApi[]; additions: OmpToolAddition[] };
 }
 
 /** Frames about one content block. `partial` is the whole turn so far, and may be ahead of the frame. */
@@ -178,22 +253,48 @@ type OmpFrame = { type: "start" } | OmpBlockFrame | OmpDoneFrame | OmpErrorFrame
 
 /**
  * Streams of the `omp-native` API; the request model's base URL is the broker route the provider resolved.
- * `identify` tells oh-my-pi's provider and API for the models of earlier turns (see `encodeAssistant`).
+ * `identify` resolves historical turns; `toolTimelineApis` opts each supported broker route model into tool additions.
  */
-export function ompNativeStreams(identify: OmpIdentityLookup): ProviderStreams {
-	const stream = (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
-		streamOmpNative(model, context, options, identify);
-	return { stream, streamSimple: stream };
+export function ompNativeStreams(
+	identify: OmpIdentityLookup,
+	toolTimelineApis?: OmpToolTimelineApiLookup,
+): ProviderStreams {
+	const catalog = { identify, toolTimelineApis };
+	const stream = (model: Model<Api>, context: TranscriptContext, options?: OmpStreamOptions) =>
+		streamOmpNative(model, context, options, catalog);
+	return { stream, streamSimple: stream, prewarm };
+}
+
+/**
+ * Asks the broker to open, or keep alive, the provider connection of `model`. The broker calls oh-my-pi's own
+ * connection warm-up, a credential-less `HEAD` over the transport and socket pool of real requests, as oh-my-pi's
+ * agent does at startup, on model change and while the user types.
+ */
+async function prewarm(model: Model<Api>, options?: ConnectionPrewarmOptions): Promise<void> {
+	const { apiKey } = options ?? {};
+	if (!apiKey) throw new Error(`No broker token for provider "${model.provider}".`);
+	const response = await (options?.fetch ?? globalThis.fetch)(routeUrl(model, PREWARM_PATH), {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+		body: JSON.stringify({ modelId: model.id }),
+		signal: options?.signal,
+	});
+	await response.body?.cancel();
+}
+
+/** The URL of `path` below the broker route the provider resolved as the model's base URL. */
+function routeUrl(model: Model<Api>, path: string): string {
+	return `${model.baseUrl.replace(/\/+$/u, "")}${path}`;
 }
 
 function streamOmpNative(
 	model: Model<Api>,
 	context: TranscriptContext,
-	options: SimpleStreamOptions | undefined,
-	identify: OmpIdentityLookup,
+	options: OmpStreamOptions | undefined,
+	catalog: OmpRequestCatalog,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
-	void relay(stream, createDecoder(model), context, options, identify);
+	void relay(stream, createDecoder(model), context, options, catalog);
 	return stream;
 }
 
@@ -202,12 +303,12 @@ async function relay(
 	stream: AssistantMessageEventStream,
 	decoder: DecoderState,
 	context: TranscriptContext,
-	options: SimpleStreamOptions | undefined,
-	identify: OmpIdentityLookup,
+	options: OmpStreamOptions | undefined,
+	catalog: OmpRequestCatalog,
 ): Promise<void> {
 	const { model } = decoder;
 	try {
-		const response = await post(model, context, options, identify);
+		const response = await post(model, context, options, catalog);
 		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 		if (!response.ok) throw await responseError(response);
 		if (!response.body) throw new Error("The account broker sent an empty response.");
@@ -226,16 +327,17 @@ async function relay(
 async function post(
 	model: Model<Api>,
 	context: TranscriptContext,
-	options: SimpleStreamOptions | undefined,
-	identify: OmpIdentityLookup,
+	options: OmpStreamOptions | undefined,
+	catalog: OmpRequestCatalog,
 ): Promise<Response> {
 	// The bearer is the broker's per-run token, which the account provider resolved.
 	const { apiKey } = options ?? {};
 	if (!apiKey) throw new Error(`No broker token for provider "${model.provider}".`);
-	let payload: unknown = encodeRequest(model, context, options, identify);
+	let payload: unknown = encodeRequest(model, context, options, catalog);
 	const replaced = await options?.onPayload?.(payload, model);
 	if (replaced !== undefined) payload = replaced;
-	return (options?.fetch ?? globalThis.fetch)(`${model.baseUrl.replace(/\/+$/u, "")}${PI_STREAM_PATH}`, {
+	const path = options?.brokerCacheRefresh ? PI_CACHE_REFRESH_PATH : PI_STREAM_PATH;
+	return (options?.fetch ?? globalThis.fetch)(routeUrl(model, path), {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
@@ -272,24 +374,151 @@ function encodeRequest(
 	model: Model<Api>,
 	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
-	identify: OmpIdentityLookup,
+	catalog: OmpRequestCatalog,
 ): OmpRequest {
 	// oh-my-pi's context has one prompt and one tool set, not system messages in the transcript. Later system
 	// messages are replayed into them, as Pi does for every API without mid-conversation system messages.
 	const system = getCurrentSystemMessage(context.messages);
 	const prompt = system ? systemPromptBlocks(system) : [];
 	const tools = getCurrentTools(context.messages);
+	// oh-my-pi keeps an Anthropic tool declaration byte-stable across a conversation: a tool that stops being active
+	// stays declared, which needs its definition. Its own agent sends every definition it declared before; the
+	// transcript's declarations are the same set.
+	const active = new Set(tools.map((tool) => tool.name));
+	const head = getInitialSystemMessage(context.messages);
+	const forced = head && forcedToolDeclarations.get(head);
+	const declared = forced?.inactiveSource ?? getDeclaredTools(context.messages);
+	const inactive = declared.filter((tool) => !active.has(tool.name));
+	const apis = catalog.toolTimelineApis?.(model.id);
+	const additions =
+		apis?.length && tools.length > 0
+			? resolveToolAdditionAnchors(
+					context.messages,
+					forced?.timeline ?? collectToolAdditions(context.messages),
+					active,
+				)
+			: undefined;
 	return {
 		// The broker resolves the bare model ID on the account or pool of the route.
 		modelId: model.id,
 		context: {
 			...(prompt.length > 0 ? { systemPrompt: prompt } : {}),
-			messages: context.messages.flatMap((message) => encodeMessage(message, identify)),
-			...(tools.length > 0 ? { tools: tools.map(encodeTool) } : {}),
+			messages: context.messages.flatMap((message) => encodeMessage(message, catalog.identify)),
+			...(tools.length > 0 || inactive.length > 0 ? { tools: tools.map(encodeTool) } : {}),
+			...(inactive.length > 0 ? { inactiveTools: inactive.map(encodeTool) } : {}),
 		},
 		options: encodeOptions(model, context, options),
 		stream: true,
+		...(apis?.length && additions?.length ? { toolTimeline: { apis, additions } } : {}),
 	};
+}
+
+function collectToolAdditions(messages: readonly AgentMessage[]): ToolAdditionCandidate[] {
+	const { foldedSystemMessages } = resolveTranscriptTools(messages, "additions");
+	const additions: ToolAdditionCandidate[] = [];
+	let systemCount = 0;
+	let turn: AssistantMessage | undefined;
+	let after: ToolAdditionAnchor | undefined;
+	for (const message of messages) {
+		switch (message.role) {
+			case "system":
+				if (systemCount++ < foldedSystemMessages || !turn || !message.toolsAdded?.length) break;
+				additions.push({
+					anchor:
+						after && isCompletedTurn(turn) ? { after: new WeakRef(after), turn: new WeakRef(turn) } : undefined,
+					names: message.toolsAdded.map((tool) => tool.name),
+				});
+				break;
+			case "assistant":
+				turn = after = message;
+				break;
+			case "user":
+				after = message;
+				break;
+			default:
+				// A delta amid tool results belongs after the whole group. Custom entries can be converted
+				// to a different role or dropped, so a delta directly after one has no stable anchor.
+				if (message.role !== "toolResult" || after !== turn) after = undefined;
+		}
+	}
+	return additions;
+}
+
+function isCompletedTurn(message: AssistantMessage): boolean {
+	return message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse";
+}
+
+function resolveToolAdditionAnchors(
+	messages: readonly Message[],
+	candidates: readonly ToolAdditionCandidate[],
+	active: ReadonlySet<string>,
+): OmpToolAddition[] {
+	const additions: OmpToolAddition[] = [];
+	if (candidates.length === 0) return additions;
+	const anchors = new Map<ToolAdditionAnchor, { turn: AssistantMessage; at?: number }>();
+	const turns = new Set<AssistantMessage>();
+	for (const { anchor } of candidates) {
+		const after = anchor?.after.deref();
+		const turn = anchor?.turn.deref();
+		if (after && turn) {
+			anchors.set(after, { turn });
+			turns.add(turn);
+		}
+	}
+	if (anchors.size === 0) return additions;
+	locateToolAdditionAnchors(messages, anchors, turns);
+	for (const { anchor, names } of candidates) {
+		const after = anchor?.after.deref();
+		const at = after && anchors.get(after)?.at;
+		const previous = additions.at(-1);
+		if (at === undefined || (previous && at < previous.at) || names.some((name) => !active.has(name))) {
+			// Fold through an unrepresentable change just as we do for a removal.
+			additions.length = 0;
+		} else if (previous?.at === at) {
+			previous.names.push(...names);
+		} else {
+			additions.push({ at, names: [...names] });
+		}
+	}
+	return additions;
+}
+
+function locateToolAdditionAnchors(
+	messages: readonly Message[],
+	anchors: Map<ToolAdditionAnchor, { turn: AssistantMessage; at?: number }>,
+	turns: ReadonlySet<AssistantMessage>,
+): void {
+	let at = 0;
+	let turn: AssistantMessage | undefined;
+	let pending: Set<string> | undefined;
+	let inResultGroup = false;
+	const finishTurn = () => {
+		if (!turn || !inResultGroup) return;
+		inResultGroup = false;
+		const anchor = anchors.get(turn);
+		if (anchor && pending?.size === 0) anchor.at = at;
+	};
+	for (const message of messages) {
+		// Only conversation messages are encoded, each as exactly one OMP message.
+		if (message.role === "system") continue;
+		if (message.role !== "toolResult") finishTurn();
+		at++;
+		if (message.role === "assistant") {
+			turn = message;
+			pending = undefined;
+			if (turns.has(message) && isCompletedTurn(message)) {
+				pending = new Set<string>();
+				for (const part of message.content) if (part.type === "toolCall") pending.add(part.id);
+			}
+			inResultGroup = true;
+		} else if (message.role === "toolResult" && inResultGroup) {
+			pending?.delete(message.toolCallId);
+		} else if (message.role === "user") {
+			const anchor = anchors.get(message);
+			if (anchor && anchor.turn === turn && pending?.size === 0) anchor.at = at;
+		}
+	}
+	finishTurn();
 }
 
 /** The base prompt, then each named section, as separate blocks. They read as `getSystemMessageText` joined. */
@@ -322,14 +551,15 @@ function encodeMessage(message: Message, identify: OmpIdentityLookup): OmpMessag
 }
 
 /**
- * oh-my-pi replays reasoning signatures only for turns of the model it resolved: the turn's provider, API and
- * model must equal that model's. A turn of an `omp-native` model therefore carries the provider and API the broker
- * reported for that model, as oh-my-pi's own client would send it. `model` is already the bare model ID. Without
- * a known identity (the account is gone, a pool serves the ID through different providers, or the catalog is
- * from an older version) the turn keeps Pi's own, and oh-my-pi replays its reasoning as plain text.
+ * Identify the provider that actually wrote the turn so oh-my-pi can replay compatible history and demote
+ * foreign reasoning. Only older turns fall back to the catalog, which can be ambiguous on a mixed pool.
  */
 function encodeAssistant(message: AssistantMessage, identify: OmpIdentityLookup): OmpAssistantMessage {
-	const upstream = message.api === OMP_NATIVE_API ? identify(message.provider, message.model) : undefined;
+	const upstream =
+		message.api === OMP_NATIVE_API
+			? (getOmpTurnIdentity(message) ?? identify(message.provider, message.model))
+			: undefined;
+	const replay = message.api === OMP_NATIVE_API ? message.providerState : undefined;
 	return {
 		role: "assistant",
 		content: message.content.flatMap(encodeBlock),
@@ -342,7 +572,16 @@ function encodeAssistant(message: AssistantMessage, identify: OmpIdentityLookup)
 		stopReason: encodeStopReason(message.stopReason),
 		errorMessage: message.errorMessage,
 		timestamp: message.timestamp,
+		// Send only oh-my-pi's replay fields, never the enclosing Credne state.
+		requestControls: replayObject(replay?.requestControls),
+		providerPayload: replayObject(replay?.providerPayload),
 	};
+}
+
+function replayObject(value: JsonValue | undefined): JsonObject | undefined {
+	// Provider state is restored from session JSON. Only object-valued replay fields are valid at this boundary.
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	return value as JsonObject; // Array.isArray does not narrow the readonly JsonValue array member.
 }
 
 function encodeBlock(block: AssistantMessage["content"][number]): OmpBlock[] {
@@ -440,7 +679,7 @@ function encodeOptions(
 		toolChoice: options?.toolChoice,
 		// The broker locks the account credential to the exact session ID oh-my-pi will use, so every request needs one.
 		sessionId: base.sessionId?.trim() ? base.sessionId : randomUUID(),
-		cacheRetention: base.cacheRetention,
+		cacheRetention: getConfiguredCacheRetention(base.cacheRetention, base.env),
 		statefulResponses: base.disableContinuation ? false : undefined,
 		maxRetryDelayMs: base.maxRetryDelayMs,
 		// A null header suppresses a default of the provider adapter, which oh-my-pi's adapter does not share.
@@ -720,6 +959,13 @@ function finishTurn(state: DecoderState, final: OmpAssistantMessage, reason: Omp
 		message.responseModel = final.upstreamModel;
 	}
 	message.errorMessage = final.errorMessage;
+	// Later requests over the transcript send these back (see `encodeAssistant`), as oh-my-pi's own transcript does.
+	const { api, provider, requestControls, providerPayload } = final;
+	message.providerState = {
+		ompIdentity: { api, provider },
+		...(requestControls === undefined ? {} : { requestControls }),
+		...(providerPayload === undefined ? {} : { providerPayload }),
+	};
 }
 
 function decodeBlock(block: OmpBlock): AssistantMessage["content"] {
@@ -747,7 +993,8 @@ function decodeUsage(model: Model<Api>, usage: OmpUsage): Usage {
 		totalTokens: usage.totalTokens,
 		cost: emptyCost(),
 	};
-	if (usage.cttl?.ephemeral1h !== undefined) decoded.cacheWrite1h = usage.cttl.ephemeral1h;
+	const { ephemeral1h, ephemeral5m } = usage.cttl ?? {};
+	if (ephemeral1h !== undefined || (ephemeral5m ?? 0) > 0) decoded.cacheWrite1h = ephemeral1h ?? 0;
 	if (usage.reasoningTokens !== undefined) decoded.reasoning = usage.reasoningTokens;
 	calculateCost(model, decoded);
 	return decoded;

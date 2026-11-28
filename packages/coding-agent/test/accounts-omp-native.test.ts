@@ -3,22 +3,26 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
+	fauxAssistantMessage,
 	type Message,
 	type Model,
 	normalizeContext,
 	type SimpleStreamOptions,
 	type Tool,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { APP_NAME } from "../src/config.ts";
 import {
+	getOmpTurnIdentity,
 	OMP_NATIVE_API,
 	type OmpIdentity,
 	type OmpIdentityLookup,
 	ompNativeStreams,
 } from "../src/extensions/accounts/omp-native.ts";
 import { chunkedBody, ompTurn, sseResponse, sseText } from "./omp-native-test-utils.ts";
+import { createHarness } from "./suite/harness.ts";
 
 const routeBase = "http://127.0.0.1:4100/credne/v1/route/a.QWNjb3VudA";
 const timestamp = 1_700_000_000_000;
@@ -37,7 +41,12 @@ const model: Model<Api> = {
 
 interface PiNativeBody {
 	modelId: string;
-	context: { systemPrompt?: string[]; messages: Record<string, unknown>[]; tools?: Record<string, unknown>[] };
+	context: {
+		systemPrompt?: string[];
+		messages: Record<string, unknown>[];
+		tools?: Record<string, unknown>[];
+		inactiveTools?: Record<string, unknown>[];
+	};
 	options: Record<string, unknown>;
 	stream: boolean;
 }
@@ -167,6 +176,57 @@ describe("omp-native request", () => {
 		expect(sent.body.context.systemPrompt).toEqual(["Base rules.\n\nExtra rules.", "<rules>Be terse.</rules>"]);
 		expect(sent.body.context.messages.map((message) => message.role)).toEqual(["user", "user"]);
 		expect(sent.body.context.tools?.map((entry) => entry.name)).toEqual(["read", "bash"]);
+		// A removed tool keeps its definition, so oh-my-pi can keep the declaration it sent byte-stable.
+		expect(sent.body.context.inactiveTools).toEqual([
+			{ name: "grep", description: "The grep tool", parameters: noObject },
+		]);
+	});
+
+	it("preserves inactive definitions and an empty active set through the forced role prompt projection", async () => {
+		const forced = "The worker's exact role.";
+		const harness = await createHarness({
+			initialActiveToolNames: ["read"],
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", () => ({ systemPrompt: forced }));
+				},
+			],
+		});
+		try {
+			const contexts: TranscriptContext[] = [];
+			const capture = (context: TranscriptContext) => {
+				contexts.push(context);
+				return fauxAssistantMessage("Done.");
+			};
+			harness.setResponses([capture, capture]);
+			await harness.session.prompt("First task.");
+			harness.session.setActiveToolsByName([]);
+			await harness.session.prompt("Next task.");
+
+			const first = (await exchange(okResponse, contexts[0])).sent.body.context;
+			const second = (await exchange(okResponse, contexts[1])).sent.body.context;
+			expect(first.systemPrompt).toEqual([forced]);
+			expect(second.systemPrompt).toEqual(first.systemPrompt);
+			expect(first.tools?.map((entry) => entry.name)).toEqual(["read"]);
+			expect(second.tools).toEqual([]);
+			expect(second.inactiveTools).toEqual(first.tools);
+			expect(second.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("warms the connection through the route's prewarm path with the broker token", async () => {
+		const fetch = vi.fn(
+			async (_input: string | URL | Request, _init?: RequestInit) => new Response(null, { status: 204 }),
+		);
+		await ompNativeStreams(unidentified).prewarm?.(model, { apiKey: "broker-token", fetch });
+
+		const [url, init] = fetch.mock.calls[0] ?? [];
+		expect(url).toBe(`${routeBase}/prewarm`);
+		expect(init?.method).toBe("POST");
+		expect(new Headers(init?.headers).get("authorization")).toBe("Bearer broker-token");
+		expect(JSON.parse(String(init?.body))).toEqual({ modelId: "claude-test-1" });
 	});
 
 	it("maps strict and grammar-constrained tools to strict and customFormat", async () => {
@@ -355,6 +415,41 @@ describe("omp-native request", () => {
 			expect(turn).toMatchObject({ provider: extra.provider, api: OMP_NATIVE_API });
 		});
 
+		it("replays the actual upstream identities across a mixed pool failover", async () => {
+			const pooled = { ...model, id: "gpt-test", provider: "pool:all" };
+			const codex = { provider: "openai-codex", api: "openai-codex-responses" };
+			const openai = { provider: "openai", api: "openai-responses" };
+			const nativePayload = { type: "openaiResponsesHistory", dt: true, items: [{ type: "reasoning" }] };
+			const responseFrom = (identity: OmpIdentity) => () =>
+				sseResponse(
+					ompTurn({ ...identity, model: pooled.id })
+						.start()
+						.text("answer")
+						.done("stop", { input: 1, output: 1 }, { providerPayload: nativePayload })
+						.sse(),
+				);
+			const first = await exchange(responseFrom(codex), { messages: [hello] }, {}, pooled);
+			expect(first.message).toMatchObject({ provider: pooled.provider, api: OMP_NATIVE_API });
+			expect(getOmpTurnIdentity(first.message)).toEqual(codex);
+
+			const second = await exchange(responseFrom(openai), { messages: [hello, first.message, hello] }, {}, pooled);
+			expect(second.sent.body.context.messages[1]).toMatchObject({ ...codex, providerPayload: nativePayload });
+			expect(getOmpTurnIdentity(second.message)).toEqual(openai);
+
+			// A later catalog change cannot relabel either turn as the adapter serving this request.
+			const { sent } = await exchange(
+				okResponse,
+				{ messages: [hello, first.message, hello, second.message, hello] },
+				{},
+				pooled,
+				() => openai,
+			);
+			expect(sent.body.context.messages[1]).toMatchObject(codex);
+			expect(sent.body.context.messages[3]).toMatchObject(openai);
+			expect(sent.body.context.messages[1]).not.toHaveProperty("ompIdentity");
+			expect(sent.body.context.messages[3]).not.toHaveProperty("ompIdentity");
+		});
+
 		it("leaves turns of other APIs alone without asking for their identity", async () => {
 			identify.mockClear();
 			const turn = await sentTurn(signedTurn({ provider: "acct:claude-test", api: "anthropic-messages" }));
@@ -430,6 +525,17 @@ describe("omp-native request", () => {
 			headers: { "x-extra": "1" },
 			metadata: { user_id: "u-1" },
 		});
+	});
+
+	it("forwards only a configured retention preference, with explicit options taking precedence", async () => {
+		vi.stubEnv("PI_CACHE_RETENTION", "short");
+		const retentionOf = async (options?: SimpleStreamOptions) =>
+			(await exchange(okResponse, { messages: [hello] }, options)).sent.body.options.cacheRetention;
+		expect(await retentionOf()).toBe("short");
+		expect(await retentionOf({ env: { PI_CACHE_RETENTION: "long" } })).toBe("long");
+		expect(await retentionOf({ cacheRetention: "none", env: { PI_CACHE_RETENTION: "long" } })).toBe("none");
+		vi.stubEnv("PI_CACHE_RETENTION", undefined);
+		expect(await retentionOf()).toBeUndefined();
 	});
 
 	it("lets the sampling parameters override the temperature and fits the default output cap to the context", async () => {
@@ -551,6 +657,38 @@ describe("omp-native response", () => {
 		const partials = events.flatMap((event) => ("partial" in event ? [event.partial] : []));
 		expect(new Set(partials).size).toBe(1);
 		expect(partials[0]).toBe(message);
+	});
+
+	it("keeps oh-my-pi's request controls and transport history and sends them back with later requests", async () => {
+		const requestControls = {
+			messageIndex: 1,
+			tools: { declared: ["read", "grep"], deferred: [], active: ["read", "grep"] },
+			effort: { topLevel: "high", tail: "high" },
+		};
+		const providerPayload = { type: "openaiResponsesHistory", items: [{ type: "reasoning" }] };
+		const turn = ompTurn()
+			.start()
+			.text("ok")
+			.done("stop", { input: 1, output: 1 }, { requestControls, providerPayload });
+		const { message } = await exchange(() => sseResponse(turn.sse()), { messages: [hello] });
+		expect(message.providerState).toEqual({
+			ompIdentity: { provider: "anthropic", api: "anthropic-messages" },
+			requestControls,
+			providerPayload,
+		});
+
+		const next = { role: "user" as const, content: "again", timestamp };
+		const { sent } = await exchange(okResponse, { messages: [hello, message, next] });
+		expect(sent.body.context.messages[1]).toMatchObject({ role: "assistant", requestControls, providerPayload });
+	});
+
+	it("distinguishes reported short cache writes from an unreported lifetime", async () => {
+		const reply = (cttl?: { ephemeral5m: number }) =>
+			sseResponse(ompTurn().start().text("ok").done("stop", { cacheWrite: 7, cttl }).sse());
+		const short = await exchange(() => reply({ ephemeral5m: 7 }), { messages: [hello] });
+		const unreported = await exchange(() => reply(), { messages: [hello] });
+		expect(short.message.usage.cacheWrite1h).toBe(0);
+		expect(unreported.message.usage.cacheWrite1h).toBeUndefined();
 	});
 
 	it("takes the finished message as the record when oh-my-pi corrected the turn after streaming it", async () => {

@@ -12,6 +12,8 @@ import {
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
+import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
+import { OPENAI_CODEX_MODELS } from "@earendil-works/pi-ai/providers/openai-codex.models";
 import {
 	type AccountCatalog,
 	ALL_POOL,
@@ -22,9 +24,17 @@ import {
 	familyOf,
 	poolDisplayName,
 	poolProviderId,
+	sharedRouteFamily,
+	upstreamIdentity,
 } from "./catalog.ts";
 import { type BrokerClient, type BrokerTarget, fetchBroker } from "./client.ts";
-import { OMP_NATIVE_API, type OmpIdentity, type OmpIdentityLookup, ompNativeStreams } from "./omp-native.ts";
+import {
+	OMP_NATIVE_API,
+	type OmpIdentity,
+	type OmpIdentityLookup,
+	type OmpToolTimelineApi,
+	ompNativeStreams,
+} from "./omp-native.ts";
 
 /** Response header naming the account that served a request, base64url encoded. */
 export const ACCOUNT_HEADER = "x-credne-account";
@@ -45,7 +55,52 @@ export interface AccountProviderSpec {
 }
 
 /** Called with the account key that served a request of a provider. */
-export type ServedByListener = (providerId: string, accountKey: string) => void;
+export type ServedByListener = (providerId: string, accountKey: string, modelId: string, sessionId?: string) => void;
+
+type AccountProvider = Provider & Pick<AccountProviderSpec, "upstream" | "poolAccounts">;
+
+/** Identifies the upstream prompt-cache mechanism even when a pool has no single upstream adapter. */
+export function brokerPromptCacheKind(
+	provider: AccountProvider | undefined,
+	modelId: string,
+): "openai" | "anthropic" | undefined {
+	const upstream = upstreamIdentity(provider?.upstream, modelId);
+	if (upstream) {
+		if (upstream.api === "anthropic-messages") return "anthropic";
+		if (upstream.api === "openai-responses" || upstream.api === "openai-codex-responses") return "openai";
+		return undefined;
+	}
+	const account = provider?.poolAccounts?.find((account) => account.models.some((model) => model.id === modelId));
+	if (!account) return undefined;
+	const family = sharedRouteFamily(familyOf(account.provider));
+	if (family === "claude") return "anthropic";
+	if (family === "openai") return "openai";
+	return undefined;
+}
+
+const codexModels: Readonly<Record<string, Model<"openai-codex-responses"> | undefined>> = OPENAI_CODEX_MODELS;
+const openaiModels: Readonly<Record<string, Model<"openai-responses"> | undefined>> = OPENAI_MODELS;
+
+function toolTimelineApis(spec: AccountProviderSpec, modelId: string): OmpToolTimelineApi[] {
+	const apis = new Set<OmpToolTimelineApi>();
+	for (const route of spec.poolAccounts ?? [spec]) {
+		const upstream = upstreamIdentity(route.upstream, modelId);
+		if (
+			upstream?.provider === "openai-codex" &&
+			upstream.api === "openai-codex-responses" &&
+			codexModels[modelId]?.compat?.supportsAdditionalTools
+		) {
+			apis.add(upstream.api);
+		} else if (
+			upstream?.provider === "openai" &&
+			upstream.api === "openai-responses" &&
+			openaiModels[modelId]?.compat?.supportsAdditionalTools
+		) {
+			apis.add(upstream.api);
+		}
+	}
+	return [...apis];
+}
 
 /** One spec per cached broker pool and account. */
 export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
@@ -94,10 +149,10 @@ export function createAccountProvider(
 	onServedBy?: ServedByListener,
 	identify: OmpIdentityLookup = () => undefined,
 	refresh?: (signal: AbortSignal) => Promise<void>,
-): Provider & Pick<AccountProviderSpec, "poolAccounts"> {
-	const report = (response: ProviderResponse) => {
+): AccountProvider {
+	const report = (response: ProviderResponse, model: Model<Api>, sessionId?: string) => {
 		const key = response.headers[ACCOUNT_HEADER];
-		if (key) onServedBy?.(spec.id, key);
+		if (key && response.status >= 200 && response.status < 300) onServedBy?.(spec.id, key, model.id, sessionId);
 	};
 	const provider = createProvider({
 		id: spec.id,
@@ -120,11 +175,16 @@ export function createAccountProvider(
 		},
 		models: [...spec.models, ...(spec.classifiers ?? [])],
 		// One API for every model: a pool may mix Claude and GPT models, and oh-my-pi speaks each provider's wire.
-		api: { [OMP_NATIVE_API]: observed(ompNativeStreams(identify), report) },
+		api: {
+			[OMP_NATIVE_API]: observed(
+				ompNativeStreams(identify, (modelId) => toolTimelineApis(spec, modelId)),
+				report,
+			),
+		},
 		// A classification may be served by another pool account than the chat, so it must not move the footer.
 		classifiers: { "typesafe-system-one": viaLoopback(typesafeSystemOneApi()) },
 	});
-	const accountProvider = { ...provider, poolAccounts: spec.poolAccounts };
+	const accountProvider = { ...provider, upstream: spec.upstream, poolAccounts: spec.poolAccounts };
 	if (!refresh) return accountProvider;
 	return {
 		...accountProvider,
@@ -137,19 +197,24 @@ export function createAccountProvider(
 }
 
 /** Reports broker responses before invoking the caller's own response handler. */
-function observed(streams: ProviderStreams, report: (response: ProviderResponse) => void): ProviderStreams {
+function observed(
+	streams: ProviderStreams,
+	report: (response: ProviderResponse, model: Model<Api>, sessionId?: string) => void,
+): ProviderStreams {
 	const withReport = <T extends StreamOptions>(options: T | undefined): T =>
 		({
 			...options,
 			fetch: fetchInference,
 			onResponse: (response: ProviderResponse, model: Model<Api>) => {
-				report(response);
+				report(response, model, options?.sessionId);
 				return options?.onResponse?.(response, model);
 			},
 		}) as T;
+	const { prewarm } = streams;
 	return {
 		stream: (model, context, options) => streams.stream(model, context, withReport(options)),
 		streamSimple: (model, context, options) => streams.streamSimple(model, context, withReport(options)),
+		...(prewarm ? { prewarm: (model, options) => prewarm(model, { ...options, fetch: fetchInference }) } : {}),
 	};
 }
 

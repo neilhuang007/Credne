@@ -347,7 +347,11 @@ test("the global GPT pool returns to ChatGPT before charging a previously used A
 			? refusal(429, "Usage limit", { "retry-after": "60" })
 			: responsesReply(model),
 	);
-	const h = await harness(upstream.origin);
+	const h = await harness(upstream.origin, (request) =>
+		request.url === "https://chatgpt.com/backend-api/codex/responses"
+			? upstream.server.fetch(request)
+			: new Response(null, { status: 404 }),
+	);
 	const record = { baseUrl: upstream.origin };
 	const send = async (target = "p.all", id = model) => {
 		const response = await h.send(target, piBody(id, "same-chat"));

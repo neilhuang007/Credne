@@ -21,8 +21,9 @@ export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
 	private workingStatusIndicator: StatusIndicator | undefined;
 	private borderBadge: string | undefined;
+	private mainBorderBadge: ((width: number) => string) | undefined;
 	public readonly embedWorkingStatus: boolean;
-	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
+	public actionHandlers: Map<AppKeybinding, () => unknown> = new Map();
 
 	// Special handlers that can be dynamically replaced
 	public onEscape?: () => void;
@@ -46,10 +47,24 @@ export class CustomEditor extends Editor {
 		this.borderBadge = badge;
 	}
 
+	/** Set the main-session badge, which is hidden while the editor addresses an extension view. */
+	setMainBorderBadge(render: ((width: number) => string) | undefined): void {
+		this.mainBorderBadge = render;
+	}
+
 	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
-		// The badge keeps at most half the border so the working status stays readable.
-		const badge = this.borderBadge && width >= 12 ? truncateToWidth(this.borderBadge, Math.floor(width / 2)) : "";
+		const badge = this.renderBorderBadge(width);
 		return this.renderStatusBorder(width - visibleWidth(badge), hiddenLineCount) + badge;
+	}
+
+	private renderBorderBadge(width: number): string {
+		if (width < 12) return "";
+		const half = Math.floor(width / 2);
+		if (this.borderBadge) return truncateToWidth(this.borderBadge, half);
+		if (this.embedWorkingStatus && this.workingStatusIndicator?.takesWholeBorder()) return "";
+		// Leave room for the working indicator, but let wider screens show several quota windows.
+		const available = width - Math.min(32, half);
+		return truncateToWidth(this.mainBorderBadge?.(available) ?? "", available);
 	}
 
 	private renderStatusBorder(width: number, hiddenLineCount: number): string {
@@ -101,7 +116,7 @@ export class CustomEditor extends Editor {
 	/**
 	 * Register a handler for an app action.
 	 */
-	onAction(action: AppKeybinding, handler: () => void): void {
+	onAction(action: AppKeybinding, handler: () => unknown): void {
 		this.actionHandlers.set(action, handler);
 	}
 
@@ -184,7 +199,7 @@ export class CustomEditor extends Editor {
 				action !== "app.subagents.select" &&
 				this.keybindings.matches(data, action)
 			) {
-				handler();
+				if (handler() === false && action === "app.subagents.background") continue;
 				return;
 			}
 		}

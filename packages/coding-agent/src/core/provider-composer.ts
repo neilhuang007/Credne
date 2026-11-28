@@ -664,6 +664,10 @@ export function composeModelProvider(
 	if (cancelDeferred) {
 		provider.cancelDeferred = (model, handle, options) => cancelDeferred(model, handle, options);
 	}
+	const prewarm = base?.prewarm;
+	if (prewarm) {
+		provider.prewarm = (model, options) => prewarm(model, options);
+	}
 	const extensionImages = extension?.images;
 	const generateImages = base?.generateImages;
 	if (generateImages || Object.keys(extensionImages ?? {}).length > 0) {

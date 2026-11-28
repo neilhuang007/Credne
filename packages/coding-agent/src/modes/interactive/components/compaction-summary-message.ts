@@ -52,13 +52,18 @@ export class CompactionSummaryMessageComponent extends Box {
 		this.clear();
 		const content = new Container();
 
-		const tokenStr = this.message.tokensBefore.toLocaleString();
+		const { tokensBefore, tokensAfter } = this.message;
+		// Compactions stored without the size after, or that did not shrink the context, keep the size before only.
+		const sizeStr =
+			tokensAfter !== undefined && tokensAfter < tokensBefore
+				? `${tokensBefore.toLocaleString()} to ${tokensAfter.toLocaleString()} tokens (${Math.round((1 - tokensAfter / tokensBefore) * 100)}% saved)`
+				: `${tokensBefore.toLocaleString()} tokens`;
 		const label = theme.fg("customMessageLabel", `\x1b[1m[compaction]\x1b[22m`);
 		content.addChild(new Text(label, 0, 0));
 		content.addChild(new Spacer(1));
 
 		if (this.expanded) {
-			const header = `**Compacted from ${tokenStr} tokens**\n\n`;
+			const header = `**Compacted from ${sizeStr}**\n\n`;
 			const transform = createMarkdownTransform(
 				"summary",
 				() => false,
@@ -80,7 +85,7 @@ export class CompactionSummaryMessageComponent extends Box {
 		} else {
 			content.addChild(
 				new Text(
-					theme.fg("customMessageText", `Compacted from ${tokenStr} tokens (`) +
+					theme.fg("customMessageText", `Compacted from ${sizeStr} (`) +
 						theme.fg("dim", keyText("app.tools.expand")) +
 						theme.fg("customMessageText", " to expand)"),
 					0,

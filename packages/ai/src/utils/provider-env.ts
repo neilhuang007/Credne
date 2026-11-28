@@ -1,6 +1,13 @@
-import type { ProviderEnv } from "../types.ts";
+import type { CacheRetention, ProviderEnv } from "../types.ts";
 
 let procEnvCache: Map<string, string> | null = null;
+
+/** An explicit request or environment preference, leaving unconfigured defaults to the provider. */
+export function getConfiguredCacheRetention(retention?: CacheRetention, env?: ProviderEnv): CacheRetention | undefined {
+	if (retention !== undefined) return retention;
+	const configured = getProviderEnvValue("PI_CACHE_RETENTION", env);
+	return configured === "none" || configured === "short" || configured === "long" ? configured : undefined;
+}
 
 /**
  * Fallback for https://github.com/oven-sh/bun/issues/27802.

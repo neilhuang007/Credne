@@ -1,3 +1,4 @@
+import type { MessageCreateParamsStreaming } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type AnthropicOptions, stream } from "../src/api/anthropic-messages.ts";
@@ -256,6 +257,63 @@ describe("Anthropic message threads", () => {
 		expect(next.betas).toEqual(create.betas);
 	});
 
+	it("marks the first and newest appended blocks on a long continuation", async () => {
+		const h = harness();
+		const messages = [user("first")];
+		await say(h, messages);
+		messages.push({
+			role: "user",
+			content: Array.from({ length: 25 }, (_, index) => ({ type: "text", text: `Block ${index}` })),
+			timestamp: 2,
+		});
+		await say(h, messages);
+
+		const next = h.requests[1];
+		expect(next.body.thread?.type).toBe("continue");
+		expect(next.body.messages[0].content).toEqual(
+			Array.from({ length: 25 }, (_, index) => ({
+				type: "text",
+				text: `Block ${index}`,
+				...(index === 0 || index === 24 ? { cache_control: { type: "ephemeral" } } : {}),
+			})),
+		);
+	});
+
+	it("keeps the rolling tail when the thread retained three fixed markers", async () => {
+		const h = harness();
+		const messages: Message[] = [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "Shared reference" },
+					{ type: "text", text: "Task" },
+				],
+				timestamp: 1,
+			},
+		];
+		await say(h, messages, {
+			options: {
+				onPayload: (payload) => {
+					const body = payload as MessageCreateParamsStreaming;
+					const first = body.messages[0];
+					if (typeof first.content !== "string" && first.content[0].type === "text") {
+						first.content[0].cache_control = { type: "ephemeral" };
+					}
+				},
+			},
+		});
+		messages.push(user("second"), user("third"));
+		await say(h, messages);
+
+		const [create, next] = h.requests;
+		expect(JSON.stringify(create.body).match(/"cache_control"/g)).toHaveLength(4);
+		expect(next.body.thread?.type).toBe("continue");
+		expect(next.body.messages).toEqual([
+			{ role: "user", content: "second" },
+			{ role: "user", content: [{ type: "text", text: "third", cache_control: { type: "ephemeral" } }] },
+		]);
+	});
+
 	it("continues after a reply that ends in tool calls, without placeholder results in the prefix", async () => {
 		const h = harness();
 		h.queue.push((request) =>
@@ -301,7 +359,7 @@ describe("Anthropic message threads", () => {
 		]);
 	});
 
-	it("continues when a system message with a native tool change follows the reply", async () => {
+	it.each(["Update", ""])("continues a native tool change with system text %j", async (content) => {
 		const model: Model<"anthropic-messages"> = {
 			...baseModel,
 			compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true },
@@ -309,13 +367,23 @@ describe("Anthropic message threads", () => {
 		const h = harness();
 		const messages: Message[] = [user("first")];
 		await say(h, messages, { model });
-		messages.push({ role: "system", content: "Update", toolsAdded: [tool("other")], timestamp: 2 }, user("second"));
+		messages.push({ role: "system", content, toolsAdded: [tool("other")], timestamp: 2 }, user("second"));
 		await say(h, messages, { model });
 
 		const next = h.requests[1];
 		expect(next.body.thread?.type).toBe("continue");
 		expect(next.body.messages.map((message) => message.role)).toEqual(["user", "system"]);
-		expect(JSON.stringify(next.body.messages[1].content)).toContain("tool_addition");
+		expect(next.body.messages[0].content).toEqual([
+			{ type: "text", text: "second", cache_control: { type: "ephemeral" } },
+		]);
+		const systemBlocks = next.body.messages[1].content;
+		expect(systemBlocks).toMatchObject([
+			...(content ? [{ type: "text", cache_control: { type: "ephemeral" } }] : []),
+			{ type: "tool_addition", tool: { type: "tool_definition", definition: { name: "other" } } },
+		]);
+		expect(systemBlocks).not.toContainEqual(
+			expect.objectContaining({ type: "tool_addition", cache_control: expect.anything() }),
+		);
 	});
 
 	it.each<[string, TurnInput, TurnInput]>([
@@ -356,7 +424,7 @@ describe("Anthropic message threads", () => {
 		const h = harness();
 		const messages = [user("first")];
 		await say(h, messages);
-		messages.push(user("second"));
+		messages.push(user("second"), user("third"));
 		h.queue.push(() => errorResponse(status, "thread rejected", errorCode));
 		const onPayload = vi.fn();
 		const result = await say(h, messages, { options: { onPayload } });
@@ -366,8 +434,12 @@ describe("Anthropic message threads", () => {
 		expect(h.requests).toHaveLength(3);
 		const [, rejected, resend] = h.requests;
 		expect(rejected.body.thread?.type).toBe("continue");
+		expect(rejected.body.messages[0].content).toEqual([
+			{ type: "text", text: "second", cache_control: { type: "ephemeral" } },
+		]);
 		expect(resend.body.thread).toEqual({ type: "create" });
-		expect(resend.body.messages).toHaveLength(3);
+		expect(resend.body.messages).toHaveLength(4);
+		expect(resend.body.messages[2].content).toBe("second");
 		expect(resend.body.system).toBeDefined();
 		expect(resend.betas).toEqual(rejected.betas);
 		expect(result.diagnostics).toHaveLength(1);
@@ -376,7 +448,7 @@ describe("Anthropic message threads", () => {
 			details: { reason: errorCode },
 		});
 
-		messages.push(user("third"));
+		messages.push(user("fourth"));
 		await say(h, messages);
 		expect(threadOf(h.requests[3])).toEqual({ type: "continue", previous_message_id: "msg_3" });
 	});
@@ -520,12 +592,24 @@ describe("Anthropic message threads", () => {
 		expect(threadOf(h.requests[1])).toEqual({ type: "create" });
 	});
 
-	it("does not use threads with cacheRetention none", async () => {
+	it.each<[string, AnthropicOptions]>([
+		["cacheRetention: none", { cacheRetention: "none" }],
+		["PI_CACHE_RETENTION=none", { env: { PI_CACHE_RETENTION: "none" } }],
+	])("does not send cache markers or threads with %s", async (_name, options) => {
 		const h = harness();
-		const messages = [user("first")];
-		await say(h, messages, { options: { cacheRetention: "none" } });
+		await say(h, [user("first")], { options });
 		expect(h.requests[0].body).not.toHaveProperty("thread");
 		expect(h.requests[0].betas).not.toContain(THREADS_BETA);
+		expect(JSON.stringify(h.requests[0].body)).not.toContain('"cache_control"');
+	});
+
+	it("lets explicit short retention override PI_CACHE_RETENTION=none", async () => {
+		const h = harness();
+		await say(h, [user("first")], { options: { cacheRetention: "short", env: { PI_CACHE_RETENTION: "none" } } });
+		expect(h.requests[0].body.thread?.type).toBe("create");
+		expect(h.requests[0].body.messages[0].content).toEqual([
+			{ type: "text", text: "first", cache_control: { type: "ephemeral" } },
+		]);
 	});
 
 	// #11987

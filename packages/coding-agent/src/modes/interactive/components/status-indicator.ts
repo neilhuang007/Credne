@@ -1,4 +1,5 @@
 import { type Component, Loader, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import type { CompactionReason } from "../../../core/compaction/index.ts";
 import type { WorkingIndicatorOptions } from "../../../core/extensions/index.ts";
 import { theme } from "../theme/theme.ts";
 import { CountdownTimer } from "./countdown-timer.ts";
@@ -28,6 +29,11 @@ export class StatusIndicator extends Loader {
 
 	renderSpinnerInBorder(width: number): string {
 		return truncateToWidth(this.getRenderedIndicator(), width, "");
+	}
+
+	/** Whether the indicator takes the whole top border, so the main-session badge is not drawn beside it. */
+	takesWholeBorder(): boolean {
+		return false;
 	}
 
 	dispose(): void {
@@ -80,15 +86,19 @@ export class RetryStatusIndicator extends StatusIndicator {
 	}
 }
 
-export type CompactionStatusReason = "manual" | "threshold" | "overflow";
+export type CompactionStatusReason = CompactionReason;
 
 export class CompactionStatusIndicator extends StatusIndicator {
+	private line: ((width: number, spinner: string) => string) | undefined;
+
 	constructor(ui: TUI, reason: CompactionStatusReason, colorFn?: (text: string) => string) {
 		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
 		const label =
 			reason === "manual"
 				? `Compacting context... ${cancelHint}`
-				: `${reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
+				: reason === "agent"
+					? `Compacting context at the agent's request... ${cancelHint}`
+					: `${reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
 		super(
 			"compaction",
 			ui,
@@ -96,6 +106,28 @@ export class CompactionStatusIndicator extends StatusIndicator {
 			colorFn ?? ((text) => theme.fg("muted", text)),
 			label,
 		);
+	}
+
+	/** Show an extension's line in place of the default text, or the default text again with undefined. */
+	setLine(render: ((width: number, spinner: string) => string) | undefined): void {
+		this.line = render;
+	}
+
+	override render(width: number): string[] {
+		if (!this.line) return super.render(width);
+		// The default text's layout: a blank row, then the text one column in from both edges.
+		const lineWidth = Math.max(1, width - 2);
+		return ["", ` ${truncateToWidth(this.line(lineWidth, this.getRenderedIndicator()), lineWidth, "")}`];
+	}
+
+	// An extension's progress line needs the room more than the usage badge does for the short time a compaction runs.
+	override takesWholeBorder(): boolean {
+		return this.line !== undefined;
+	}
+
+	override renderInBorder(width: number): string {
+		if (!this.line) return super.renderInBorder(width);
+		return truncateToWidth(this.line(width, this.getRenderedIndicator()), width, "");
 	}
 }
 

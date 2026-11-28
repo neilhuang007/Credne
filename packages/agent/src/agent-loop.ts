@@ -7,12 +7,13 @@ import {
 	type AssistantMessage,
 	type ClientIdentity,
 	EventStream,
+	getCurrentSystemMessage,
 	getCurrentTools,
 	getToolStateChanges,
 	mergeClientIdentity,
 	normalizeContext,
 	PI_ATTRIBUTION,
-	type SystemMessage,
+	type Tool,
 	type ToolResultMessage,
 	type ToolStateChanges,
 	toToolDeclaration,
@@ -24,6 +25,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
+	AgentSystemMessage,
 	AgentTool,
 	AgentToolCall,
 	AgentToolCallOutcome,
@@ -330,14 +332,10 @@ async function runLoop(
 }
 
 /**
- * Declare tool loadout changes to the model.
- *
- * `context.tools` is what the runtime can execute; the transcript's system messages declare
- * what the model may call. Before each request the difference becomes `toolsAdded` and
- * `toolsRemoved` on a system message. When a pending system message exists, its tool fields
- * are treated as intent and replaced with the delta between the committed transcript and
- * the executable set, so replay always yields exactly `context.tools`. Otherwise a new
- * system message is inserted before the first non-system pending message.
+ * Record the executable loadout and its visibility before each request. This lets resume recover
+ * callable tools without declaring them until their visibility changes. The last pending system
+ * message carries the changes, or a new system message is inserted before the first non-system
+ * pending message.
  */
 function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage[]): AgentMessage[] {
 	let systemIndex = -1;
@@ -347,39 +345,108 @@ function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage
 			break;
 		}
 	}
-	const pending = pendingMessages[systemIndex] as SystemMessage | undefined;
-	const baseline = pending
-		? pendingMessages.map((message, index) =>
-				index === systemIndex ? withToolChanges(pending, NO_CHANGES) : message,
-			)
-		: pendingMessages;
-	const changes = getToolStateChanges(
-		getCurrentTools([...context.messages, ...baseline]),
-		(context.tools ?? []).map(toToolDeclaration),
-	);
-	const unchanged = changes.toolsAdded.length === 0 && changes.toolsRemoved.length === 0;
+	const pending = pendingMessages[systemIndex];
+	const baseline = [...context.messages, ...pendingMessages.filter((_, index) => index !== systemIndex)];
+	const tools = context.tools ?? [];
+	const changes = getToolStateChanges(getCurrentTools(baseline), tools.map(toToolDeclaration));
+	const previousHidden = getHiddenToolDeclarations(baseline) ?? [];
+	const hidden = tools.filter((tool) => tool.omitFromDeclaration).map((tool) => tool.name);
+	const visibility =
+		hidden.length === previousHidden.length && hidden.every((name) => previousHidden.includes(name))
+			? undefined
+			: hidden;
+	const unchanged = changes.toolsAdded.length === 0 && changes.toolsRemoved.length === 0 && visibility === undefined;
 
-	if (pending) {
+	if (pending?.role === "system") {
 		// Keep the caller's message object when it already declares no tool changes.
-		if (unchanged && !pending.toolsAdded?.length && !pending.toolsRemoved?.length) return pendingMessages;
-		return baseline.map((message, index) => (index === systemIndex ? withToolChanges(pending, changes) : message));
+		if (
+			unchanged &&
+			!pending.toolsAdded?.length &&
+			!pending.toolsRemoved?.length &&
+			!pending.hiddenToolDeclarations
+		) {
+			return pendingMessages;
+		}
+		return pendingMessages.map((message, index) =>
+			index === systemIndex ? withToolChanges(pending, changes, visibility) : message,
+		);
 	}
 	if (unchanged) return pendingMessages;
-	const update = withToolChanges({ role: "system", content: "", timestamp: Date.now() }, changes);
+	const update = withToolChanges({ role: "system", content: "", timestamp: Date.now() }, changes, visibility);
 	const insertIndex = pendingMessages.findIndex((message) => message.role !== "system");
 	const index = insertIndex === -1 ? pendingMessages.length : insertIndex;
 	return [...pendingMessages.slice(0, index), update, ...pendingMessages.slice(index)];
 }
 
-const NO_CHANGES: ToolStateChanges = { toolsAdded: [], toolsRemoved: [] };
+/** Read the most recent tool visibility snapshot, if this transcript has one. */
+export function getHiddenToolDeclarations(messages: readonly AgentMessage[]): readonly string[] | undefined {
+	const message = messages.findLast(
+		(message) => message.role === "system" && message.hiddenToolDeclarations !== undefined,
+	);
+	return message?.role === "system" ? message.hiddenToolDeclarations : undefined;
+}
 
-/** Copy a system message with its tool fields replaced by `changes`; empty lists omit the field. */
-function withToolChanges(message: SystemMessage, { toolsAdded, toolsRemoved }: ToolStateChanges): SystemMessage {
-	const { toolsAdded: _added, toolsRemoved: _removed, ...rest } = message;
+/** Checkpoint the current full tool set and visibility for a new transcript prefix. */
+export function getCurrentAgentSystemMessage(messages: readonly AgentMessage[]): AgentSystemMessage | undefined {
+	const baseline = getCurrentSystemMessage(messages);
+	if (!baseline) return undefined;
+	const hiddenToolDeclarations = getHiddenToolDeclarations(messages);
+	return hiddenToolDeclarations?.length ? { ...baseline, hiddenToolDeclarations } : baseline;
+}
+
+/** Turn the recorded loadout into provider-visible deltas without moving a reveal into the prefix. */
+export function projectToolDeclarations(messages: AgentMessage[], legacyHidden?: ReadonlySet<string>): AgentMessage[] {
+	const hasSnapshots = getHiddenToolDeclarations(messages) !== undefined;
+	if (!hasSnapshots && !legacyHidden?.size) return messages;
+	let hidden = hasSnapshots ? undefined : legacyHidden;
+	const active = new Map<string, Tool>();
+	return messages.map((message) => {
+		if (message.role !== "system") return message;
+		const { toolsAdded, toolsRemoved, hiddenToolDeclarations } = message;
+		const nextHidden = hiddenToolDeclarations === undefined ? hidden : new Set(hiddenToolDeclarations);
+		const removed = toolsRemoved?.filter((tool) => !hidden?.has(tool.name)) ?? [];
+		if (hiddenToolDeclarations !== undefined) {
+			const removedNames = new Set(removed.map((tool) => tool.name));
+			for (const name of hiddenToolDeclarations) {
+				if (active.has(name) && !hidden?.has(name) && !removedNames.has(name)) removed.push({ name });
+			}
+		}
+		for (const tool of toolsRemoved ?? []) active.delete(tool.name);
+		for (const tool of toolsAdded ?? []) active.set(tool.name, tool);
+		let added: Tool[];
+		if (hiddenToolDeclarations === undefined) {
+			added = toolsAdded?.filter((tool) => !nextHidden?.has(tool.name)) ?? [];
+		} else {
+			const addedNames = new Set(toolsAdded?.map((tool) => tool.name));
+			// Preserve loadout order among all definitions introduced at this point.
+			added = [...active.values()].filter(
+				(tool) => !nextHidden?.has(tool.name) && (hidden?.has(tool.name) || addedNames.has(tool.name)),
+			);
+		}
+		hidden = nextHidden;
+		if (
+			hiddenToolDeclarations === undefined &&
+			added.length === (toolsAdded?.length ?? 0) &&
+			removed.length === (toolsRemoved?.length ?? 0)
+		) {
+			return message;
+		}
+		return withToolChanges(message, { toolsAdded: added, toolsRemoved: removed });
+	});
+}
+
+/** Copy a system message with its tool fields replaced, without changing its prompt text. */
+function withToolChanges(
+	message: AgentSystemMessage,
+	{ toolsAdded, toolsRemoved }: ToolStateChanges,
+	hiddenToolDeclarations?: readonly string[],
+): AgentSystemMessage {
+	const { toolsAdded: _added, toolsRemoved: _removed, hiddenToolDeclarations: _hidden, ...rest } = message;
 	return {
 		...rest,
 		...(toolsAdded.length > 0 ? { toolsAdded } : {}),
 		...(toolsRemoved.length > 0 ? { toolsRemoved } : {}),
+		...(hiddenToolDeclarations !== undefined ? { hiddenToolDeclarations } : {}),
 	};
 }
 
@@ -401,7 +468,7 @@ async function streamAssistantResponse(
 	}
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
+	const llmMessages = await config.convertToLlm(projectToolDeclarations(messages));
 
 	const llmContext = normalizeContext({ messages: llmMessages });
 

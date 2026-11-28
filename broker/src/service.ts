@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { TYPESAFE_DEFAULT_BASE_URL } from "@oh-my-pi/pi-catalog/discovery/typesafe";
 import { lock } from "proper-lockfile";
+import manifest from "../package.json" with { type: "json" };
 import { Accounts, atomicJson, boundedText, HttpError, publicAccount, publicModels } from "./accounts.ts";
 import { Gateway, protocolError } from "./gateway.ts";
 import { keyRouteError } from "./key-route.ts";
@@ -141,7 +142,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 		url: "",
 		token: `cbk_${randomBytes(32).toString("hex")}`,
 		brokerVersion: options.version ?? process.env.CREDNE_BROKER_VERSION ?? "0.1.6",
-		upstreamVersion: "19.0.0",
+		upstreamVersion: manifest.dependencies["@oh-my-pi/pi-ai"],
 		backend: "oh-my-pi",
 		startedAt: new Date().toISOString(),
 	};
@@ -271,7 +272,8 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle 
 							path,
 						);
 						const loginMatch = /^\/logins\/([A-Za-z0-9_-]+)(?:\/(callback|acknowledge))?$/.exec(path);
-						const routeMatch = /^\/route\/([^/]+)(\/pi\/stream|\/systemone|\/search)$/.exec(path);
+						const routeMatch =
+							/^\/route\/([^/]+)(\/pi\/(?:stream|cache-refresh)|\/systemone|\/search|\/prewarm)$/.exec(path);
 						if (accountMatch) {
 							const account = store.get(accountMatch[1]);
 							const action = accountMatch[2];

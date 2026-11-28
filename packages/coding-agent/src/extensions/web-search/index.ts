@@ -30,9 +30,6 @@ export interface SearchResult {
 	notes: string[];
 }
 
-const domainList = (description: string) =>
-	Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 253 }), { maxItems: 50, description }));
-
 /**
  * Registers `web_search`. The broker runs the search with oh-my-pi's own web search providers on a Claude or ChatGPT
  * subscription, so the request is the one oh-my-pi sends; API keys are never used for it.
@@ -44,29 +41,14 @@ export default function webSearchExtension(pi: ExtensionAPI): void {
 		name: "web_search",
 		label: "Web search",
 		description: describeWebSearch(new Date()),
-		promptGuidelines: [
-			"When you are about to answer from memory on something recent or past your knowledge cutoff, use web_search and not memory alone.",
-			"When you plan several web searches, send them in the same turn.",
-		],
 		parameters: Type.Object({
 			query: Type.String({ description: "The search query to use" }),
-			allowed_domains: domainList("Only include search results from these domains"),
-			blocked_domains: domainList("Never include search results from these domains"),
 		}),
-		async execute(_toolCallId, { query, allowed_domains, blocked_domains }, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, { query }, signal, _onUpdate, ctx) {
 			const trimmed = query.trim();
 			if (trimmed.length < 2 || trimmed.length > 4096) {
 				throw new Error("Enter a search query between 2 and 4096 characters.");
 			}
-			if (allowed_domains?.length && blocked_domains?.length) {
-				throw new Error("Cannot specify both allowed_domains and blocked_domains in the same request.");
-			}
-			// oh-my-pi's query syntax: Claude turns `site:` into its domain filters, Codex keeps it as search operators.
-			const directives = [
-				...(allowed_domains ?? []).map((domain) => `site:${domain}`),
-				...(blocked_domains ?? []).map((domain) => `-site:${domain}`),
-			];
-			const searchQuery = [trimmed, ...directives].join(" ");
 			const timeout = AbortSignal.timeout(120_000);
 			const deadline = signal ? AbortSignal.any([signal, timeout]) : timeout;
 			const sessionId = ctx.sessionManager.getSessionId();
@@ -77,19 +59,14 @@ export default function webSearchExtension(pi: ExtensionAPI): void {
 				servingAccount(ctx),
 				deadline,
 			)) {
-				const answer = await searchAccount(
-					client,
-					account.key,
-					{ modelId, sessionId, query: searchQuery },
-					deadline,
-				);
+				const answer = await searchAccount(client, account.key, { modelId, sessionId, query: trimmed }, deadline);
 				if (answer.type === "limited") {
 					limited = new Error(answer.message);
 					continue;
 				}
 				return {
 					content: [{ type: "text" as const, text: formatResults(trimmed, answer.result) }],
-					details: { account: account.id, query: searchQuery, ...answer.result },
+					details: { account: account.id, query: trimmed, ...answer.result },
 				};
 			}
 			throw (
@@ -102,16 +79,12 @@ export default function webSearchExtension(pi: ExtensionAPI): void {
 	});
 }
 
-// Claude Code's current WebSearch description. Its "US-only" note is left out: ChatGPT search has no such limit, and
-// the results are a summary with sources rather than result blocks.
+// Claude Code's concise WebSearch description, keeping only its lines that hold for this tool.
 function describeWebSearch(now: Date): string {
 	const month = now.toLocaleString("en-US", { month: "long", year: "numeric" });
-	return `Search the web. Returns a summary of the results with their titles and URLs.
+	return `Search the web.
 
-- The current month is ${month} — use this when searching for recent information.
-- \`allowed_domains\` / \`blocked_domains\` filter results; not both in one call.
-- Send only a public search query, never private workspace data such as file contents, secrets or internal names.
-- After answering from results, end with a "Sources:" list of the URLs you used as markdown links.`;
+- The current month is ${month} — use this when searching for recent information.`;
 }
 
 /** The tool result text: the search model's answer, then every source as a numbered markdown link. */
@@ -125,7 +98,6 @@ function formatResults(query: string, result: SearchResult): string {
 		result.answer?.trim() || "The search returned sources without a summary.",
 		`Sources:\n${sources.join("\n")}`,
 		...(result.notes.length > 0 ? [`Notes:\n${result.notes.map((note) => `- ${note}`).join("\n")}`] : []),
-		"REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.",
 	].join("\n\n");
 }
 

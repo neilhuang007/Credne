@@ -54,7 +54,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getClientVersion } from "../utils/identity.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
-import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { getConfiguredCacheRetention, getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
 import { getSystemMessageText } from "../utils/text.ts";
@@ -275,7 +275,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			if (customHeaders) {
 				addCustomHeadersMiddleware(client, customHeaders);
 			}
-			const cacheRetention = resolveCacheRetention(options.cacheRetention, options.env);
+			const cacheRetention = getConfiguredCacheRetention(options.cacheRetention, options.env) ?? "short";
 			const inferenceMaxTokens = options.maxTokens ?? (isAnthropicClaudeModel(model) ? model.maxTokens : undefined);
 			const initialSystemMessage = getInitialSystemMessage(normalizedContext.messages);
 			const initialSystemPrompt = initialSystemMessage ? getSystemMessageText(initialSystemMessage) : undefined;
@@ -872,20 +872,6 @@ function mapThinkingLevelToEffort(
 		default:
 			return "high";
 	}
-}
-
-/**
- * Resolve cache retention preference.
- * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
- */
-function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
-	if (cacheRetention) {
-		return cacheRetention;
-	}
-	if (getProviderEnvValue("PI_CACHE_RETENTION", env) === "long") {
-		return "long";
-	}
-	return "short";
 }
 
 /**

@@ -188,7 +188,7 @@ describe("worker Anthropic cache payloads", () => {
 				{ type: "text", text: reference, cache_control: { type: "ephemeral" } },
 				{ type: "text", text: "Implement the endpoint.", cache_control: { type: "ephemeral" } },
 			]);
-			expect(payload.tools?.[0].cache_control).toBeUndefined();
+			expect(payload.tools?.[0].cache_control).toEqual({ type: "ephemeral" });
 			expect(payload.prompt_cache_options).toBeUndefined();
 			expect(child.requests.map((request) => request.type)).toEqual(["cache_wait", "cache_ready"]);
 			expect(result.usage).toMatchObject({ input: 10, cacheRead: 90, cacheWrite: 0, totalTokens: 102 });
@@ -214,6 +214,7 @@ describe("worker Anthropic cache payloads", () => {
 			cache_control: { type: "ephemeral", ttl: "1h" },
 		});
 		expect(payload.system?.at(-1)?.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+		expect(payload.tools?.[0].cache_control).toBeUndefined();
 		expect(JSON.stringify(payload).match(/"cache_control":/g)!.length).toBeLessThanOrEqual(4);
 	});
 
@@ -270,7 +271,7 @@ describe("worker Anthropic cache payloads", () => {
 
 describe("worker OpenAI cache payloads", () => {
 	it.each(["openai-responses", "openai-codex-responses", "azure-openai-responses"] as const)(
-		"shares the system key across tasks and checkpoints in %s while keeping session headers separate",
+		"shares the system key across tasks and checkpoints in %s while keeping request IDs separate",
 		async (api) => {
 			const keys: Array<string | undefined> = [];
 			for (const [sessionId, conversation] of [
@@ -310,8 +311,12 @@ describe("worker OpenAI cache payloads", () => {
 									options,
 								).result();
 				expect(result.stopReason, result.errorMessage).toBe("stop");
-				keys.push(wire.captured[0].body.prompt_cache_key);
-				if (api !== "azure-openai-responses") expect(wire.captured[0].headers.get("session-id")).toBe(sessionId);
+				const { body, headers } = wire.captured[0];
+				keys.push(body.prompt_cache_key);
+				if (api !== "azure-openai-responses") {
+					expect(headers.get("session-id")).toBe(body.prompt_cache_key);
+					expect(headers.get("x-client-request-id")).toBe(sessionId);
+				}
 				expect(result.usage).toMatchObject({ input: 10, cacheRead: 90, cacheWrite: 0 });
 			}
 			expect(keys[0]).toMatch(/^subagent-[a-f0-9]{48}$/);
@@ -339,7 +344,12 @@ describe("worker OpenAI cache payloads", () => {
 			else if (api === "azure-openai-responses")
 				await azureStream(selected as Model<"azure-openai-responses">, context(), options).result();
 			else await codexStream(selected as Model<"openai-codex-responses">, context(), options).result();
-			expect(wire.captured[0].body.prompt_cache_key).toBeUndefined();
+			const { body, headers } = wire.captured[0];
+			expect(body.prompt_cache_key).toBeUndefined();
+			if (api !== "azure-openai-responses") {
+				expect(headers.has("session-id")).toBe(false);
+				expect(headers.has("x-client-request-id")).toBe(false);
+			}
 			expect(child.requests).toHaveLength(0);
 		},
 	);

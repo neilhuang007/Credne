@@ -383,6 +383,7 @@ export class ExtensionRunner {
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
+	private requestCompactionFn: () => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
@@ -457,6 +458,7 @@ export class ExtensionRunner {
 		this.shutdownHandler = contextActions.shutdown;
 		this.getContextUsageFn = contextActions.getContextUsage;
 		this.compactFn = contextActions.compact;
+		this.requestCompactionFn = contextActions.requestCompaction;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
 		this.getSystemPromptOptionsFn =
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
@@ -964,6 +966,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				runner.compactFn(options);
 			},
+			requestCompaction: () => {
+				runner.assertActive();
+				runner.requestCompactionFn();
+			},
 			getSystemPrompt: () => {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
@@ -1114,12 +1120,15 @@ export class ExtensionRunner {
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
 						result = handlerResult as SessionBeforeEventResult;
-						if (result.cancel) {
+						if (result.cancel || ("error" in result && result.error !== undefined)) {
 							return result as RunnerEmitResult<TEvent>;
 						}
 					}
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
+					// A compaction whose handler threw must not fall through to the default summary; its failure reports the
+					// message once.
+					if (event.type === "session_before_compact") return { error: message } as RunnerEmitResult<TEvent>;
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
 						extensionPath: ext.path,

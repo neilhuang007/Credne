@@ -1,6 +1,11 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	type AssistantMessage,
+	getPromptCacheTtlMs,
+	type ModelsSimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import {
 	clampThinkingLevel,
 	type Message,
@@ -8,7 +13,10 @@ import {
 	modelsAreEqual,
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
+import { getConfiguredCacheRetention } from "@earendil-works/pi-ai/utils/provider-env";
 import { getAgentDir, USES_BROKER_AUTH } from "../config.ts";
+import { ACCOUNT_PROVIDER_PREFIX } from "../extensions/accounts/catalog.ts";
+import { getOmpTurnIdentity, OMP_NATIVE_API } from "../extensions/accounts/omp-native.ts";
 import { getBuiltInModelExtensions } from "../extensions/index.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
@@ -159,6 +167,29 @@ export {
 
 function getDefaultAgentDir(): string {
 	return getAgentDir();
+}
+
+function brokerCacheTtlMs(
+	model: Model<Api>,
+	options: ModelsSimpleStreamOptions,
+	response: AssistantMessage,
+): number | undefined {
+	const upstream = getOmpTurnIdentity(response);
+	if (upstream?.provider !== "anthropic" || upstream.api !== "anthropic-messages") return undefined;
+	if (response.responseModel !== undefined && response.responseModel !== model.id) return undefined;
+	if (response.stopReason !== "stop" && response.stopReason !== "length" && response.stopReason !== "toolUse") {
+		return undefined;
+	}
+	const configured = getConfiguredCacheRetention(options.cacheRetention, options.env);
+	if (configured === "none") return undefined;
+	const { cacheWrite, cacheWrite1h } = response.usage;
+	// A cache hit could read an older entry with a different retention tier. Only a write proves this request's tier.
+	if (cacheWrite <= 0) return undefined;
+	const observed = cacheWrite1h === 0 ? "short" : cacheWrite1h === cacheWrite ? "long" : undefined;
+	if (cacheWrite1h !== undefined && (!observed || (configured && configured !== observed))) return undefined;
+	// OMP can downgrade long retention when the endpoint refuses it; explicit long alone is not proof.
+	if (!observed && options.cacheRetention !== "short") return undefined;
+	return getPromptCacheTtlMs(model, { cacheRetention: observed ?? configured });
 }
 
 /**
@@ -384,16 +415,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 	// Warm only requests for the selected model. Requests a virtual selection routed, or that an
 	// extension redirected, may not be repeated by the next request, so warming them could be wasted.
-	const cacheContextIsCurrent = (requestModel: Model<any>) => {
-		const messages = agent.state.messages;
+	let latestCacheRequest = 0;
+	const cacheContextIsCurrent = (requestModel: Model<Api>, sessionId: string) => {
+		const { messages, thinkingLevel, tools } = agent.state;
+		const messageCount = messages.length;
+		const revision = ++latestCacheRequest;
 		return () => {
-			const currentModel = agent.state.model;
-			const currentMessages = agent.state.messages;
+			const state = agent.state;
 			return (
-				currentModel.provider === requestModel.provider &&
-				currentModel.id === requestModel.id &&
-				messages.length <= currentMessages.length &&
-				messages.every((message, index) => currentMessages[index] === message)
+				revision === latestCacheRequest &&
+				sessionManager.getSessionId() === sessionId &&
+				state.model.provider === requestModel.provider &&
+				state.model.id === requestModel.id &&
+				state.model.api === requestModel.api &&
+				state.thinkingLevel === thinkingLevel &&
+				state.tools.length === tools.length &&
+				tools.every((tool, index) => state.tools[index] === tool) &&
+				messageCount <= state.messages.length &&
+				state.messages.every((message, index) =>
+					index < messageCount ? message === messages[index] : message.role !== "system",
+				)
 			);
 		};
 	};
@@ -442,10 +483,26 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// the current transcript still extends the request's prefix. Agent state may
 			// shallow-copy the messages array or refresh the model object without changing
 			// the provider request, so top-level object identity is not a valid cache key.
-			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+			const touchedAt = Date.now();
+			const stream = modelRuntime.streamSimple(model, context, requestOptions);
+			if (options?.sessionId !== sessionManager.getSessionId() || requestOptions.disableContinuation) return stream;
+			const isCurrent = cacheContextIsCurrent(model, options.sessionId);
+			const request = { model, context, options: requestOptions };
+			if (model.api !== OMP_NATIVE_API) {
+				cacheWarmer.start(request, isCurrent);
+			} else {
+				cacheWarmer.cancel();
+				// Pools can fail over, and OMP adds a reasoning budget on top of the requested output cap.
+				if (model.provider.startsWith(ACCOUNT_PROVIDER_PREFIX) && model.promptCache && !requestOptions.reasoning) {
+					void stream.result().then((message) => {
+						if (requestOptions.signal?.aborted || !isCurrent()) return;
+						const ttlMs = brokerCacheTtlMs(model, requestOptions, message);
+						if (ttlMs !== undefined)
+							cacheWarmer.start({ ...request, confirmedCache: { ttlMs, touchedAt } }, isCurrent);
+					});
+				}
 			}
-			return modelRuntime.streamSimple(model, context, requestOptions);
+			return stream;
 		},
 		onPayload: transformProviderPayload,
 		onResponse: handleProviderResponse,
@@ -500,6 +557,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});
+
+	// The handshake overlaps the rest of startup. A no-op unless the model's provider can warm a connection; providers
+	// that extensions register later are warmed by the model change that selects them.
+	session.prewarmModelConnection();
 
 	return {
 		session,

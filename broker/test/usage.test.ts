@@ -6,7 +6,7 @@ import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
 import { startBroker } from "../src/service.ts";
 import { accountUsage, usageFromReports } from "../src/usage.ts";
 import { array, object } from "../src/wire.ts";
-import { apiKey, fakeUpstream, harness, subscription } from "./fixtures.ts";
+import { apiKey, fakeNetwork, fakeUpstream, harness, subscription } from "./fixtures.ts";
 
 const secret = "private-token-account-and-provider-payload";
 const claudeQuota = {
@@ -116,7 +116,7 @@ describe("reading usage through OMP", () => {
 			const request = upstream.calls.find((call) => call.path === "/api/oauth/usage")!;
 			expect(request.headers.get("authorization")).toBe("Bearer sk-ant-oat01-usage");
 			expect(request.headers.get("anthropic-beta")).toContain("oauth-2025-04-20");
-			expect(h.external).toEqual([]);
+			expect(h.external).toContain("https://api.anthropic.com/api/oauth/usage");
 		} finally {
 			await h.close();
 			await upstream.server.stop(true);
@@ -184,6 +184,7 @@ describe("reading usage through OMP", () => {
 				expired: new Date(Date.now() + 3600000).toISOString(),
 			}),
 		);
+		const network = fakeNetwork(undefined, upstream.origin);
 		const broker = await startBroker({ home, idleTimeout: 0, anthropicBaseUrl: upstream.origin });
 		if (!broker) throw new Error("No test broker");
 		try {
@@ -198,6 +199,7 @@ describe("reading usage through OMP", () => {
 			expect(JSON.stringify(usage)).not.toMatch(/imported|usage@example\.com|private-token/);
 		} finally {
 			await broker.close();
+			network.restore();
 			await upstream.server.stop(true);
 			await rm(home, { recursive: true, force: true });
 		}

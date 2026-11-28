@@ -43,7 +43,7 @@ import {
 	isOpenRouterModel,
 	type OpenRouterUsageAccounting,
 } from "../utils/openrouter-cost.ts";
-import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { getConfiguredCacheRetention, getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
@@ -82,13 +82,7 @@ import { splitErrorToolResultImages, transformMessages } from "./transform-messa
  * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
  */
 function resolveCacheRetention(cacheRetention?: CacheRetention, env?: ProviderEnv): CacheRetention {
-	if (cacheRetention) {
-		return cacheRetention;
-	}
-	if (getProviderEnvValue("PI_CACHE_RETENTION", env) === "long") {
-		return "long";
-	}
-	return "short";
+	return getConfiguredCacheRetention(cacheRetention, env) ?? "short";
 }
 
 function getCacheControl(
@@ -211,6 +205,8 @@ interface ThreadEntry {
 	prefixHash: string;
 	/** Id of the reply to continue from. */
 	replyId: string;
+	/** Breakpoints kept by the server from the thread's create request. */
+	retainedCacheBreakpoints: number;
 }
 
 /** Per session: where the next request can continue, or "off" after the endpoint rejected threads. */
@@ -295,10 +291,90 @@ function hashThreadPrefix(
 interface PreparedThreadRequest {
 	sessionId: string;
 	body: ThreadedParams;
+	retainedCacheBreakpoints: number;
 }
 
 function createThreadRequest(sessionId: string, params: MessageCreateParamsStreaming): PreparedThreadRequest {
-	return { sessionId, body: { ...params, thread: { type: "create" } } };
+	return {
+		sessionId,
+		body: { ...params, thread: { type: "create" } },
+		retainedCacheBreakpoints: countRetainedCacheBreakpoints(params),
+	};
+}
+
+function countRetainedCacheBreakpoints(params: MessageCreateParamsStreaming): number {
+	let retained = typeof params.system === "string" ? 0 : (params.system ?? []).filter(hasCacheBreakpoint).length;
+	retained += (params.tools ?? []).filter(hasCacheBreakpoint).length;
+	// The thread keeps the create's fixed breakpoints, not its rolling tail. Empty effort
+	// controls after that tail don't count as content blocks.
+	let lastBlockMarked = false;
+	for (const { content } of params.messages) {
+		if (typeof content === "string") {
+			lastBlockMarked = false;
+			continue;
+		}
+		for (const block of content) {
+			lastBlockMarked = hasCacheBreakpoint(block);
+			if (lastBlockMarked) retained++;
+		}
+	}
+	return retained - Number(lastBlockMarked);
+}
+
+function hasCacheBreakpoint(block: object): boolean {
+	return "cache_control" in block && block.cache_control != null;
+}
+
+const MAX_CACHE_BREAKPOINTS = 4;
+
+type CacheableContentBlock = Extract<ContentBlockParam, { type: "text" | "image" | "tool_use" | "tool_result" }>;
+
+function isCacheableContentBlock(block: ContentBlockParam): block is CacheableContentBlock {
+	// Claude rejects cache_control on mid-conversation tool directives, despite the SDK types.
+	return block.type === "text" || block.type === "image" || block.type === "tool_use" || block.type === "tool_result";
+}
+
+/** Keep existing markers; with a free slot, reach back to the previous write from the first appended block. */
+function addThreadReadBreakpoint(messages: MessageParam[], slots: number): boolean {
+	let first: { messageIndex: number; blockIndex: number; marked: boolean } | undefined;
+	let template: CacheControlEphemeral | undefined;
+	for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+		const { content } = messages[messageIndex];
+		if (typeof content === "string") {
+			first ??= { messageIndex, blockIndex: 0, marked: false };
+			continue;
+		}
+		for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
+			const block = content[blockIndex];
+			const marker = "cache_control" in block ? block.cache_control : undefined;
+			if (!first && isCacheableContentBlock(block)) first = { messageIndex, blockIndex, marked: !!marker };
+			if (marker) {
+				// Match the earliest existing TTL: Anthropic requires longer lifetimes first.
+				template ??= marker;
+				slots--;
+			}
+		}
+	}
+	if (slots < 0) return false;
+	if (slots > 0 && first && !first.marked && template) {
+		messages[first.messageIndex] = withCacheBreakpoint(messages[first.messageIndex], first.blockIndex, template);
+	}
+	return true;
+}
+
+function withCacheBreakpoint(
+	message: MessageParam,
+	blockIndex: number,
+	cacheControl: CacheControlEphemeral,
+): MessageParam {
+	if (typeof message.content === "string") {
+		return { ...message, content: [{ type: "text", text: message.content, cache_control: cacheControl }] };
+	}
+	const block = message.content[blockIndex];
+	if (!block || !isCacheableContentBlock(block)) return message;
+	const content = message.content.slice();
+	content[blockIndex] = { ...block, cache_control: cacheControl };
+	return { ...message, content };
 }
 
 function prepareThreadRequest(
@@ -313,17 +389,19 @@ function prepareThreadRequest(
 		params.messages.length > state.prefixCount &&
 		hashThreadPrefix(model, params, params.messages.slice(0, state.prefixCount)) === state.prefixHash
 	) {
-		// Each reply can be continued once; deleting also keeps a concurrent request from trying.
-		threadState.delete(sessionId);
-		const { system: _system, tools: _tools, ...rest } = params;
-		return {
-			body: {
-				...rest,
-				messages: params.messages.slice(state.prefixCount),
-				thread: { type: "continue", previous_message_id: state.replyId },
-			},
-			sessionId,
-		};
+		const messages = params.messages.slice(state.prefixCount);
+		const slots = MAX_CACHE_BREAKPOINTS - state.retainedCacheBreakpoints - Number(params.cache_control != null);
+		// If caller-supplied markers don't fit the old thread, resend them in a new full request.
+		if (addThreadReadBreakpoint(messages, slots)) {
+			// Each reply can be continued once; deleting also keeps a concurrent request from trying.
+			threadState.delete(sessionId);
+			const { system: _system, tools: _tools, ...rest } = params;
+			return {
+				body: { ...rest, messages, thread: { type: "continue", previous_message_id: state.replyId } },
+				sessionId,
+				retainedCacheBreakpoints: state.retainedCacheBreakpoints,
+			};
+		}
 	}
 	return createThreadRequest(sessionId, params);
 }
@@ -407,6 +485,7 @@ function recordThreadReply(
 		prefixCount: prefix.length,
 		prefixHash: hashThreadPrefix(model, params, prefix),
 		replyId: output.responseId,
+		retainedCacheBreakpoints: thread.retainedCacheBreakpoints,
 	});
 }
 
@@ -1417,31 +1496,16 @@ function convertMessages(
 
 	flushPendingSystemMessages();
 
-	// Add cache_control to the last user or system message to cache conversation history
-	if (cacheControl && params.length > 0) {
-		const lastMessage = params[params.length - 1];
-		if (lastMessage.role === "user" || lastMessage.role === "system") {
-			if (Array.isArray(lastMessage.content)) {
-				const lastBlock = lastMessage.content[lastMessage.content.length - 1];
-				if (
-					lastBlock &&
-					(lastBlock.type === "text" ||
-						lastBlock.type === "image" ||
-						lastBlock.type === "tool_result" ||
-						lastBlock.type === "tool_addition" ||
-						lastBlock.type === "tool_removal")
-				) {
-					(lastBlock as any).cache_control = cacheControl;
-				}
-			} else if (typeof lastMessage.content === "string") {
-				lastMessage.content = [
-					{
-						type: "text",
-						text: lastMessage.content,
-						cache_control: cacheControl,
-					},
-				] as any;
-			}
+	if (cacheControl) {
+		for (let index = params.length - 1; index >= 0; index--) {
+			const message = params[index];
+			if (message.role === "assistant") break;
+			// A trailing native tool directive should not displace an eligible breakpoint before it.
+			const blockIndex =
+				typeof message.content === "string" ? 0 : message.content.findLastIndex(isCacheableContentBlock);
+			if (blockIndex < 0) continue;
+			params[index] = withCacheBreakpoint(message, blockIndex, cacheControl);
+			break;
 		}
 	}
 

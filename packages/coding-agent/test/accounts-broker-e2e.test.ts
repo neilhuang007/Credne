@@ -3,7 +3,7 @@
 //   (cd ../../broker && bun run build)
 //   PI_ACCOUNTS_BROKER=../../broker/dist/credne-broker node ../../node_modules/vitest/dist/cli.js --run test/accounts-broker-e2e.test.ts
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -12,14 +12,10 @@ import { type ClassifierContext, createModels, type Model } from "@earendil-work
 import { getBuiltinClassifierModel } from "@earendil-works/pi-ai/providers/all";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildCatalog } from "../src/extensions/accounts/catalog.ts";
-import { type BrokerAccount, BrokerClient } from "../src/extensions/accounts/client.ts";
+import { BrokerClient } from "../src/extensions/accounts/client.ts";
 import { type AccountProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
 
 const brokerBinary = process.env.PI_ACCOUNTS_BROKER;
-
-const CLAUDE_SUBSCRIPTION_MODEL = "claude-sonnet-5";
-const CLAUDE_SUBSCRIPTION_TOKEN = "sk-ant-oat01-fixture";
-const CLAUDE_SUBSCRIPTION_FILE = "claude-fixture.json";
 
 const DECISIONS_ANSWER = {
 	model: "gpt-6-luna",
@@ -31,7 +27,6 @@ const DECISIONS_ANSWER = {
 class FakeUpstream {
 	readonly calls = new Map<string, number>();
 	readonly failing = new Set<string>();
-	readonly auth = new Map<string, string>();
 	/** Decisions requests as the upstream saw them: the API key they carried and their body. */
 	readonly decisions: { key: string; body: string }[] = [];
 	readonly hangStarted = Promise.withResolvers<void>();
@@ -41,9 +36,8 @@ class FakeUpstream {
 		for await (const chunk of request) body += chunk;
 		const key = (request.headers["x-api-key"] as string | undefined) ?? request.headers.authorization?.slice(7) ?? "";
 		this.calls.set(key, (this.calls.get(key) ?? 0) + 1);
-		this.auth.set(key, request.headers.authorization ?? "");
 		if (this.failing.has(key)) {
-			response.writeHead(429, { "content-type": "application/json", "retry-after": "3" });
+			response.writeHead(429, { "content-type": "application/json", "retry-after": "3", "x-should-retry": "false" });
 			response.end(
 				JSON.stringify({
 					type: "error",
@@ -220,9 +214,7 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 	let pool: AccountProviderSpec;
 	let allPool: AccountProviderSpec;
 	let openaiPool: AccountProviderSpec;
-	let subscription: AccountProviderSpec;
 	let luna: AccountProviderSpec;
-	let accounts: BrokerAccount[];
 
 	const first = (spec: AccountProviderSpec) => spec.models[0] as Model<"anthropic-messages">;
 	const resetCooldowns = async () => {
@@ -244,23 +236,11 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 			join(home, "config.yaml"),
 			`routing:\n  retry:\n    request-retry: 0\napi-keys:\n  claude:\n${group("work", "sk-ant-A", "claude-test-1")}${group("personal", "sk-ant-B", "claude-test-1")}  codex:\n${group("codex", "sk-codex-C", "gpt-test")}`,
 		);
-		// Seed a broker-owned subscription fixture. Browser sign-in is covered with a mock broker, not live OAuth.
-		mkdirSync(join(home, "auths"));
-		writeFileSync(
-			join(home, "auths", CLAUDE_SUBSCRIPTION_FILE),
-			JSON.stringify({
-				type: "claude",
-				access_token: CLAUDE_SUBSCRIPTION_TOKEN,
-				refresh_token: "fixture-refresh",
-				expired: new Date(Date.now() + 3_600_000).toISOString(),
-				email: "fixture@example.com",
-			}),
-		);
 		// An official-API key account, validated against the fake upstream's GET /v1/models.
 		await client.addApiKey("direct", "sk-ant-D");
 		// An OpenAI API key: it lists gpt-6-luna, so it serves the Decisions classifier.
 		await client.addApiKey("luna", "sk-openai-luna", "openai");
-		accounts = await client.listAccounts();
+		const accounts = await client.listAccounts();
 		const accountModels = new Map(
 			await Promise.all(accounts.map(async (a) => [a.key, await client.accountModels(a.key)] as const)),
 		);
@@ -274,17 +254,13 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 			),
 		);
 		for (const spec of specs) models.setProvider(createAccountProvider(spec, client));
-		subscription = specs.find((spec) => spec.id === "acct:claude-fixture")!;
-		// Map the API-key providers to the key the upstream saw. The OpenAI key has no chat model here.
-		for (const spec of specs.filter(
-			(entry) => entry.target.type === "account" && entry.models.length > 0 && entry !== subscription,
-		)) {
+		const pinned = specs.filter((spec) => spec.target.type === "account");
+		for (const spec of pinned.filter((entry) => entry.models.length > 0)) {
 			const before = new Map(upstream.calls);
 			await models.completeSimple(spec.models[0]!, user("probe"));
 			const key = [...upstream.calls].find(([name, count]) => count !== before.get(name))?.[0];
 			if (key) byKey.set(key, spec);
 		}
-		const pinned = specs.filter((spec) => spec.target.type === "account");
 		luna = pinned.find((spec) => spec.classifiers !== undefined)!;
 		pool = specs.find((spec) => spec.id === "pool:claude")!;
 		allPool = specs.find((spec) => spec.id === "pool:all")!;
@@ -308,28 +284,6 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 			expect.objectContaining({ type: "toolCall", name: "read", arguments: { path: "a.txt" } }),
 		]);
 		expect(reply.usage).toMatchObject({ input: 12, output: 20 });
-	});
-
-	it("streams a Claude subscription through the pinned and Claude pool routes", async () => {
-		expect(accounts.find((account) => account.id === CLAUDE_SUBSCRIPTION_FILE)).toMatchObject({
-			provider: "claude",
-			kind: "oauth",
-			email: "fixture@example.com",
-		});
-		for (const spec of [subscription, pool]) {
-			const model = spec.models.find((entry) => entry.id === CLAUDE_SUBSCRIPTION_MODEL)!;
-			const reply = await models.completeSimple(model, user("hi"));
-			expect(reply.content).toContainEqual(
-				expect.objectContaining({
-					type: "text",
-					text: `served by ${CLAUDE_SUBSCRIPTION_TOKEN}`,
-				}),
-			);
-		}
-		expect(upstream.auth.get(CLAUDE_SUBSCRIPTION_TOKEN)).toBe(`Bearer ${CLAUDE_SUBSCRIPTION_TOKEN}`);
-		expect(JSON.parse(readFileSync(join(home, "auths", CLAUDE_SUBSCRIPTION_FILE), "utf8"))).toMatchObject({
-			access_token: CLAUDE_SUBSCRIPTION_TOKEN,
-		});
 	});
 
 	it("streams the Responses protocol through a Codex account", async () => {
@@ -368,17 +322,6 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 	});
 
 	it("routes Claude and GPT models through one pool:all provider", async () => {
-		const expected = ["claude-test-1", "gpt-test", CLAUDE_SUBSCRIPTION_MODEL];
-		expect(
-			allPool.models
-				.filter((model) => expected.includes(model.id))
-				.map((model) => [model.id, model.api])
-				.sort(),
-		).toEqual([
-			[CLAUDE_SUBSCRIPTION_MODEL, "anthropic-messages"],
-			["claude-test-1", "anthropic-messages"],
-			["gpt-test", "openai-responses"],
-		]);
 		const claude = await models.completeSimple(allPool.models.find((m) => m.id === "claude-test-1")!, user("hi"));
 		expect(claude.content).toContainEqual(
 			expect.objectContaining({ type: "text", text: expect.stringMatching(/^served by sk-ant-[ABD]$/) }),

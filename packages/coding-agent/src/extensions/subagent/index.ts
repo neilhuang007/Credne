@@ -15,17 +15,29 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { CONFIG_DIR_NAME, getAgentDir } from "../../config.ts";
-import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	NormalizedBuildSystemPromptOptions,
+} from "../../core/extensions/types.ts";
+import type { SessionEntry } from "../../core/session-manager.ts";
 import { formatReadLineRange } from "../../core/tools/render-utils.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "../../core/tools/truncate.ts";
 import { getMarkdownTheme, type Theme, type ThemeColor } from "../../modes/interactive/theme/theme.ts";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { captureSubagentContext, turnSchema } from "./context.ts";
-import { createSubagentDispatch, dropBlankSelections, type ModelChoice, reasoningEffortSchema } from "./dispatch.ts";
+import {
+	createSubagentDispatch,
+	dispatchModelSchema,
+	dropBlankSelections,
+	type ModelChoice,
+	reasoningEffortSchema,
+} from "./dispatch.ts";
 import { registerModelSearch } from "./model-search.ts";
 import { type ModelTier, modelTierSchema } from "./model-tiers.ts";
 import {
@@ -248,12 +260,7 @@ function resolveAgent(defaultCwd: string, scope: AgentScope, name: string, cwd?:
 }
 
 const dispatchProperties = {
-	model: Type.Optional(
-		Type.String({
-			description:
-				"Model ID, unique name, or family alias such as sol, opus or flash (newest of that family) on the current account. Use search_models to discover models. An explicit provider/model ID opts into that route. Overrides the agent profile model.",
-		}),
-	),
+	model: dispatchModelSchema,
 	tier: Type.Optional(modelTierSchema),
 	reasoningEffort: Type.Optional(reasoningEffortSchema),
 	turn: Type.Optional(turnSchema),
@@ -358,6 +365,13 @@ const DELEGATING_TOOLS = new Set(["subagent", "assign_tasks", "assign_task"]);
 // The subagent tool's loadout change until the branch delegates: requests leave out the follow-up tools.
 const HIDE_DELEGATION_TOOLS = { hiddenDeclarations: DELEGATION_TOOLS };
 
+/** Whether the entry is the result of a delegating call; the first one on a branch revealed DELEGATION_TOOLS. */
+function isDelegation(entry: SessionEntry): boolean {
+	return (
+		entry.type === "message" && entry.message.role === "toolResult" && DELEGATING_TOOLS.has(entry.message.toolName)
+	);
+}
+
 export default function (pi: ExtensionAPI) {
 	const dispatch = createSubagentDispatch(pi);
 	registerModelSearch(pi, dispatch);
@@ -407,27 +421,40 @@ export default function (pi: ExtensionAPI) {
 	// Whether this branch has delegated. Read from the branch so resume and /tree keep it.
 	let delegated = false;
 	const syncDelegated = (_event: unknown, ctx: ExtensionContext) => {
-		const next = ctx.sessionManager
-			.getBranch()
-			.some(
-				(entry) =>
-					entry.type === "message" &&
-					entry.message.role === "toolResult" &&
-					DELEGATING_TOOLS.has(entry.message.toolName),
-			);
+		const next = ctx.sessionManager.getBranch().some(isDelegation);
 		if (next === delegated) return;
 		delegated = next;
 		pi.setActiveTools(pi.getActiveTools());
 	};
+	// Re-runs the loadout hooks and lists the active delegation tools (see revealTools).
+	const listDelegationTools = () => revealTools(pi, DELEGATION_TOOLS, "Here are the relevant tools for subagents:");
+	// Sets the closing section that re-sends the listing, which a compaction removed from context with
+	// the first delegation's result. The tools are revealed already, so the re-run hooks change nothing.
+	const resendTools = (options: NormalizedBuildSystemPromptOptions) => {
+		const listing = listDelegationTools();
+		if (listing) options.closingSections.subagent_tools = listing;
+	};
 	pi.on("session_start", syncDelegated);
 	pi.on("session_tree", syncDelegated);
+	pi.on("before_agent_start", (event, ctx) => {
+		if (!delegated) return;
+		const branch = ctx.sessionManager.getBranch();
+		const first = branch.findIndex(isDelegation);
+		if (first >= 0 && branch.findLastIndex((entry) => entry.type === "compaction") > first)
+			resendTools(event.systemPromptOptions);
+	});
+	// The compaction about to be stored follows every entry of the branch, so it removes the listing
+	// whenever the branch delegated. The section goes into the compacted context's prompt.
+	pi.on("session_before_compact", (event) => {
+		if (delegated && event.branchEntries.some(isDelegation)) resendTools(event.systemPromptOptions);
+	});
 	pi.on("tool_result", (event) => {
 		if (!DELEGATING_TOOLS.has(event.toolName)) return;
 		// The first delegation, even a failed one, reveals the follow-up tools, so an unknown model can be looked up.
 		let revealed: string | undefined;
 		if (!delegated) {
 			delegated = true;
-			revealed = revealTools(pi, DELEGATION_TOOLS, "Here are the relevant tools for subagents:");
+			revealed = listDelegationTools();
 		}
 		// Tool execute results cannot set runtime error state directly, so patch it through the result hook.
 		const isError = event.toolName === "subagent" && (event.details as SubagentDetails | undefined)?.isError;
@@ -475,6 +502,9 @@ export default function (pi: ExtensionAPI) {
 					{ deliverAs: "followUp", triggerTurn: true },
 				);
 			};
+			let detached = false;
+			const foregroundIds: string[] = [];
+			const completedWhileWaiting: SingleResult[] = [];
 			const runForeground = async (
 				defaults: DispatchDefaults,
 				resolved: ResolvedAgent,
@@ -492,13 +522,19 @@ export default function (pi: ExtensionAPI) {
 					defaults,
 					resolved,
 					step,
-					onUpdate: update,
+					onUpdate:
+						update &&
+						((partial) => {
+							if (!detached) update(partial);
+						}),
 					makeDetails: details,
 					onResult(result, workerId) {
-						if (!firstRun) notifyResult(result, workerId);
+						if (!firstRun || detached) notifyResult(result, workerId);
+						else completedWhileWaiting.push(result);
 						firstRun = false;
 					},
 				});
+				foregroundIds.push(worker.id);
 				const cancel = () => {
 					void team.cancel(worker.id);
 				};
@@ -704,199 +740,224 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.chain && params.chain.length > 0) {
-				modelChoices = chainDefaults.map((item) => item.modelChoice);
-				const results: SingleResult[] = [];
-				let previousOutput = "";
+			const finished = await team.waitInForeground(
+				signal,
+				async (signal): Promise<AgentToolResult<SubagentDetails>> => {
+					if (params.chain && params.chain.length > 0) {
+						modelChoices = chainDefaults.map((item) => item.modelChoice);
+						const results: SingleResult[] = [];
+						let previousOutput = "";
 
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+						for (let i = 0; i < params.chain.length; i++) {
+							const step = params.chain[i];
+							const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
 
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
+							// Create update callback that includes all previous results
+							const chainUpdate: OnUpdateCallback | undefined = onUpdate
+								? (partial) => {
+										// Combine completed results with current streaming result
+										const currentResult = partial.details?.results[0];
+										if (currentResult) {
+											const allResults = [...results, currentResult];
+											onUpdate({
+												content: partial.content,
+												details: makeDetails("chain")(allResults),
+											});
+										}
+									}
+								: undefined;
+
+							const result = await runForeground(
+								chainDefaults[i],
+								resolvedChain[i],
+								step.agent,
+								taskWithContext,
+								i + 1,
+								signal,
+								chainUpdate,
+								makeDetails("chain"),
+							);
+							results.push(result);
+
+							const isError = isFailedResult(result);
+							if (isError) {
+								const errorMsg = getResultOutput(result);
+								return {
+									content: [
+										{
+											type: "text",
+											text: truncateModelOutput(
+												`Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
+											),
+										},
+									],
+									details: makeDetails("chain")(results),
+								};
 							}
-						: undefined;
-
-					const result = await runForeground(
-						chainDefaults[i],
-						resolvedChain[i],
-						step.agent,
-						taskWithContext,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-					);
-					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
+							previousOutput = getFinalOutput(result.messages);
+						}
 						return {
 							content: [
 								{
 									type: "text",
-									text: truncateModelOutput(`Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`),
+									text: truncateModelOutput(getResultOutput(results[results.length - 1])),
 								},
 							],
 							details: makeDetails("chain")(results),
 						};
 					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [
-						{
-							type: "text",
-							text: truncateModelOutput(getResultOutput(results[results.length - 1])),
-						},
-					],
-					details: makeDetails("chain")(results),
-				};
-			}
 
-			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel", true)([]),
-					};
+					if (params.tasks && params.tasks.length > 0) {
+						if (params.tasks.length > MAX_PARALLEL_TASKS)
+							return {
+								content: [
+									{
+										type: "text",
+										text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+									},
+								],
+								details: makeDetails("parallel", true)([]),
+							};
 
-				modelChoices = taskDefaults.map((item) => item.modelChoice);
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
+						modelChoices = taskDefaults.map((item) => item.modelChoice);
+						// Track all results for streaming updates
+						const allResults: SingleResult[] = new Array(params.tasks.length);
 
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						status: "pending",
-						exitCode: null,
-						messages: [],
-						stderr: "",
-						usage: emptyUsage(),
-					};
-				}
+						// Initialize placeholder results
+						for (let i = 0; i < params.tasks.length; i++) {
+							allResults[i] = {
+								agent: params.tasks[i].agent,
+								agentSource: "unknown",
+								task: params.tasks[i].task,
+								status: "pending",
+								exitCode: null,
+								messages: [],
+								stderr: "",
+								usage: emptyUsage(),
+							};
+						}
 
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((result) => result.status === "running").length;
-						const pending = allResults.filter((result) => result.status === "pending").length;
-						const done = allResults.length - running - pending;
-						onUpdate({
+						const emitParallelUpdate = () => {
+							if (!detached && onUpdate) {
+								const running = allResults.filter((result) => result.status === "running").length;
+								const pending = allResults.filter((result) => result.status === "pending").length;
+								const done = allResults.length - running - pending;
+								onUpdate({
+									content: [
+										{
+											type: "text",
+											text: `Parallel: ${done}/${allResults.length} done, ${running} running, ${pending} pending...`,
+										},
+									],
+									details: makeDetails("parallel")([...allResults]),
+								});
+							}
+						};
+
+						const results = await Promise.all(
+							params.tasks.map(async (t, index) => {
+								const result = await runForeground(
+									taskDefaults[index],
+									resolvedTasks[index],
+									t.agent,
+									t.task,
+									undefined,
+									signal,
+									// Per-task update callback
+									(partial) => {
+										if (partial.details?.results[0]) {
+											allResults[index] = partial.details.results[0];
+											emitParallelUpdate();
+										}
+									},
+									makeDetails("parallel"),
+								);
+								allResults[index] = result;
+								emitParallelUpdate();
+								return result;
+							}),
+						);
+
+						const successCount = results.filter((r) => !isFailedResult(r)).length;
+						const summaries = results.map((r) => {
+							const output = truncateParallelOutput(getResultOutput(r));
+							const status =
+								isFailedResult(r) && r.stopReason && r.stopReason !== "end"
+									? `${r.status} (${r.stopReason})`
+									: r.status;
+							return `### [${r.agent}] ${status}\n\n${output}`;
+						});
+						return {
 							content: [
 								{
 									type: "text",
-									text: `Parallel: ${done}/${allResults.length} done, ${running} running, ${pending} pending...`,
+									text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
 								},
 							],
-							details: makeDetails("parallel")([...allResults]),
-						});
+							details: makeDetails("parallel")(results),
+						};
 					}
-				};
 
-				const results = await Promise.all(
-					params.tasks.map(async (t, index) => {
+					if (params.agent && params.task && resolvedSingle && singleDefaults) {
+						modelChoices = [singleDefaults.modelChoice];
 						const result = await runForeground(
-							taskDefaults[index],
-							resolvedTasks[index],
-							t.agent,
-							t.task,
+							singleDefaults,
+							resolvedSingle,
+							params.agent,
+							params.task,
 							undefined,
 							signal,
-							// Per-task update callback
-							(partial) => {
-								if (partial.details?.results[0]) {
-									allResults[index] = partial.details.results[0];
-									emitParallelUpdate();
-								}
-							},
-							makeDetails("parallel"),
+							onUpdate,
+							makeDetails("single"),
 						);
-						allResults[index] = result;
-						emitParallelUpdate();
-						return result;
-					}),
-				);
+						const isError = isFailedResult(result);
+						if (isError) {
+							const errorMsg = getResultOutput(result);
+							return {
+								content: [
+									{
+										type: "text",
+										text: truncateModelOutput(`Agent ${result.stopReason || result.status}: ${errorMsg}`),
+									},
+								],
+								details: makeDetails("single")([result]),
+							};
+						}
+						return {
+							content: [
+								{
+									type: "text",
+									text: truncateModelOutput(getResultOutput(result)),
+								},
+							],
+							details: makeDetails("single")([result]),
+						};
+					}
 
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status =
-						isFailedResult(r) && r.stopReason && r.stopReason !== "end"
-							? `${r.status} (${r.stopReason})`
-							: r.status;
-					return `### [${r.agent}] ${status}\n\n${output}`;
-				});
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
-						},
-					],
-					details: makeDetails("parallel")(results),
-				};
-			}
-
-			if (params.agent && params.task && resolvedSingle && singleDefaults) {
-				modelChoices = [singleDefaults.modelChoice];
-				const result = await runForeground(
-					singleDefaults,
-					resolvedSingle,
-					params.agent,
-					params.task,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-				);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
+					const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 					return {
-						content: [
-							{
-								type: "text",
-								text: truncateModelOutput(`Agent ${result.stopReason || result.status}: ${errorMsg}`),
-							},
-						],
-						details: makeDetails("single")([result]),
+						content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
+						details: makeDetails("single", true)([]),
 					};
-				}
-				return {
-					content: [
-						{
-							type: "text",
-							text: truncateModelOutput(getResultOutput(result)),
-						},
-					],
-					details: makeDetails("single")([result]),
-				};
+				},
+				() => {
+					detached = true;
+				},
+			);
+			if (finished) {
+				completedWhileWaiting.length = 0;
+				return finished;
 			}
-
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			for (const result of completedWhileWaiting.splice(0)) notifyResult(result, result.workerId!);
+			const jobIds = [...foregroundIds];
 			return {
-				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
-				details: makeDetails("single", true)([]),
+				content: [
+					{
+						type: "text",
+						text: `Continuing in the background: ${jobIds.join(", ")}. Results will arrive automatically.`,
+					},
+				],
+				details: { ...makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]), jobIds },
 			};
 		},
 
